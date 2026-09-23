@@ -337,10 +337,14 @@ So an object whose template declares a handler is a `js::BaseProxyHandler`
 proxy over the ordinary object that carries the template's declared properties
 and, for a `Class<T>`, its native state. Proxy traps are the only construct on
 this engine that run on every access and can fall through to an ordinary
-lookup. The proxy's prototype is the target's prototype, so a declined `get`
-forwarded to the target walks the chain the language expects, and `set`
-forwards with the *target* as receiver so it does not come straight back
-through the trap.
+lookup. The proxy has no prototype of its own - it is made with a *lazy* one,
+so every read and write of its prototype goes to the handler and on to the
+target. A proxy made with a concrete prototype keeps that one and answers
+`setPrototypeOf` by changing it without asking the handler, while a declined
+`get` forwarded to the target walks the target's chain, which then never
+changes. With the lazy prototype there is one chain, the target's, and a
+declined lookup walks the one the language expects. `set` forwards with the
+*target* as receiver so it does not come straight back through the trap.
 
 Consequences worth knowing:
 

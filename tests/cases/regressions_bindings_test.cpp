@@ -415,3 +415,29 @@ UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: an intercepted object from a plain
     CHECK(ub_test::EvalText(fixture.context, "typeof o.hasOwnProperty") == "function");
     CHECK(ub_test::EvalText(fixture.context, "String(o)") == "[object Object]");
 }
+
+UNIBIND_TEST_CASE(INTERCEPTORS,
+                  "regressions: an intercepted object looks things up through the prototype it was given") {
+    // `Object.setPrototypeOf` on an intercepted object has to change the chain
+    // a declined lookup walks. On SpiderMonkey the object is a proxy that was
+    // made with a prototype of its own, and the engine answers
+    // `setPrototypeOf` on such a proxy by changing that - without asking the
+    // handler - while a declined lookup walked the chain of the hidden target,
+    // which never changed. `Object.getPrototypeOf` said one thing and every
+    // property read did another.
+    ub_test::Fixture fixture;
+    const auto tpl = ub::FunctionTemplate::New(fixture.iso());
+    tpl.PrototypeTemplate().Set("inherited", ub::Constant(1));
+    tpl.InstanceTemplate().SetHandler(ub::NamedPropertyHandler{.getter = &DeclineRead});
+    const auto function = tpl.GetFunction(fixture.context);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "F", *function);  // NOLINT(bugprone-unchecked-optional-access)
+    ub_test::Eval(fixture.context, "var o = new F(), q = { swapped: 2 }");
+
+    CHECK(ub_test::EvalInt(fixture.context, "o.inherited") == 1);
+    CHECK(ub_test::EvalTruth(fixture.context, "Object.setPrototypeOf(o, q) === o && Object.getPrototypeOf(o) === q"));
+    CHECK(ub_test::EvalInt(fixture.context, "o.swapped") == 2);
+    CHECK(ub_test::EvalTruth(fixture.context, "'swapped' in o && !('inherited' in o) && o.inherited === undefined"));
+    CHECK(ub_test::EvalTruth(fixture.context, "o instanceof F") == false);
+    CHECK(tpl.HasInstance(fixture.context, ub_test::Eval(fixture.context, "o")) == std::optional<bool>(true));
+}

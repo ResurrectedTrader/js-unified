@@ -1108,12 +1108,13 @@ JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl,
     }
     JS::RootedObject made(cx, instance);
     if (intercepted) {
-        JS::RootedObject protoForProxy(cx);
-        if (!JS_GetPrototype(cx, instance, &protoForProxy)) {
-            return nullptr;
-        }
+        // With a lazy prototype, so that the proxy has none of its own: every
+        // read and write of it goes to the handler, and so to the target. A
+        // proxy made with a prototype keeps that one and changes *it* on
+        // `setPrototypeOf` without asking - while a declined lookup walks the
+        // target's chain, which then never changes.
         JS::RootedValue target(cx, JS::ObjectValue(*instance));
-        made = js::NewProxyObject(cx, &INTERCEPTOR_HANDLER, target, protoForProxy);
+        made = js::NewProxyObject(cx, &INTERCEPTOR_HANDLER, target, nullptr, js::ProxyOptions().setLazyProto(true));
         if (made == nullptr) {
             return nullptr;
         }
