@@ -339,6 +339,8 @@ bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::Mu
 
 bool ApplyEntries(JSContext* cx, const Context& context, JS::HandleObject target, TemplateRec* tpl);
 
+JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl, JS::HandleObject prototypeOverride);
+
 bool ApplyEntry(JSContext* cx, const Context& context, JS::HandleObject target, const TemplateEntry& entry) {
     switch (entry.kind) {
         case TemplateEntry::Kind::Constant:
@@ -394,8 +396,12 @@ bool ApplyEntry(JSContext* cx, const Context& context, JS::HandleObject target, 
                     return false;
                 }
             } else {
-                function = JS_NewPlainObject(cx);
-                if (function == nullptr || !ApplyEntries(cx, context, function, entry.child)) {
+                // A whole instance of the inner template, as `NewInstance`
+                // would make one - with its handler, if it declares one - and
+                // not merely its declarations replayed onto a plain object.
+                JS::RootedObject noOverride(cx);
+                function = NewInstanceOf(cx, context, entry.child, noOverride);
+                if (function == nullptr) {
                     return false;
                 }
             }

@@ -310,3 +310,29 @@ UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: a key an enumerator lists twice is
                             "(() => { const r = []; for (const k in o) r.push(k); return r.join(); })()") ==
           "declared,a,b");
 }
+
+UNIBIND_TEST_CASE2(TEMPLATES, INTERCEPTORS, "regressions: a template nested in another keeps its interceptor") {
+    // `ObjectTemplate::Set(name, template)` puts an instance of the inner
+    // template on every instance of the outer one, and an instance of a
+    // template with a handler is intercepted. SpiderMonkey's backend built the
+    // inner object by replaying only its declared properties onto a plain
+    // object, so the handler - the whole point of a nested scope object - was
+    // silently left off.
+    ub_test::Fixture fixture;
+    HookLog log;
+    const auto inner = ub::ObjectTemplate::New(fixture.iso());
+    inner.Set("declared", ub::Constant(1));
+    inner.SetHandler(ub::NamedPropertyHandler{.getter = &EchoName, .data = ub::CallbackData::For(log)});
+    const auto outer = ub::ObjectTemplate::New(fixture.iso());
+    outer.Set("inner", inner);
+    const auto first = outer.NewInstance(fixture.context);
+    const auto second = outer.NewInstance(fixture.context);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    ub_test::Expose(fixture.context, "first", *first);    // NOLINT(bugprone-unchecked-optional-access)
+    ub_test::Expose(fixture.context, "second", *second);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalText(fixture.context, "first.inner.anything") == "named");
+    CHECK(log.seen == "nanything ");
+    CHECK(ub_test::EvalTruth(fixture.context, "first.inner !== second.inner"));
+}
