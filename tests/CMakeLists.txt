@@ -134,7 +134,7 @@ if(UNIBIND_BACKEND STREQUAL "v8")
     target_include_directories(unibind_fatal SYSTEM PRIVATE "${UNIBIND_V8_DIR}/include")
     target_compile_definitions(unibind_fatal PRIVATE V8_GN_HEADER NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
-    add_executable(unibind_fatal fatal_spidermonkey.cpp)
+    add_executable(unibind_fatal spidermonkey/fatal.cpp)
     target_include_directories(unibind_fatal SYSTEM PRIVATE "${UNIBIND_SPIDERMONKEY_DIR}/include")
     target_compile_definitions(unibind_fatal PRIVATE
         STATIC_JS_API MOZ_STATIC_JS XP_WIN ENABLE_EXPLICIT_RESOURCE_MANAGEMENT NOMINMAX WIN32_LEAN_AND_MEAN)

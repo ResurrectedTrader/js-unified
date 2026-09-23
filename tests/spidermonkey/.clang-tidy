@@ -1,0 +1,15 @@
+# The one test that includes SpiderMonkey's own headers: the suite's set, minus
+# the two path-sensitive analyzer checkers the backend drops for the same reason.
+InheritParentConfig: true
+
+Checks: >
+  -clang-analyzer-core.NullDereference,
+  -clang-analyzer-cplusplus.NewDelete
+
+# Both report inside the engine's headers, on paths that start here - see
+# src/backends/spidermonkey/.clang-tidy for the full account. Here they are also
+# the test itself: `MOZ_CRASH` is the deliberate null write the test exists to
+# cause, and `mozilla/cxxalloc.h` is the engine's replacement `operator delete`,
+# which the analyzer counts as freeing memory the `delete` expression already
+# released. Nothing else in `tests/` includes an engine header, so nothing else
+# loses the checks.

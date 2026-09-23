@@ -20,7 +20,7 @@
 ///     only one of the two engines has it.
 ///
 /// `EngineFault::Fatal` is not here: it ends the process by design, so each
-/// backend provokes it in a process of its own (`tests/fatal_*.cpp`, see
+/// backend provokes it in a process of its own (`tests/fatal_v8.cpp` and `tests/spidermonkey/fatal.cpp`, see
 /// `docs/testing.md`).
 
 #include <cstddef>
