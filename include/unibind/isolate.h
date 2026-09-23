@@ -827,6 +827,9 @@ class Isolate {
     ///     whenever it was posted.
     ///   * A delay of zero, a negative one, or a NaN is no delay: the job is
     ///     posted as it would be by `PostJob`.
+    ///   * A delay longer than the steady clock can count - a little under three
+    ///     hundred years, infinity included - is a job that never falls due,
+    ///     not one that wraps round into the past.
     ///   * Callable from any thread. Still waiting when the isolate is
     ///     destroyed means dropped, as for any posted work.
     void PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept;

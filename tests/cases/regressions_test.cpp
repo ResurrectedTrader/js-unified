@@ -3,6 +3,8 @@
 /// here failed - or crashed - on the code before its fix, and passes on every
 /// backend after it. The comment on each says what it caught.
 
+#include <atomic>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -135,4 +137,31 @@ UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: a column offset moves the firs
     CHECK(firstMoved->columnNumber == firstPlain->columnNumber + 10);
     CHECK(secondMoved->columnNumber == secondPlain->columnNumber);
     // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+namespace {
+
+std::atomic<int> g_delayedRuns{0};
+
+void CountDelayedRun(ub::Isolate& /*isolate*/, ub::CallbackData /*data*/) {
+    g_delayedRuns.fetch_add(1, std::memory_order_relaxed);
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(DELAYED_JOBS, "regressions: a delay too long for the clock is a long delay, not none") {
+    // The delay is a double and the steady clock counts integer nanoseconds,
+    // which run out a little under three hundred years from now. A delay past
+    // that - infinity included - must still be a floor nothing reaches, not an
+    // overflow that lands in the past and runs at the next pump.
+    ub_test::Fixture fixture;
+    g_delayedRuns = 0;
+
+    auto& isolate = fixture.iso();
+    isolate.PostDelayedJob(&CountDelayedRun, {}, std::numeric_limits<double>::infinity());
+    isolate.PostDelayedJob(&CountDelayedRun, {}, 1e12);
+    isolate.PostDelayedJob(&CountDelayedRun, {}, std::numeric_limits<double>::max());
+    isolate.PostDelayedJob(&CountDelayedRun, {}, 9.3e9);
+    isolate.PumpJobs();
+    CHECK(g_delayedRuns.load() == 0);
 }

@@ -3164,8 +3164,16 @@ void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double del
     if (callback == nullptr) {
         return;
     }
-    const auto due = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                            std::chrono::duration<double>(delayInSeconds));
+    // Past what the clock can count - a little under three hundred years from
+    // now, in integer nanoseconds - the conversion would overflow and land in
+    // the past, and a delay nothing will outlive would run at the next pump.
+    // Half the room left is the cut-off, well clear of rounding, and beyond it
+    // the job is due never.
+    const auto now = std::chrono::steady_clock::now();
+    const std::chrono::duration<double> delay(delayInSeconds);
+    const std::chrono::duration<double> room(std::chrono::steady_clock::time_point::max() - now);
+    const auto due = delay < room / 2 ? now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay)
+                                      : std::chrono::steady_clock::time_point::max();
     const std::lock_guard<std::mutex> lock(impl_->jobMutex);
     impl_->delayedJobs.emplace(due, Impl::PostedJob{.callback = callback, .data = data});
 }
