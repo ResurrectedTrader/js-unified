@@ -747,3 +747,21 @@ UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a buffer too large to allocate is e
     }
     CHECK(ub_test::EvalInt(fixture.context, "6 * 7") == 42);
 }
+
+UNIBIND_TEST_CASE(ARRAYS, "regressions: an array can be made at every length its type can say") {
+    // `Array::New` takes a `uint32_t` length, and every one of them is a length
+    // a JavaScript array can have - up to 2^32 - 1, holes throughout. One
+    // engine's own factory stops at INT_MAX; the answer above that must still
+    // be the array that was asked for, as it is on the other.
+    ub_test::Fixture fixture;
+
+    for (const std::uint32_t length :
+         {std::uint32_t{0}, std::uint32_t{7}, static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()),
+          static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) + 1U,
+          std::numeric_limits<std::uint32_t>::max()}) {
+        CAPTURE(length);
+        const auto array = ub::Array::New(fixture.context, length);
+        REQUIRE(array.has_value());
+        CHECK(array->Length() == length);  // NOLINT(bugprone-unchecked-optional-access) - REQUIRE above
+    }
+}

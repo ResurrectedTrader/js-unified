@@ -819,11 +819,19 @@ Maybe<Slot> MakeObject(const Context& context) {
 
 Maybe<Slot> MakeArray(const Context& context, std::uint32_t length) {
     RealmGuard realm(context);
-    JSObject* array = JS::NewArrayObject(Raw(context), length);
-    if (array == nullptr) {
+    JSContext* cx = Raw(context);
+    // A short length is handed to the engine's factory, which allocates for
+    // it. A longer one is an empty array whose length is then set - what
+    // `new Array(length)` makes, holes throughout and nothing allocated for
+    // them - because the factory refuses a large one that script could make.
+    // The cut-off is the other backend's, for the same reason.
+    constexpr std::uint32_t ARRAY_PREALLOCATED = 1U << 16;
+    JS::RootedObject array(cx, JS::NewArrayObject(cx, length <= ARRAY_PREALLOCATED ? length : 0));
+    if (array == nullptr || (length > ARRAY_PREALLOCATED && !JS::SetArrayLength(cx, array, length))) {
+        JS_ClearPendingException(cx);
         return std::nullopt;
     }
-    return PushOrNothing(OwnerOf(context), array);
+    return PushOrNothing(OwnerOf(context), JS::ObjectValue(*array));
 }
 
 Maybe<Slot> MakeError(const Context& context, ErrorKind kind, std::string_view message) {

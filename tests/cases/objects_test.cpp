@@ -406,19 +406,18 @@ TEST_CASE("objects: an empty array is empty") {
     CHECK(array->Kind() == ub::ValueKind::Array);
 }
 
-TEST_CASE("objects: an array too long to make is refused rather than made short") {
+TEST_CASE("objects: an array longer than an int is made at its length, not made short") {
     // The length is a `uint32_t` because that is what a JavaScript array's
     // length is, and one engine's own factory takes an `int` and reads a
-    // negative one as *zero*. A length that cannot be made has to come back
-    // empty: an array of length 0 reporting success is the failure that looks
-    // like a result.
+    // negative one as *zero*. An array of length 0 reporting success would be
+    // the failure that looks like a result; the array asked for - holes
+    // throughout, as `new Array(3000000000)` makes it - is the answer.
     ub_test::Fixture fixture;
 
     const auto huge = ub::Array::New(fixture.context, 3000000000U);
-    CHECK_FALSE(huge.has_value());
+    REQUIRE(huge.has_value());
+    CHECK(huge->Length() == 3000000000U);  // NOLINT(bugprone-unchecked-optional-access) - REQUIRE above
 
-    // The boundary itself still works, so the refusal is about what cannot be
-    // made rather than about large arrays.
     const auto large = ub::Array::New(fixture.context, 1000U);
     REQUIRE(large.has_value());
     CHECK(large->Length() == 1000U);

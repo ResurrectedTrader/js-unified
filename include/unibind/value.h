@@ -217,6 +217,8 @@ struct Object : Value {
 };
 
 struct Array : Object {
+    /// An array of `length` holes, as `new Array(length)` makes one - at every
+    /// length a `uint32_t` can say, which is every length an array can have.
     [[nodiscard]] static std::optional<Local<Array>> New(const Context& context, std::uint32_t length = 0) {
         return detail::WrapSlot<Array>(detail::MakeArray(context, length));
     }

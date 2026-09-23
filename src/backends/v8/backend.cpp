@@ -1070,18 +1070,36 @@ std::optional<Slot> GetWellKnownSymbol(Isolate& isolate, WellKnownSymbol which) 
     return PushOrNothing(isolate, symbol);
 }
 
+/// The longest array `MakeArray` has the engine size a backing store for up
+/// front: long enough for anything built element by element, short enough that
+/// the store is small.
+constexpr uint32_t ARRAY_PREALLOCATED = 1U << 16;
+
 std::optional<Slot> MakeObject(const Context& context) {
     return PushOrNothing(OwnerOf(context), v8::Object::New(Raw(OwnerOf(context))));
 }
 
 std::optional<Slot> MakeArray(const Context& context, uint32_t length) {
-    // V8's length is an `int` and a negative one means *zero*, not an error, so
-    // a length above INT_MAX would come back as an empty array reporting
-    // success. Refusing is the only answer that is not a wrong one.
-    if (length > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    // A length up to `ARRAY_PREALLOCATED` is handed to `Array::New`, which sizes
+    // a backing store for it, so filling it in costs no growth. Anything longer
+    // is an empty array whose length is then set - what `new Array(length)`
+    // makes, holes throughout and nothing allocated for them - because
+    // `Array::New` takes an `int`, reading a length above INT_MAX as zero, and
+    // ends the process ("invalid size") on a large one within it.
+    Isolate& owner = OwnerOf(context);
+    v8::Isolate* raw = Raw(owner);
+    if (length <= ARRAY_PREALLOCATED) {
+        return PushOrNothing(owner, v8::Array::New(raw, static_cast<int>(length)));
+    }
+    v8::Local<v8::Array> array = v8::Array::New(raw, 0);
+    if (array.IsEmpty()) {
         return std::nullopt;
     }
-    return PushOrNothing(OwnerOf(context), v8::Array::New(Raw(OwnerOf(context)), static_cast<int>(length)));
+    v8::Local<v8::String> key = v8::String::NewFromUtf8Literal(raw, "length");
+    if (array->Set(Raw(context), key, v8::Number::New(raw, length)).IsNothing()) {
+        return std::nullopt;
+    }
+    return PushOrNothing(owner, array);
 }
 
 std::optional<Slot> MakeError(const Context& context, ErrorKind kind, std::string_view message) {
