@@ -27,12 +27,13 @@ Ninja has no `-A` and clang-cl targets the host; nothing clang-tidy reports
 depends on the architecture.
 
 ```powershell
+$llvm = '<VS install>\VC\Tools\Llvm\x64\bin'
 $env:VCPKG_ROOT = '<your vcpkg>'
 cmake --preset tidy-v8
 # The suite includes a header the build generates by asking the backend library
 # what it defines, so that header has to exist before any test file will parse.
 cmake --build build/tidy-v8 --target tests/generated/unibind_test_capabilities.h
-python "<VS>\VC\Tools\Llvm\x64\bin\run-clang-tidy" -p build/tidy-v8 -quiet
+python "$llvm\run-clang-tidy" -clang-tidy-binary "$llvm\clang-tidy.exe" -p build/tidy-v8 -quiet
 ```
 
 `run-clang-tidy` is LLVM's own parallel driver and lives beside `clang-tidy.exe`
@@ -40,15 +41,29 @@ in the ClangCL toolset. It uses every core by default, which is what takes the
 whole tree - both backends, the public headers, the suite, the benchmark and
 the headers-only tool - from a single-threaded afternoon to about a minute.
 
-Two things to get right, both of which fail quietly rather than loudly:
+Three things to get right, and **every one of them fails quietly rather than
+loudly** - this tooling's characteristic shape is a run that exits zero having
+done less than you think, or that reports something a colleague's run does not:
 
+- **Name the binary.** `run-clang-tidy` spawns whichever `clang-tidy` `PATH`
+  finds first, and a machine may well have two - the ClangCL toolset's, and a
+  standalone LLVM. Different releases have different check sets, so which one
+  ran decides what the lint *means*. `-clang-tidy-binary` is not optional here,
+  and printing `--version` of the binary you *found* proves nothing about the
+  one that *ran*.
 - **Run it from the repository root.** clang-tidy decides whether a diagnostic
   is in one of *our* headers by matching `HeaderFilterRegex` against a path it
   resolves relative to the working directory. Started somewhere else it still
   exits zero, having reported a fraction of what it should.
-- **Do not lint the engines.** Both backends mark the engine include directory
-  `SYSTEM`, and `.clang-tidy` excludes `dependencies/`. Without both, a run
-  walks into V8 and SpiderMonkey through every `#include`.
+- **Do not lint the engines.** Two independent things stop it, and either alone
+  is enough: the backends mark the engine include directory `SYSTEM` (and
+  clang-tidy's `SystemHeaders` defaults to false), and `HeaderFilterRegex` names
+  our own include roots. `ExcludeHeaderFilterRegex` is a third layer that
+  carries nothing the first two do not - which is just as well, because it is
+  new enough (clang-tidy 19) that an older binary drops the key **without
+  saying so**. `lint.yml` refuses such a binary rather than letting it read
+  less; if you add a setting to `.clang-tidy`, check it survives
+  `clang-tidy --dump-config`.
 
 Which checks are on, and why each disabled one is disabled, is in `.clang-tidy`
 itself. Two directories narrow it further and say why in the same way:

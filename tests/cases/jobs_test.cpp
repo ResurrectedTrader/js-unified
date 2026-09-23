@@ -450,7 +450,7 @@ UNIBIND_TEST_CASE(PROMISES, "promises: a rejection reaches the handler that was 
 
     fixture.iso().PumpJobs();
     const std::string logged = ub_test::EvalText(fixture.context, "log.join(',')");
-    CHECK(logged.rfind("rejected: ", 0) == 0);
+    CHECK(logged.starts_with("rejected: "));
     CHECK(logged.find("no answer") != std::string::npos);
 }
 

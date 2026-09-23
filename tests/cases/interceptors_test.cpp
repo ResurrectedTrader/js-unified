@@ -72,7 +72,7 @@ ub::Intercepted SetNamed(const ub::Local<ub::Name>& property, const ub::Local<ub
                          const ub::PropertyCallbackInfo& info) {
     Store* store = StoreOf(info);
     const auto key = KeyOf(property);
-    if (store == nullptr || !key || key->rfind("own_", 0) == 0) {
+    if (store == nullptr || !key || key->starts_with("own_")) {
         return ub::Intercepted::No;
     }
     const auto asInt = value.ToInt32(info.GetContext());

@@ -14,17 +14,34 @@
 # The `tidy-*` presets exist only to produce that file - Ninja, the same ClangCL
 # toolchain, the same flags - and nothing is linked from them.
 #
+# **The binary is named, never looked up.** `run-clang-tidy` spawns whatever
+# `clang-tidy` `PATH` finds first, and this image has two: the ClangCL toolset's
+# and a standalone LLVM under `C:\Program Files\LLVM`. They are different
+# releases with different check sets, so which one ran decided what "lint"
+# meant - and the job printed the version of the one it had *found* rather than
+# the one it *ran*. Both are now the same binary, resolved from the Visual
+# Studio installation this workflow already pins, and passed to the driver.
+#
 # **x64 here, both architectures in the engine jobs.** Ninja has no `-A`, and
 # clang-cl targets the host, so these trees are x64. Nothing clang-tidy reports
 # is architecture-dependent - the one thing that differs between the two builds
 # is the value of a storage-size macro - and the engine workflows are what
 # answer the architecture question.
 #
-# **Only this repository's own code is read.** Both backends mark the engine
-# include directory `SYSTEM`, and `.clang-tidy` names the include roots it will
-# report on and excludes `dependencies/`. Without that a run would walk into
-# V8 and SpiderMonkey through every `#include` and report on a third-party tree
-# nobody is going to change.
+# **What keeps it out of the engines**, in the order it holds. Measured, not
+# assumed - the numbers are from one SpiderMonkey translation unit:
+#
+#   1. The engine include directory is `SYSTEM`, and clang-tidy's `SystemHeaders`
+#      defaults to false. This alone is enough: with both header filters wide
+#      open the run still reports nothing from the engine. Defeat it and the
+#      same file reports 71,806.
+#   2. `HeaderFilterRegex` names this repository's own include roots. This alone
+#      is also enough: defeat `SYSTEM` and it still reports nothing.
+#   3. `ExcludeHeaderFilterRegex` excludes `dependencies/`. It is the third
+#      layer and carries nothing the first two do not already carry - which
+#      matters, because it is the one option here new enough (clang-tidy 19) for
+#      an older binary to **ignore in silence**. The step below refuses such a
+#      binary rather than letting it quietly read less than it should.
 #
 # **Run from the repository root.** clang-tidy decides whether a diagnostic is
 # in one of "our" headers against the working directory, so a run started
@@ -55,7 +72,8 @@ jobs:
       # The version matters: clang-format 19 is what `.clang-format` was checked
       # with, and its predecessors disagree about AccessModifierOffset here. The
       # one in the pinned image's ClangCL toolset is the one to use, found the
-      # way the other workflows find that toolset.
+      # way the other workflows find that toolset - and named rather than
+      # resolved through PATH, for the reason the tidy job gives at length.
       - name: Check every tracked C++ file against .clang-format
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -64,6 +82,7 @@ jobs:
           if (-not (Test-Path "$llvm\clang-format.exe")) {
               throw "no clang-format in the ClangCL toolset on this image"
           }
+          "clang-format in use: $llvm\clang-format.exe"
           & "$llvm\clang-format.exe" --version
           $files = git ls-files '*.h' '*.cpp'
           "checking $($files.Count) files"
@@ -83,7 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Find the tools, and refuse an image without them
+      - name: Pin the tools, and refuse an image without them
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $install = & $vswhere -latest -products * -property installationPath
@@ -94,8 +113,40 @@ jobs:
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
               throw "no ninja on this image; the compile database is generated with it"
           }
+          # This is the binary that will run, not merely one that was found.
+          "clang-tidy in use: $llvm\clang-tidy.exe"
           & "$llvm\clang-tidy.exe" --version
-          "UNIBIND_LLVM=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # For contrast, so a log says whether the image still carries a second
+          # one and what it would have been.
+          $other = Get-Command clang-tidy -ErrorAction SilentlyContinue
+          if ($other) { "(PATH would have found $($other.Source), which is NOT what runs)" }
+          "UNIBIND_CLANG_TIDY=$llvm\clang-tidy.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "UNIBIND_RUN_CLANG_TIDY=$llvm\run-clang-tidy" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # An option this clang-tidy does not know is not an error to it: it drops
+      # the key and carries on, which is how a tightening written in .clang-tidy
+      # can quietly stop applying. `--dump-config` prints the configuration as
+      # the binary understood it, so anything we set that does not come back is
+      # something it ignored. Fail on that, here, rather than on whatever the
+      # weakened run then finds.
+      - name: Refuse a clang-tidy that does not understand this .clang-tidy
+        run: |
+          $dump = & $env:UNIBIND_CLANG_TIDY --dump-config | Out-String
+          $configs = git ls-files | Where-Object { $_ -match '(^|/)\.clang-tidy$' }
+          $keys = $configs |
+              ForEach-Object { Get-Content $_ } |
+              Select-String -Pattern '^([A-Za-z][A-Za-z0-9]*):' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } |
+              # A directive rather than a stored setting, so it is never echoed.
+              Where-Object { $_ -ne 'InheritParentConfig' } |
+              Sort-Object -Unique
+          "checking $($keys.Count) settings from: $($configs -join ', ')"
+          $ignored = $keys | Where-Object { $dump -notmatch "(?m)^$_\s*:" }
+          if ($ignored) {
+              throw ("this clang-tidy silently ignores: $($ignored -join ', '). " +
+                     "It would lint less than the tree expects and say nothing about it.")
+          }
+          "all understood"
 
       # The preset reads VCPKG_ROOT; the runner calls it VCPKG_INSTALLATION_ROOT.
       - name: Configure the compile database, which fetches the engine
@@ -112,7 +163,8 @@ jobs:
 
       - name: clang-tidy
         run: >
-          python "${env:UNIBIND_LLVM}\run-clang-tidy"
+          python "${env:UNIBIND_RUN_CLANG_TIDY}"
+          -clang-tidy-binary "${env:UNIBIND_CLANG_TIDY}"
           -p build/tidy-${{ matrix.backend }}
           -quiet
           -warnings-as-errors='*'
