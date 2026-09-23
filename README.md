@@ -142,10 +142,12 @@ against. Following `windows-latest` would test a toolchain nobody chose. A
 non-blocking canary does build on `windows-latest` - Visual Studio 2026, MSVC
 14.51 - and currently passes, which is how the pin will eventually be moved.
 
-Each engine's workflow runs the suite twice, x86 and x64, as separate jobs: the
-handle is a different size in the two, the backends' frames are different
-sizes, and the x64 V8 archive brings a different allocator - so one of them
-passing says nothing about the other.
+Each engine's workflow runs the suite three times, as separate jobs: x86 and x64
+in Release, because the handle is a different size in the two, the backends'
+frames are different sizes, and the x64 V8 archive brings a different
+allocator - so one of them passing says nothing about the other; and x86 in
+Debug against the engine's debug build, whose assertions have caught backend
+bugs no release engine reports (`docs/testing.md`).
 
 Then install a prefix for consumers:
 
