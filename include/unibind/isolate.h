@@ -867,7 +867,10 @@ class Isolate {
     /// queues survive it - cancel the termination and pump again. A stop that
     /// lands during the pump, in a continuation or in a piece of posted work,
     /// ends it there: the posted work behind it waits for the next pump after
-    /// the cancel.
+    /// the cancel. **The promise continuations queued behind it do not wait -
+    /// they are discarded.** V8 empties its job queue when a stop lands in it
+    /// and nothing can keep it, so both backends do exactly that, rather than
+    /// one of them running continuations the other dropped.
     void PumpJobs();
 
     /// One typed embedder pointer per isolate, recovered as its real type or

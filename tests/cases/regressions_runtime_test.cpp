@@ -138,3 +138,34 @@ UNIBIND_TEST_CASE2(JOBS, TERMINATION,
     fixture.iso().PumpJobs();
     CHECK(log == std::vector<std::string>{"continuation stops", "job"});
 }
+
+UNIBIND_TEST_CASE2(PROMISES, TERMINATION, "regressions: the continuations queued behind one that stops never run") {
+    // A continuation that stops the isolate stops the continuations queued
+    // behind it too, on both engines. SpiderMonkey's drain went on past the
+    // stopped one and ran the rest there and then, stop or no stop; V8 empties
+    // its queue when a stop lands in it, which cannot be kept, so that is what
+    // both backends do - the continuations behind it do not wait for the
+    // cancel the way posted work does.
+    ub_test::Fixture fixture;
+    std::vector<std::string> log;
+    ExposeLogAndStop(fixture.context, log);
+    (void)ub_test::Eval(fixture.context, R"(
+        const settled = Promise.resolve();
+        settled.then(() => { log('first stops'); stop(); });
+        settled.then(() => log('second'));
+        settled.then(() => log('third'));
+    )");
+
+    fixture.iso().PumpJobs();
+    CHECK(fixture.iso().IsExecutionTerminating());
+    CHECK(log == std::vector<std::string>{"first stops"});
+
+    fixture.iso().CancelTerminateExecution();
+    fixture.iso().PumpJobs();
+    CHECK(log == std::vector<std::string>{"first stops"});
+
+    // And the queue is an ordinary queue again afterwards.
+    (void)ub_test::Eval(fixture.context, "Promise.resolve().then(() => log('later'))");
+    fixture.iso().PumpJobs();
+    CHECK(log == std::vector<std::string>{"first stops", "later"});
+}

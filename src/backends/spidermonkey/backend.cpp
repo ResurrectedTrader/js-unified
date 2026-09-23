@@ -42,6 +42,7 @@
 // rather than with JS_SetNativeStackQuota.
 #include <js/experimental/CompileScript.h>
 // For MinimumStackLimitMargin, the least margin that quota may leave.
+#include <js/friend/MicroTask.h>
 #include <js/friend/StackLimits.h>
 
 namespace ub {
@@ -3405,6 +3406,63 @@ void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double del
     impl_->delayedJobs.emplace(due, Impl::PostedJob{.callback = callback, .data = data});
 }
 
+namespace {
+
+/// Run the engine's promise jobs until there are none, one at a time and asking
+/// between each whether the isolate has been stopped - what V8's microtask
+/// checkpoint does, and what `js::RunJobs` alone does not: it carries on past a
+/// job that was stopped, so every continuation queued behind it ran, stop or
+/// no stop, before the pump could look.
+///
+/// **A stop discards what is still queued.** V8 empties its microtask queue
+/// when a termination lands in a checkpoint and there is no way to keep it, so
+/// this does the same rather than leave one backend running continuations the
+/// other dropped. A stop that is in force *before* the drain starts discards
+/// nothing: `PumpJobs` does not get here.
+///
+/// `js::RunJobs` still has the last word, on an empty queue: it is what drains
+/// the engine's off-thread promise work into the queue, and what clears the
+/// objects `WeakRef.prototype.deref` kept alive for the length of a job. Any
+/// job that puts back on the queue goes round again.
+void DrainEngineJobs(Isolate::Impl& impl) {
+    JSContext* cx = impl.cx;
+    for (;;) {
+        while (JS::HasAnyMicroTasks(cx)) {
+            if (impl.terminating.load(std::memory_order_acquire)) {
+                while (!JS::DequeueNextMicroTask(cx).isNull()) {
+                }
+                return;
+            }
+            const JS::Rooted<JS::Value> task(cx, JS::DequeueNextMicroTask(cx));
+            if (!JS::IsJSMicroTask(task)) {
+                continue;  // not one of the engine's; nothing here queues any
+            }
+            const JS::Rooted<JS::JSMicroTask*> job(cx, JS::ToUnwrappedJSMicroTask(task));
+            JSObject* global = job == nullptr ? nullptr : JS::GetExecutionGlobalFromJSMicroTask(job);
+            if (global == nullptr) {
+                continue;  // its realm is gone, and the engine would skip it too
+            }
+            const JSAutoRealm realm(cx, global);
+            // A pump is not a call and has nowhere to put an exception.
+            if (!JS::RunJSMicroTask(cx, job) && JS_IsExceptionPending(cx)) {
+                JS_ClearPendingException(cx);
+            }
+        }
+        if (impl.terminating.load(std::memory_order_acquire)) {
+            return;
+        }
+        js::RunJobs(cx);
+        if (JS_IsExceptionPending(cx)) {
+            JS_ClearPendingException(cx);
+        }
+        if (!JS::HasAnyMicroTasks(cx)) {
+            return;
+        }
+    }
+}
+
+}  // namespace
+
 void Isolate::PumpJobs() {
     // Engine jobs, then one piece of posted work, then round again until both
     // are empty - so the continuations a posted job queues run before the next
@@ -3419,10 +3477,7 @@ void Isolate::PumpJobs() {
         // nowhere to put them, and this is the only thing that runs them. What
         // decision 23 costs the other backend - turning an automatic drain off
         // - costs this one nothing, because there was never one to turn off.
-        js::RunJobs(impl_->cx);
-        if (JS_IsExceptionPending(impl_->cx)) {
-            JS_ClearPendingException(impl_->cx);
-        }
+        DrainEngineJobs(*impl_);
         // A continuation may have been what was stopped, and then the posted
         // work behind it waits for the cancel like everything else.
         if (impl_->terminating.load(std::memory_order_acquire)) {

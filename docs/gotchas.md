@@ -661,7 +661,10 @@ can observe, so it is made uniform rather than left as a hint.
 Call it with no native frame on the stack. It catches and **discards** anything
 a job throws - a pump is not a call and has nowhere to put an exception - and it
 does nothing at all while a termination is pending, though the queues survive
-that.
+that. A stop that lands *during* a pump is different, and silent too: the posted
+work behind it waits for the cancel, but the promise continuations queued behind
+a stopped one are **discarded** - V8 empties its queue then and nothing can keep
+it, so both backends do.
 
 ### Posting does not wake anything, and what is queued at teardown is dropped
 
