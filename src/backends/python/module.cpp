@@ -455,6 +455,7 @@ void ReleaseTypes(Isolate& isolate) noexcept {
     Py_CLEAR(types.promise);
     Py_CLEAR(types.typedArray);
     Py_CLEAR(types.dataView);
+    Py_CLEAR(types.dataCloneError);
     Py_CLEAR(types.module);
 }
 

@@ -119,6 +119,7 @@ struct Types {
     // data.cpp
     PyTypeObject* typedArray = nullptr;  ///< `unibind.TypedArray`
     PyTypeObject* dataView = nullptr;    ///< `unibind.DataView`
+    PyObject* dataCloneError = nullptr;  ///< `unibind.DataCloneError(unibind.Error)`
 };
 
 }  // namespace detail
