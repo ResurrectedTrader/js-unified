@@ -2506,6 +2506,12 @@ void ClassConstructTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     {
         CallFrame frame(isolate, &info);
         CallbackState state = CallState(isolate, frame.frame(), info, {});
+        // A class constructor answers with its native, never through the
+        // return slot. V8 makes an object left in a construct call's slot the
+        // result of `new` - right for a `FunctionTemplate`, and wrong here,
+        // where the instance carrying the `T` would be swapped for whatever
+        // the callback wrote. So the slot goes nowhere, as on SpiderMonkey.
+        state.returns = &DiscardReturn::SINK;
         box = rec->constructor(CallbackInfo(state));
     }
     if (box == nullptr) {

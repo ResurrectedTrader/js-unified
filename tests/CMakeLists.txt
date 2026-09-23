@@ -56,6 +56,7 @@ add_executable(unibind_tests
     cases/ownership_test.cpp
     cases/realms_test.cpp
     cases/regressions_test.cpp
+    cases/regressions_bindings_test.cpp
     cases/sandbox_test.cpp
     cases/scripts_test.cpp
     cases/stacks_test.cpp

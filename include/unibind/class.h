@@ -276,6 +276,11 @@ class Class {
     /// an `Error` saying the constructor declined - no instance without a
     /// native ever reaches script.
     ///
+    /// What comes out of `new` is always the instance: anything the callback
+    /// writes through `info.GetReturnValue()` is discarded, as for an
+    /// interceptor setter. A `FunctionTemplate`, which has no native to
+    /// guarantee, is where a construct call may answer with another object.
+    ///
     /// A *fresh* native, which is why this is a `std::unique_ptr` while a
     /// wrapper holds a share: `new` means a new instance, and the instance's
     /// native is the thing being made. Handing script a wrapper over a native
