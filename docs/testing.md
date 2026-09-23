@@ -209,6 +209,16 @@ ECMAScript accessor property precisely so that it has a receiver, and
 `templates: an accessor sees the instance as its receiver` asserts that a
 prototype accessor read through an instance finds the instance.
 
+### A key an enumerator lists that no hook answers for
+
+An enumerator is expected to list the keys the query or the getter answers
+for. One that lists a key neither answers makes the engines disagree, and
+neither can be made to agree with the other without breaking something else:
+V8 reports such a key from `Object.keys` (though not from `for...in`, which
+asks whether it is there), while SpiderMonkey's interceptor is a proxy whose
+`Object.keys` asks each listed key for its descriptor and drops one nobody
+describes. The suite lists only answered keys; `unibind/template.h` says to.
+
 ### Finalizer timing
 
 Neither engine promises to collect on request, and they do not collect the same

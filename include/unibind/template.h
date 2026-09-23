@@ -83,7 +83,10 @@ using NamedQueryCallback = std::optional<PropertyAttribute> (*)(const Local<Name
 using NamedDeleterCallback = std::optional<bool> (*)(const Local<Name>& property, const PropertyCallbackInfo& info);
 /// The own keys this object claims. Empty means it claims none: an engine
 /// whose enumerator has a decline path may treat that as declining, V8's has
-/// none, so do not depend on the difference.
+/// none, so do not depend on the difference. List only keys the query or the
+/// getter answers for: `Object.keys` reports one nobody answers on V8 and
+/// drops it on SpiderMonkey (docs/testing.md). A key listed twice, or one the
+/// object already has, is one key.
 using NamedEnumeratorCallback = std::optional<Local<Array>> (*)(const PropertyCallbackInfo& info);
 
 using IndexedGetterCallback = Intercepted (*)(std::uint32_t index, const PropertyCallbackInfo& info);
