@@ -1076,6 +1076,10 @@ std::optional<Slot> GetWellKnownSymbol(Isolate& isolate, WellKnownSymbol which) 
 constexpr uint32_t ARRAY_PREALLOCATED = 1U << 16;
 
 std::optional<Slot> MakeObject(const Context& context) {
+    // Entered, here and in every factory below that is handed a realm: V8 makes
+    // an object, an array, a buffer, a view or an error in the isolate's
+    // *current* realm, and the caller may have a different one entered.
+    const v8::Context::Scope entered(Raw(context));
     return PushOrNothing(OwnerOf(context), v8::Object::New(Raw(OwnerOf(context))));
 }
 
@@ -1086,6 +1090,7 @@ std::optional<Slot> MakeArray(const Context& context, uint32_t length) {
     // makes, holes throughout and nothing allocated for them - because
     // `Array::New` takes an `int`, reading a length above INT_MAX as zero, and
     // ends the process ("invalid size") on a large one within it.
+    const v8::Context::Scope entered(Raw(context));
     Isolate& owner = OwnerOf(context);
     v8::Isolate* raw = Raw(owner);
     if (length <= ARRAY_PREALLOCATED) {
@@ -1103,6 +1108,7 @@ std::optional<Slot> MakeArray(const Context& context, uint32_t length) {
 }
 
 std::optional<Slot> MakeError(const Context& context, ErrorKind kind, std::string_view message) {
+    const v8::Context::Scope entered(Raw(context));
     Isolate& owner = OwnerOf(context);
     v8::Local<v8::String> text = RawString(owner, message);
     v8::Local<v8::Value> error;
@@ -1221,6 +1227,7 @@ uint32_t ArrayLength(Slot array) noexcept {
 
 std::optional<Slot> MakeArrayBuffer(const Context& context, std::span<const std::byte> bytes, size_t byteLength) {
     assert(bytes.size() <= byteLength && "an array buffer was asked to hold more than it is long");
+    const v8::Context::Scope entered(Raw(context));
     Isolate& owner = OwnerOf(context);
     // `MaybeNew`, and the ceiling checked first: `New` answers an allocation
     // that fails by ending the process, and both answer a length past the
@@ -1296,6 +1303,7 @@ template <class View>
 
 std::optional<Slot> MakeTypedArray(const Context& context, ElementType type, Slot buffer, size_t byteOffset,
                                    size_t length) {
+    const v8::Context::Scope entered(Raw(context));
     Isolate& owner = OwnerOf(context);
     v8::Local<v8::ArrayBuffer> raw = Resolve(buffer).As<v8::ArrayBuffer>();
     // V8 checks this too, but by aborting rather than by failing, so the check
@@ -1408,6 +1416,7 @@ size_t ArrayBufferViewCopyOut(Slot view, std::span<std::byte> out) noexcept {
 }
 
 std::optional<Slot> MakeDataView(const Context& context, Slot buffer, size_t byteOffset, size_t byteLength) {
+    const v8::Context::Scope entered(Raw(context));
     v8::Local<v8::ArrayBuffer> raw = Resolve(buffer).As<v8::ArrayBuffer>();
     // Checked here for the reason `MakeTypedArray` checks: V8 enforces the
     // bounds by aborting, not by failing. A detached buffer is refused too -

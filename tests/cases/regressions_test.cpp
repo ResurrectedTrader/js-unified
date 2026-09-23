@@ -765,3 +765,48 @@ UNIBIND_TEST_CASE(ARRAYS, "regressions: an array can be made at every length its
         CHECK(array->Length() == length);  // NOLINT(bugprone-unchecked-optional-access) - REQUIRE above
     }
 }
+
+UNIBIND_TEST_CASE(REALMS, "regressions: a value made for a realm belongs to that realm, whichever is entered") {
+    // Every factory that takes a `Context` makes its value in that realm: an
+    // object made for realm B has B's `Object.prototype`, however the caller
+    // happens to have realm A entered at the time. One engine made several of
+    // them in whichever realm was current instead.
+    ub_test::Fixture fixture;  // enters its own realm, A
+    auto other = ub::Context::New(fixture.iso());
+    REQUIRE(other.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    const ub::Context& b = *other;
+
+    const auto object = ub::Object::New(b);
+    const auto array = ub::Array::New(b, 3);
+    const auto buffer = ub::ArrayBuffer::New(b, 8);
+    const auto error = ub::MakeError(b, ub::ErrorKind::TypeError, "made for b");
+    const auto view = buffer ? ub::DataView::New(b, *buffer, 0, 8) : std::nullopt;
+    const auto typed = buffer ? ub::TypedArray::New(b, ub::ElementType::Uint8, *buffer, 0, 8) : std::nullopt;
+    const std::array<float, 2> floats{1.5F, 2.5F};
+    const auto copied = ub::TypedArray::New(b, std::span<const float>(floats));
+    REQUIRE(object.has_value());
+    REQUIRE(array.has_value());
+    REQUIRE(buffer.has_value());
+    REQUIRE(error.has_value());
+    REQUIRE(view.has_value());
+    REQUIRE(typed.has_value());
+    REQUIRE(copied.has_value());
+
+    const ub::ContextScope inB(b);
+    ub_test::Expose(b, "madeObject", *object);
+    ub_test::Expose(b, "madeArray", *array);
+    ub_test::Expose(b, "madeBuffer", *buffer);
+    ub_test::Expose(b, "madeError", *error);
+    ub_test::Expose(b, "madeView", *view);
+    ub_test::Expose(b, "madeTyped", *typed);
+    ub_test::Expose(b, "madeCopy", *copied);
+    CHECK(ub_test::EvalTruth(b, "Object.getPrototypeOf(madeObject) === Object.prototype"));
+    CHECK(ub_test::EvalTruth(b, "Array.isArray(madeArray) && madeArray instanceof Array"));
+    CHECK(ub_test::EvalTruth(b, "madeBuffer instanceof ArrayBuffer"));
+    CHECK(ub_test::EvalTruth(b, "madeError instanceof TypeError"));
+    CHECK(ub_test::EvalTruth(b, "madeView instanceof DataView"));
+    CHECK(ub_test::EvalTruth(b, "madeTyped instanceof Uint8Array && madeCopy instanceof Float32Array"));
+    CHECK(ub_test::EvalTruth(b, "madeCopy.buffer instanceof ArrayBuffer"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}
