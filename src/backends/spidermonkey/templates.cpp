@@ -1161,16 +1161,18 @@ bool ConstructInstance(JSContext* cx, JS::CallArgs& args, TemplateRec* tpl, Clas
     }
 
     // A bare FunctionTemplate's own callback runs with the new object as its
-    // receiver, which is what V8 does.
+    // receiver, which is what V8 does - and, as there, an object it answers
+    // with is what `new` evaluates to, which is the language's own rule for a
+    // constructor that returns one. Anything else it answers is ignored.
     if (owner == nullptr && tpl->callRecord != nullptr && tpl->callRecord->callback != nullptr) {
         CallFrame frame(*isolate, &args);
         const SlotIndex self = frame.frame().Push(JS::ObjectValue(*instance));
-        JS::RootedValue discarded(cx);
+        JS::RootedValue answer(cx);
         CallbackState state{.owner = isolate,
                             .frame = &frame.frame(),
                             .context = context,
                             .call = &args,
-                            .result = discarded.address(),
+                            .result = answer.address(),
                             .thisSlot = self,
                             .holderSlot = self,
                             .data = tpl->callRecord->data,
@@ -1178,6 +1180,14 @@ bool ConstructInstance(JSContext* cx, JS::CallArgs& args, TemplateRec* tpl, Clas
         tpl->callRecord->callback(CallbackInfo(state));
         if (JS_IsExceptionPending(cx)) {
             return false;
+        }
+        if (answer.isObject()) {
+            // It may have come from another realm of the isolate.
+            if (!JS_WrapValue(cx, &answer)) {
+                return false;
+            }
+            args.rval().set(answer);
+            return true;
         }
     }
 

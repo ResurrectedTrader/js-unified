@@ -200,6 +200,12 @@ class ObjectTemplate {
 /// `FunctionTemplate` that refused a plain call would be a strictly worse
 /// `Class<T>`, and the middle row would be unreachable.
 ///
+/// In a construct call the callback's receiver is the new instance, and that
+/// is what `new` evaluates to - unless the callback answers with an object,
+/// which then is, as for a JavaScript constructor that returns one. A
+/// primitive answer is ignored. (`Class<T>` discards the answer outright: what
+/// comes out of it must carry a `T`.)
+///
 /// `Class<T>` is the typed wrapper over this; reach for a bare FunctionTemplate
 /// when the instances carry no native state, or when the thing genuinely is a
 /// function as well as a constructor.

@@ -98,3 +98,36 @@ UNIBIND_TEST_CASE2(CLASSES, CALLABLE_CLASS,
     CHECK(ub_test::EvalText(fixture.context, "typeof globalThis.stamped") == "undefined");
     CHECK(cls.IsInstance(ub_test::Eval(fixture.context, "Stamped.call({})")));
 }
+
+namespace {
+
+/// Answers a construct call with an object of its own when given one, and with
+/// a number otherwise.
+void AnswerWithArgument(const ub::CallbackInfo& info) {
+    if (info.Length() > 0) {
+        info.GetReturnValue().Set(info[0]);
+        return;
+    }
+    info.GetReturnValue().Set(1);
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(TEMPLATES, "regressions: a function template's constructor may answer with an object of its own") {
+    // A `FunctionTemplate` is V8's, and V8 makes an object a construct call
+    // leaves in its return slot the result of `new` - the language's own rule
+    // for a constructor that returns an object - while a primitive there is
+    // ignored. SpiderMonkey's backend gave the callback a slot that went
+    // nowhere, so `new F(o)` was a fresh instance on one engine and `o` on the
+    // other.
+    ub_test::Fixture fixture;
+    const auto tpl = ub::FunctionTemplate::New(fixture.iso(), &AnswerWithArgument);
+    const auto function = tpl.GetFunction(fixture.context);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "F", *function);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalTruth(fixture.context, "(() => { const o = {}; return new F(o) === o; })()"));
+    CHECK(ub_test::EvalTruth(fixture.context, "new F() instanceof F"));
+    CHECK(ub_test::EvalTruth(fixture.context, "new F(5) instanceof F"));
+    CHECK(ub_test::EvalInt(fixture.context, "F()") == 1);
+}
