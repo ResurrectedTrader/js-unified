@@ -415,17 +415,19 @@ differs by engine, and on V8 with no heap-limit callback installed it ends the
 process. What is asserted instead is the thing an embedder can actually do about
 it, which is the ceiling case above.
 
-**`EngineFault::Fatal` has no case at all, and cannot have one.** Reaching it
-means making V8 fail an internal check or detect an API misuse, and every route
-to that from this API is undefined behaviour - the suite would not be provoking
-a fault, it would be corrupting the process and hoping the fault came first. It
-could not be gated into the suite either: the kind ends the process by design
-(see decision 28 for why the backend makes sure of that rather than letting it
-vary), so the case would take every case after it down and the parity matrix
-with them, and unlike the two checked-build deaths there is nothing to *expect*
-except the abort itself. **That `Fatal` is delivered at all rests on review, not
-on a test, and should be read that way** - like the interrupt hook and the
-allocation failure in `Isolate::New` in the section below. What *is* pinned is
+**`EngineFault::Fatal` is tested outside the suite, one process per backend**
+(`<backend>.fatal-reaches-the-fault-handler`). The kind ends the process by
+design (decision 28), so it cannot be a case among others; each backend gets an
+executable that installs a handler, provokes the engine's own fatal path, and
+prints the report, and CTest passes on that line rather than on an exit code.
+Neither is faked, and neither is reachable through the public API without
+undefined behaviour, so each reaches past it: the V8 one asks the native isolate
+(through `unibind/interop/v8.h`) for a handle with no `v8::HandleScope` open,
+which V8 refuses through its fatal-error hook in a release build; the
+SpiderMonkey one expands the engine's own `MOZ_CRASH` macro, compiled the way
+the engine compiles it. A `DCHECK` or `MOZ_ASSERT` needs a debug engine and a
+real engine bug to fire, so that route shares the wiring but not the test. What
+*is* pinned inside the suite is
 the other half, and it is the half that would bite: `faults: nothing is reported
 while nothing is going wrong` fails if either backend's fatal wiring fired on
 ordinary work, and a script's own `throw` is in that case on purpose, because a

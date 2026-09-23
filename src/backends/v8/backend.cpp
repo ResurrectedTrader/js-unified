@@ -2820,9 +2820,10 @@ void OnIsolateOutOfMemory(const char* location, const v8::OOMDetails& details, v
     std::abort();
 }
 
-/// A failed internal check, anywhere in the process. It names a file and a line
-/// rather than an isolate, so the isolate - if there is one - comes from the
-/// thread, which one isolate per thread makes an honest answer.
+/// A failed internal check - a CHECK, or in a debug engine a DCHECK - anywhere
+/// in the process. It names a file and a line rather than an isolate, so the
+/// isolate - if there is one - comes from the thread, which one isolate per
+/// thread makes an honest answer.
 ///
 /// Aborts afterwards for the same reason as the hook above, and for one more:
 /// whether V8 itself would abort after dispatching this is a detail of how the
@@ -2869,6 +2870,11 @@ Platform::Platform(const PlatformOptions& options) {
         // behaviour - a message on stderr and an abort - is what an embedder
         // asked for by not asking for anything.
         v8::V8::SetFatalErrorHandler(&OnProcessFatalError);
+        // A failed DCHECK is the same thing from the embedder's side - the
+        // engine has said it cannot continue - and it arrives in the same
+        // shape. Only a debug engine has any; a release one compiles them out
+        // and never calls this.
+        v8::V8::SetDcheckErrorHandler(&OnProcessFatalError);
     }
     // The embedder's flags go first: they are the process's command line and
     // ours are the ones the library needs regardless.

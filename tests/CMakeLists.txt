@@ -125,6 +125,33 @@ if(UNIBIND_BACKEND STREQUAL "v8")
 endif()
 
 # ---------------------------------------------------------------------------
+# EngineFault::Fatal - ends the process by design, so each backend provokes its
+# own in a process of its own, and the pass condition is the report the
+# handler printed on the way out rather than an exit code.
+# ---------------------------------------------------------------------------
+if(UNIBIND_BACKEND STREQUAL "v8")
+    add_executable(unibind_fatal fatal_v8.cpp)
+    target_include_directories(unibind_fatal SYSTEM PRIVATE "${UNIBIND_V8_DIR}/include")
+    target_compile_definitions(unibind_fatal PRIVATE V8_GN_HEADER NOMINMAX WIN32_LEAN_AND_MEAN)
+else()
+    add_executable(unibind_fatal fatal_spidermonkey.cpp)
+    target_include_directories(unibind_fatal SYSTEM PRIVATE "${UNIBIND_SPIDERMONKEY_DIR}/include")
+    target_compile_definitions(unibind_fatal PRIVATE
+        STATIC_JS_API MOZ_STATIC_JS XP_WIN ENABLE_EXPLICIT_RESOURCE_MANAGEMENT NOMINMAX WIN32_LEAN_AND_MEAN)
+    string(TOLOWER "${UNIBIND_ENGINE_FLAVOR}" unibindFatalFlavor)
+    if(unibindFatalFlavor STREQUAL "debug")
+        target_compile_definitions(unibind_fatal PRIVATE DEBUG)
+    endif()
+endif()
+target_link_libraries(unibind_fatal PRIVATE unibind::unibind)
+if(unibindEngineOwnsOperators)
+    target_link_options(unibind_fatal PRIVATE "/FORCE:MULTIPLE")
+endif()
+add_test(NAME ${UNIBIND_BACKEND}.fatal-reaches-the-fault-handler COMMAND unibind_fatal)
+set_tests_properties(${UNIBIND_BACKEND}.fatal-reaches-the-fault-handler PROPERTIES
+    TIMEOUT 120 LABELS "suite" PASS_REGULAR_EXPRESSION "unibind-fault: Fatal isolate=yes message=.")
+
+# ---------------------------------------------------------------------------
 # CTest: one test per case, so a failure names the case and not the binary
 # ---------------------------------------------------------------------------
 if(EXISTS "${doctest_DIR}/doctest.cmake")

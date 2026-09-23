@@ -841,19 +841,25 @@ embedder whose policy changes changes it behind the fixed handler, through
 | kind | V8 | SpiderMonkey |
 |---|---|---|
 | `OutOfMemory` | `Isolate::SetOOMErrorHandler`, plus the library's own frame exhaustion | `JS::SetOutOfMemoryCallback`, which every internal out-of-memory funnels through - frame exhaustion included, because the backend already reports that one through `JS_ReportOutOfMemory` |
-| `Fatal` | `Isolate::SetFatalErrorHandler` and `V8::SetFatalErrorHandler` | **never** |
+| `Fatal` | `Isolate::SetFatalErrorHandler`, `V8::SetFatalErrorHandler`, and `V8::SetDcheckErrorHandler` | `MOZ_CRASH` (so every `MOZ_RELEASE_ASSERT`, and a debug engine's `MOZ_ASSERT`), recognised by a vectored exception handler |
 
-`Fatal` is the one that is not portable, and the header says so in a table
-rather than leaving it to be discovered: SpiderMonkey's fatal path is
-`MOZ_CRASH`, which is not embedder-facing at all.
+SpiderMonkey's fatal path has no embedder hook, but it does not have to have one.
+`mozilla/Assertions.h` fixes what `MOZ_CRASH` does on Windows - store the reason
+in the exported `gMozCrashReason`, then `__debugbreak()`, then a null write - and
+the engine's objects store that reason at every crash site. A vectored exception
+handler that sees a breakpoint or access violation *with that reason set* is
+therefore seeing the engine die and knows why, and nothing else in a process sets
+the variable. It reports and then ends the process with the engine's own exit
+code, so the embedder's unhandled-exception filter does not receive the same
+death a second time with less to say about it. An embedder installs
+`onEngineFault` instead of each engine's own hooks, which is what it is for.
 
-**There is deliberately no `Assertion` kind**, which is the shape the enum
-nearly had. V8 spells it `SetDcheckErrorHandler` and SpiderMonkey spells it
-`MOZ_ASSERT`, and *both compile out of a release engine*, which is what this
-ships against. A kind no shipped build of either backend can raise is strictly
-worse than one only V8 can - it is a promise with no keeper at all - and an
-engine assertion that does fire is a bug in the engine or in a backend rather
-than something an embedder acts on.
+**An engine assertion is a `Fatal`, not a kind of its own.** `DCHECK` and
+`MOZ_ASSERT` compile out of a release engine, but debug engines are published
+too and a consumer's Debug build links them, so an assertion does fire in a build
+that ships. When it does, the engine is as finished as after any other failed
+check and nothing an embedder would do differs, so it is routed into `Fatal`,
+and `message` says which check it was.
 
 `Fatal` **ends the process, and installing a handler does not change that.**
 V8 with no handler prints and aborts; V8 *with* one would hand the failed check

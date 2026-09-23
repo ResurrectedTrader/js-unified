@@ -882,11 +882,11 @@ most often says allocation is failing, so allocating to report it is a bug in
 every case and a crash in the interesting one. Reserve the buffer and open the
 log file first.
 
-`EngineFault::OutOfMemory` comes from both engines. `EngineFault::Fatal` comes
-only from V8 - SpiderMonkey's fatal path is `MOZ_CRASH`, which no embedder can
-hook - and the header says so rather than leaving you with a case that never
-runs. There is no assertion kind, because both engines compile theirs out of the
-release builds this ships against.
+Both kinds come from both engines. `EngineFault::Fatal` covers a failed engine
+check of every sort - V8's `CHECK` and API misuse, SpiderMonkey's `MOZ_CRASH`
+and `MOZ_RELEASE_ASSERT`, and the `DCHECK` / `MOZ_ASSERT` a debug engine adds -
+and the process ends after your handler returns. It is the one hook to install
+instead of each engine's own OOM, fatal and assertion handlers.
 
 ```cpp
 std::size_t Rescue(ub::Isolate& isolate, std::size_t current, std::size_t initial,
@@ -1073,10 +1073,8 @@ not a workaround for something you could otherwise ask for - you cannot ask.
 has nothing of the kind - not a different shape, nothing - so a call to it does
 not link there. Both engines still report the failure itself as
 `EngineFault::OutOfMemory`; what differs is whether you get asked first.
-`EngineFault::Fatal` is V8-only for the same sort of reason: SpiderMonkey's
-fatal path is `MOZ_CRASH`, which is not embedder-facing, and there is no
-assertion kind at all because both engines compile theirs out of a release
-build.
+`EngineFault::Fatal` needs no such caveat: SpiderMonkey has no hook for its
+`MOZ_CRASH`, so the backend recognises the crash itself.
 
 **Not thread-safe, by contract.** Everything but `TerminateExecution`,
 `RequestInterrupt` and `PostJob` happens on the isolate's own thread.

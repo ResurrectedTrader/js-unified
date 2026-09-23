@@ -40,22 +40,14 @@ namespace ub {
 /// | kind | V8 | SpiderMonkey |
 /// |---|---|---|
 /// | `OutOfMemory` | yes | yes |
-/// | `Fatal` | yes | **never** |
+/// | `Fatal` | yes | yes |
 ///
-/// `Fatal` is the one that is not portable, and saying so is worth more than a
-/// kind that silently never arrives on half the builds. SpiderMonkey's fatal
-/// path is `MOZ_CRASH`, which is not embedder-facing: there is no hook to
-/// install, no callback it consults, and no backend work that would change
-/// that. A SpiderMonkey build will never call you with `Fatal`.
-///
-/// **There is deliberately no `Assertion` kind**, which is the shape this enum
-/// nearly had. V8 spells it `SetDcheckErrorHandler` and SpiderMonkey spells it
-/// `MOZ_ASSERT`, and *both* compile out of a release engine - so it would be a
-/// kind that no shipped build of either backend can raise, which is strictly
-/// worse than one only V8 can. An engine assertion that does fire is a bug in
-/// the engine or in the backend rather than something an embedder can act on,
-/// and it is reported the way a bug is: by the engine, to stderr, on the way
-/// down.
+/// **An engine assertion is a `Fatal`, not a kind of its own.** V8's `DCHECK`
+/// and SpiderMonkey's `MOZ_ASSERT` exist only in a debug engine, and when one
+/// fails the engine is exactly as finished as after a check that survives into
+/// a release build - there is nothing an embedder would do differently, so a
+/// separate kind would be a distinction with no use. What the report says in
+/// `message` is where the two differ, and that is diagnostic text anyway.
 enum class EngineFault : std::uint8_t {
     /// The engine could not get memory it needed, and said so rather than
     /// waiting to be asked.
@@ -82,8 +74,14 @@ enum class EngineFault : std::uint8_t {
 
     /// The engine hit a condition it does not continue from.
     ///
-    /// V8 only (see the table above). Two things reach it: an API misuse V8
-    /// itself detects, and a failed internal check.
+    /// On V8: an API misuse V8 itself detects, a failed `CHECK`, and in a
+    /// debug engine a failed `DCHECK`. On SpiderMonkey: `MOZ_CRASH`, which is
+    /// what every `MOZ_RELEASE_ASSERT` - and in a debug engine every
+    /// `MOZ_ASSERT` - comes down to. SpiderMonkey has no hook for that; the
+    /// backend recognises the crash sequence the engine's own header defines
+    /// (its reason stored in `gMozCrashReason`, then a breakpoint) with a
+    /// vectored exception handler, installed only when a handler is. `message`
+    /// is the engine's reason, `location` is empty.
     ///
     /// **The process ends, and installing a handler does not change that.**
     /// That is deliberate and is the only defensible answer: V8 with no

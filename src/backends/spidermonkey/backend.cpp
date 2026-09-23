@@ -8,6 +8,7 @@
 // Nothing above them includes a SpiderMonkey header, which is what
 // `unibind_headers_only` proves.
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -2425,6 +2426,18 @@ std::optional<std::uint32_t> g_workerThreads;  // NOLINT(*-avoid-non-const-globa
 EngineFaultCallback g_faultHandler = nullptr;  // NOLINT(*-avoid-non-const-global-variables)
 CallbackData g_faultData;                      // NOLINT(*-avoid-non-const-global-variables)
 
+/// The vectored handler that turns `MOZ_CRASH` into `EngineFault::Fatal`, while
+/// one is installed. Defined below, beside the per-thread isolate it reads.
+LONG CALLBACK OnEngineCrash(EXCEPTION_POINTERS* info);
+PVOID g_crashHandler = nullptr;  // NOLINT(*-avoid-non-const-global-variables)
+
+void RemoveCrashHandler() noexcept {
+    if (g_crashHandler != nullptr) {
+        RemoveVectoredExceptionHandler(g_crashHandler);
+        g_crashHandler = nullptr;
+    }
+}
+
 /// Hand a fault to whatever the embedder installed, if anything.
 ///
 /// **Nothing here allocates**, and that is the contract rather than an
@@ -2512,6 +2525,13 @@ Platform::Platform(const PlatformOptions& options) {
     // this is the copy those installs read.
     g_faultHandler = options.onEngineFault;
     g_faultData = options.engineFaultData;
+    if (g_faultHandler != nullptr) {
+        // Only when there is somewhere to send it, as on the other backend:
+        // with no handler the engine's own crash is what was asked for. First
+        // in the chain, so the report is written before anything else the
+        // process installed decides what the exception means.
+        g_crashHandler = AddVectoredExceptionHandler(1, &OnEngineCrash);
+    }
 
     // `JS_Init` reports failure and it is not decoration - it can fail. An
     // unchecked `assert` here is worse than nothing, because it compiles out of
@@ -2547,6 +2567,7 @@ Platform::~Platform() {
     // successful `JS_Init` is not something the engine promises to survive, and
     // the destructor of a failed bring-up is precisely when it would be called.
     if (!g_initialized) {
+        RemoveCrashHandler();
         g_faultHandler = nullptr;
         g_faultData = CallbackData{};
         return;
@@ -2559,6 +2580,7 @@ Platform::~Platform() {
     g_initialized = false;
     // Last, because everything above could still have faulted. The handler
     // belongs to this Platform and the next one brings its own.
+    RemoveCrashHandler();
     g_faultHandler = nullptr;
     g_faultData = CallbackData{};
 }
@@ -2592,6 +2614,37 @@ namespace {
 /// `unibind/isolate.h` already documents as what happens when a heap cannot be
 /// made. Dying is not one of the available answers.
 thread_local Isolate* g_threadIsolate = nullptr;  // NOLINT(*-avoid-non-const-global-variables)
+
+/// SpiderMonkey ending the process: `MOZ_CRASH`, and through it every
+/// `MOZ_RELEASE_ASSERT` - and every `MOZ_ASSERT` in a debug engine.
+///
+/// None of those has an embedder hook; they are the engine's crash-reporter
+/// protocol. What they do on Windows is fixed by `mozilla/Assertions.h`: store
+/// the reason in the exported `gMozCrashReason`, then `__debugbreak()`, then
+/// write through null, then `TerminateProcess`. So the first of those
+/// exceptions, seen with a reason set, *is* the engine's fatal path, and the
+/// reason is the engine's own message for it. Nothing else in a process sets
+/// that variable, which is what keeps this from claiming a breakpoint or an
+/// access violation that is not the engine's.
+///
+/// It ends the process itself once it has reported, as the other backend does
+/// for its `Fatal`: the engine is past continuing, and returning would only
+/// walk into the null write and hand the same death to whatever unhandled-
+/// exception filter the embedder has, as a second, less informative report.
+/// Exit code 3 is the one the engine's own `TerminateProcess` would have used.
+LONG CALLBACK OnEngineCrash(EXCEPTION_POINTERS* info) {
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    const char* reason = gMozCrashReason;
+    if (reason == nullptr || (code != EXCEPTION_BREAKPOINT && code != EXCEPTION_ACCESS_VIOLATION)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    static std::atomic_flag reported;
+    if (!reported.test_and_set()) {
+        ReportEngineFault(EngineFault::Fatal, g_threadIsolate, "", reason);
+    }
+    TerminateProcess(GetCurrentProcess(), 3);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 /// `wanted`, or as much of this thread's stack as can safely be promised.
 ///

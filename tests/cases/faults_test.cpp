@@ -19,10 +19,9 @@
 ///     is the decision point `Isolate::SetHeapLimitCallback` exists for, and
 ///     only one of the two engines has it.
 ///
-/// What no case here can reach is `EngineFault::Fatal`: provoking it means
-/// making V8 fail an internal check, which ends the process by design, and the
-/// only ways to do that from this API are undefined behaviour. `docs/testing.md`
-/// says so rather than the suite pretending otherwise.
+/// `EngineFault::Fatal` is not here: it ends the process by design, so each
+/// backend provokes it in a process of its own (`tests/fatal_*.cpp`, see
+/// `docs/testing.md`).
 
 #include <cstddef>
 #include <string>
