@@ -39,7 +39,7 @@ struct Client final : ub::InspectorClient {
         ++pauses;
         // What a real client's loop depends on: DevTools only knows to send a
         // resume once it has been told the script is paused.
-        if (Saw("\"method\":\"Debugger.paused\"")) {
+        if (Saw(R"("method":"Debugger.paused")")) {
             ++pausesAnnounced;
         }
         quit = false;
