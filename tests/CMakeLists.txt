@@ -42,6 +42,7 @@ add_executable(unibind_tests
     cases/binary_test.cpp
     cases/classes_test.cpp
     cases/codecache_test.cpp
+    cases/coverage_test.cpp
     cases/exceptions_test.cpp
     cases/faults_test.cpp
     cases/functions_test.cpp

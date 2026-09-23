@@ -517,7 +517,9 @@ class Isolate {
     [[nodiscard]] bool HasPendingException() const noexcept;
 
     /// Throw from native code. The throw takes effect when control returns to
-    /// the engine; the calling code should stop and return promptly.
+    /// the engine; the calling code should stop and return promptly. `message`
+    /// is decoded as `ub::Throw` decodes it: bytes that are not UTF-8 become
+    /// U+FFFD rather than costing the error.
     void ThrowError(ErrorKind kind, std::string_view message);
 
     [[nodiscard]] HeapStatistics GetHeapStatistics() const noexcept;

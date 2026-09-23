@@ -843,7 +843,10 @@ bool IsType(Slot value, TypeCode type) noexcept {
         case TypeCode::BigInt:
             return raw->IsBigInt();
         case TypeCode::Object:
-            return raw->IsObject();
+            // V8 15.6 counts its own External as an object; this API does not
+            // (`unibind/handle.h`), because an External has no properties to
+            // offer and SpiderMonkey's is a private class no script may touch.
+            return raw->IsObject() && !raw->IsExternal();
         case TypeCode::Array:
             return raw->IsArray();
         case TypeCode::Function:

@@ -295,8 +295,8 @@ version, and an engine with no interceptor of its own builds ours out of
 proxies, so a kind that singled proxies out would make a sandbox object report
 differently on two backends purely because of how it was built.
 
-Ask `Is<ArrayBuffer>()` or `To<TypedArray>()`, which answer without a kind of
-their own. `ValueKind::Other` is not the exotic-object answer - it means the
+Ask `Is<ArrayBuffer>()` or `To<TypedArray>()` - or `IsArrayBuffer()`,
+`IsTypedArray()`, `IsDataView()` - which answer without a kind of their own. `ValueKind::Other` is not the exotic-object answer - it means the
 backend could not classify the value at all, which today happens for no value on
 either engine.
 
@@ -307,7 +307,16 @@ not how the engine happens to be storing it. So it is true for `1.0` and false
 for `1.5`, and the same JavaScript expression can narrow or fail to narrow
 depending on what it evaluated to. That is deliberate: SpiderMonkey has one
 number type, and asking V8's storage question would have given two backends two
-answers.
+answers. `IsInt32()` is the same question, and `IsUint32()` its unsigned twin,
+which also says no to `-0`.
+
+### An `External` is not an `Object`, though V8 says it is
+
+`IsObject()`, `Is<Object>()` and `To<Object>()` all say no to an `External`, on
+both backends: it is a value with no properties, and `Object` promises property
+operations. Code ported from V8 may expect the opposite, because V8 15.6's own
+`External::IsObject()` is true. Ask `IsExternal()` first where the difference
+matters.
 
 ### `Object::Set` is not `DefineOwnProperty`
 
@@ -403,6 +412,16 @@ declaration time puts them in the wrong realm.
 
 As in JavaScript. If "not passed" has to differ from "passed `undefined`", ask
 `Length()`.
+
+### `Object::SetAccessor` keeps its callbacks for the life of the isolate
+
+**Silent, and it grows.** An accessor on one object records its getter, setter
+and data the way a template's accessor does - in the isolate, until the isolate
+goes - because the property's functions may be called for as long as anything
+can reach the object, and nothing tells the library when that stops. Once per
+realm or per long-lived object is what it is for. Calling it on an object made
+for every call adds a record per call that is never given back; use an
+`ObjectTemplate` with the accessor on it instead, which records it once.
 
 ### Throwing does not stop your C++
 
@@ -638,6 +657,13 @@ A posted callback is not inside a call: no realm is current and no handle scope
 is open. Open your own `HandleScope` and `ContextScope`, let nothing escape, and
 wrap engine calls in a `TryCatch`.
 
+`PostDelayedJob` is not a timer. Its delay is a floor: once it has passed the
+job is ordinary posted work, and nothing wakes the thread to run it, so a job due
+in ten milliseconds on a thread that pumps once a second runs up to a second
+late. The same goes for `Inspector::RequestDispatch` on an idle isolate - it
+runs at the next pump - and a request still waiting when the `Inspector` goes is
+dropped with it.
+
 ### A stack quota larger than the thread's real stack is not a limit
 
 **Fatal, and it is the failure the knob exists to prevent.** `stackLimitBytes`
@@ -827,12 +853,20 @@ many bytes.
 There is no borrowing a string's bytes on a moving collector, so `Utf8Value()`
 allocates and `String::New` copies out of the view you hand it. An empty result
 means the bytes were not valid UTF-8 **or** the engine could not allocate, and
-the two are indistinguishable. `String::NewFromUtf8` never refuses bytes - it
-repairs them, one U+FFFD per maximal invalid sequence - so an empty result from
-it means only that the engine could not allocate. Reach for it when repair is
-what you want, and not to make an encoding error go away. The same applies to the `std::string_view`
+the two are indistinguishable. The same applies to the `std::string_view`
 overloads of `Get`/`Set`: a key that could not be built and a property access
 that failed both arrive as an empty optional.
+
+`String::NewFromUtf8` never refuses bytes - it repairs them, one U+FFFD per
+maximal invalid sequence - so an empty result from it means only that the
+engine could not allocate. Reach for it when repair is what you want, and not to
+make an encoding error go away. **The conveniences are lossy, and `String::New`
+is not**: `ReturnValue::Set` with text and every way of throwing a fresh error
+(`ub::Throw`, `info.Throw`, `Isolate::ThrowError`, `MakeError`) repair as
+`NewFromUtf8` does, as V8's own do, because that text is usually read from
+outside. So the same bytes are a string with a U+FFFD in it when a callback
+returns them and no string at all when handed to `String::New` - both on
+purpose, and silent either way.
 
 ### Binary data is copied in both directions, and there is no borrowing
 

@@ -37,8 +37,8 @@ A backend joins the comparison by existing: nothing lists them.
 
 Every doctest case is registered with CTest under its own name
 (`v8.handles: a Global outlives every handle scope`), so a failure names the
-case rather than the binary. Seven tests stand apart from the per-case ones, the
-last of them only in a checked build:
+case rather than the binary. Seven tests stand apart from the per-case ones on
+every backend, an eighth on V8, and two more in a checked build:
 
 | test | what it is |
 |---|---|
@@ -48,7 +48,10 @@ last of them only in a checked build:
 | `<backend>.global-identity-without-a-scope` | decision 16's load-bearing clause: two `Global`s compared with no `HandleScope` open at all. A backend that gets it wrong ends the process, so it runs alone rather than taking the matrix with it. |
 | `<backend>.platform-is-the-gate-on-an-isolate` | the platform lifecycle - before one exists, while one does, after it has gone - which needs a process with no `Platform` in it, and the suite always has one |
 | `<backend>.worker-threads-belong-to-one-platform` | the same, with a worker-thread count asked for, so the cached figure is observable |
+| `<backend>.fatal-reaches-the-fault-handler` | decision 28's `EngineFault::Fatal`: the engine's own fatal path, provoked in a process of its own, passing on the report the handler printed on the way out rather than on an exit code |
+| `v8.interop` | `unibind/interop/v8.h`, which only the V8 backend defines, so it is built and run only there |
 | `<backend>.checked.using-a-handle-after-its-scope-closed-is-diagnosed` | `docs/lifetimes.md` section 9: a checked build must diagnose a stale handle. Diagnosing it means dying, so it runs in a process of its own and is expected to fail. Debug configurations only - Release compiles the assertion out. |
+| `<backend>.checked.a-global-outliving-its-isolate-is-diagnosed` | decision 27: a `Context`, `Script` or `Global<T>` still alive when its isolate goes. Same shape and same reason as the one above, and registered the same way. |
 
 ## Areas a backend has not implemented yet
 
@@ -81,8 +84,12 @@ name in `UNIBIND_TEST_CASE`. Nothing else knows the list.
 
 ```
 main.cpp            the runner, plus the checks that need a process of their
-                    own: the deliberately-fatal one, and the two about a
-                    process before and after it has a `Platform`
+                    own: the two deliberately-fatal checked-build ones,
+                    comparing `Global`s with no scope open, and the two about
+                    a process before and after it has a `Platform`
+fatal_v8.cpp        EngineFault::Fatal provoked through each engine's own
+spidermonkey/fatal.cpp    fatal path, one process per backend
+interop_v8.cpp      unibind/interop/v8.h, built only for V8
 support/harness.h   the fixture, the gating macros, and the small helpers
 support/allocations.cpp   global operator new/delete, so a leak test has
                           something to measure that no engine reports

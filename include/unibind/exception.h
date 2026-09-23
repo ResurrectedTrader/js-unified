@@ -170,7 +170,15 @@ class TryCatch {
     /// that was not compiled through `Script` (`eval`, `new Function`) has a
     /// line on V8 and none on SpiderMonkey.
     [[nodiscard]] std::optional<MessageLocation> Location(const Context& context) const {
-        return detail::TryCatchLocation(State(), context);
+        std::optional<MessageLocation> location = detail::TryCatchLocation(State(), context);
+        // Both engines answer a throw with no script under it with a location
+        // that names no line - and each fills the rest differently, V8 with an
+        // empty line of text and SpiderMonkey with a script called "<native>".
+        // No line is no position, so it is settled here, once, as empty.
+        if (location && location->lineNumber <= 0) {
+            return std::nullopt;
+        }
+        return location;
     }
 
     /// Let the exception continue outwards when this handler closes, instead

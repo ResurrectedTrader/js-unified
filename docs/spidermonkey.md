@@ -229,9 +229,11 @@ SpiderMonkey values are primitives or objects, with nothing in between. So
 `External` is an object of a private `JSClass` holding the embedder pointer in
 a reserved slot, and `KindOf` / `IsType` ask the class before they ask anything
 else - which means `value.Is<Object>()` is deliberately **false** for an
-External, matching V8, where `External::IsObject()` is also false. The
-divergence is invisible from the API and is worth noting only because the
-obvious implementation (a plain object) would have got it wrong.
+External. That is this API's answer rather than either engine's: V8 15.6's
+`External::IsObject()` is true, and the V8 backend excludes it by hand just as
+this one does. The divergence is invisible from the API and is worth noting
+only because the obvious implementation (a plain object) would have got it
+wrong.
 
 ### There is no `Integer` type
 
@@ -358,9 +360,14 @@ so `JS_SetContextPrivate` holds the owning `ub::Isolate*`; a callback's
 SpiderMonkey gives a native no closure pointer of its own. The realm's
 `Context` is recovered from a reserved slot on the current global.
 
-`GetHeapStatistics` reports `JSGC_BYTES` for both `usedBytes` and `totalBytes`,
-because the engine does not separate them the way V8 does. The header already
-warns that only `usedBytes` is comparable, and even then only as a trend.
+`GetHeapStatistics` reports `JSGC_BYTES` as `usedBytes` and, as `totalBytes`,
+the chunks the collector holds (`JSGC_TOTAL_CHUNKS` times `JSGC_CHUNK_BYTES`):
+the heap is reserved in chunks, so that is what has been reserved, used or not.
+The six figures V8 adds - physical, external, malloced and its peak, and the
+global-handle pool - are left empty. The engine's only source for them is a
+full memory report that walks the heap, which is not what a statistics call
+should cost, and zero would be a claim. The header already warns that only
+`usedBytes` is comparable, and even then only as a trend.
 
 ### A `PersistentRooted` you only assigned to is not a root
 
@@ -622,6 +629,14 @@ What the stencil route does **not** buy is any association between a blob and
 the source it came from - see below. That was worth finding out, because it is
 the obvious thing to assume.
 
+`CompileOptions::EagerCompile` is one compile option here:
+`setEagerDelazificationStrategy(ParseEverythingEagerly)`, which parses every
+function body and gives it bytecode in the first pass, so the stencil - and so
+the blob - holds all of it rather than a syntax-checked outline of each
+function. Nothing else is needed, because this engine has no in-isolate
+compilation cache that could answer an eager compile with an earlier lazy one;
+that is V8's problem, and decision 19 says what its backend does about it.
+
 #### The blob says which engine built it, and not which source it came from
 
 **This is the most dangerous thing found in this backend, and the stencil route
@@ -875,3 +890,19 @@ does anyway.
 
 Mechanical. `Maybe<T>` was already an alias for `std::optional<T>`, and this
 backend's uses are spellings rather than semantics.
+
+### 5.9 A DevTools inspector: not of this shape
+
+SpiderMonkey's debugging surface is the `Debugger` object, a JavaScript API
+installed into a debuggee realm. It speaks no protocol and has no C++ session to
+drive, so a Chrome DevTools inspector over it would be a debugger server written
+in script on top of that object - a different and much larger thing than a
+backend, and not one this backend pretends to be.
+
+So `src/backends/spidermonkey/inspector.cpp` defines every member of
+`unibind/inspector.h` and makes nothing: `Inspector::Supported()` is false,
+`New` returns null, and the rest can never be reached, because there is never an
+object to call it on. That a program compiled once links against this backend
+anyway, and is told no at run time, is the point (decision 29) - and it is why
+this is not decision 19's link error, which would have made a program that
+merely *offers* a DevTools port impossible to build against this engine.

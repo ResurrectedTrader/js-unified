@@ -97,12 +97,16 @@ class Local {
     [[nodiscard]] bool IsSymbol() const noexcept { return Kind() == ValueKind::Symbol; }
     [[nodiscard]] bool IsName() const noexcept { return IsString() || IsSymbol(); }
     [[nodiscard]] bool IsBigInt() const noexcept { return Kind() == ValueKind::BigInt; }
-    /// True for every object, arrays and functions included, as in V8.
+    /// True for every object, arrays and functions included, as in V8 - and
+    /// false for an `External`, which V8 itself counts as one and this API does
+    /// not: an External is a value with no properties, and `Is<Object>()` says
+    /// the same.
     [[nodiscard]] bool IsObject() const noexcept { return detail::IsType(slot_, TypeCode::Object); }
     [[nodiscard]] bool IsArray() const noexcept { return Kind() == ValueKind::Array; }
     [[nodiscard]] bool IsFunction() const noexcept { return Kind() == ValueKind::Function; }
     [[nodiscard]] bool IsExternal() const noexcept { return Kind() == ValueKind::External; }
-    /// A number that is exactly an `int32_t`, however the engine stores it.
+    /// A number that is exactly an `int32_t`, however the engine stores it, and
+    /// not `-0`, which V8 does not count as one.
     [[nodiscard]] bool IsInt32() const noexcept { return detail::IsType(slot_, TypeCode::Integer); }
     /// A number that is exactly a `uint32_t` - an integer from 0 to 2^32 - 1,
     /// and not `-0`, which V8 does not count as one either.

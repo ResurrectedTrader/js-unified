@@ -12,20 +12,22 @@ backend without one can define none of them.
 
 **Where the two backends are.** Both implement everything the headers declare
 that their engines can do, decisions 1-29, and the suite agrees case for case:
-305 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
+330 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
 harness's own test of the skip path, which exists so that the machinery for
 reporting a missing area is exercised on every backend rather than only on the
 day one falls behind.
 
-Eight rows are `SKIPPED | PASSED`, and none of them is a backend falling behind.
-Two are `HEAP_LIMIT`, decision 28's near-heap-limit hook: SpiderMonkey has no
-such thing to implement, so it defines nothing, a call does not link, and the
-two cases report a skip. That is the shape decision 19 designed for an absent
-operation, working as designed - it is a gap in the *engines*, and the report
-saying so is the point rather than a defect in it. The other six are the
-inspector's protocol cases (decision 29), which ask `Inspector::Supported()` and
-report a skip where it says no - the same gap, reported the way decision 29 says
-this one is.
+Thirteen rows are `SKIPPED | PASSED`, and none of them is a backend falling
+behind. Two are `HEAP_LIMIT`, decision 28's near-heap-limit hook: SpiderMonkey
+has no such thing to implement, so it defines nothing, a call does not link, and
+the two cases report a skip. That is the shape decision 19 designed for an
+absent operation, working as designed - it is a gap in the *engines*, and the
+report saying so is the point rather than a defect in it. Ten are cases that
+drive the inspector's protocol (decision 29), which ask `Inspector::Supported()`
+and report a skip where it says no - the same gap, reported the way decision 29
+says this one is. The last is a view over a `SharedArrayBuffer`, which a
+SpiderMonkey realm made here does not define, so the case asks script whether
+the constructor exists and reports a skip when it does not (`docs/testing.md`).
 
 - V8 15.6: `src/backends/v8/`.
 - SpiderMonkey 153.3.0esr: `src/backends/spidermonkey/`. Its own notes - what
@@ -143,6 +145,14 @@ call has a receiver, so the accessor has one.
 Consequence: `PropertyAttribute::ReadOnly` is meaningless on an accessor - a
 getter with no setter *is* the read-only form - and both backends drop it.
 
+`Object::SetAccessor` - V8's, for one object rather than every instance of a
+template - installs exactly the same property: two real functions, so
+`Object.getOwnPropertyDescriptor` reports `get` and `set` on both engines, a
+receiver that is whatever the read went through, and the same dropped
+`ReadOnly`. Its callback record is the isolate's for the isolate's life, as a
+template's is (decision 13), which is the one thing an embedder has to know
+about it: it is for an object made a bounded number of times.
+
 ### 7. Boxes and natives are destroyed exactly once, finalizer or not
 
 This was one invariant until decision 14, because under exclusive ownership
@@ -190,6 +200,12 @@ own builds ours out of proxies, so a kind that singled proxies out would make a
 sandbox object report differently on two backends purely because of how we
 built it. `ValueKind::Other` is for a value a backend cannot classify at all,
 which today is no value on either engine.
+
+The other half of the same rule: **an `External` is not an `Object`**, to
+`Is<Object>()` or to `IsObject()`, on either backend. It is a value with no
+properties, which is what `Object` would promise. V8 15.6 counts its own
+External as an object, so that backend excludes it by hand; SpiderMonkey's is an
+object of a private class, excluded the same way (`docs/spidermonkey.md`).
 
 ### 9. A native function is callable; a constructor is asked for (`unibind/value.h`)
 
@@ -276,7 +292,8 @@ is nothing to run.
 
 ### 13. Templates outlive nothing
 
-`TemplateRec`, `ClassRec` and the accessor and interceptor records are
+`TemplateRec`, `ClassRec` and the accessor and interceptor records - including
+the record `Object::SetAccessor` makes for a single object - are
 isolate-owned and isolate-lifetime by design (see the header comment in
 `unibind/template.h`). They are raw pointers into containers the isolate owns, and
 they must not become refcounted. Everything holding an engine root is released
@@ -294,7 +311,11 @@ the other still reads, and nothing at the call site says which.
 gives back a share and the native goes when the last holder does - which may be
 the embedder's. `Wrap` takes a share (a `unique_ptr` converts), `Unwrap` still
 hands back a bare `T*`, and `UnwrapShared` is how a native outlives the wrapper
-it came from.
+it came from. A constructor may return either shape too: `Construct` and
+`ConstructOrCall` take a callback returning a `std::unique_ptr<T>` or one
+returning a `std::shared_ptr<T>`, so a native with a deleter of its own, or one
+the embedder already holds, is made the way any other is. The trampoline turns
+either into the wrapper's share, so that cost no backend anything either.
 
 Rejected, and why, in the header: a **borrowed wrapper** (the bug this
 prevents), a **per-class dial** (a type parameter on the most-used type in the
@@ -316,8 +337,10 @@ the case this decision exists for.
 
 ### 15. Stopping a script from another thread (`unibind/isolate.h`)
 
-`TerminateExecution` is one of the two operations callable from a thread other
-than the isolate's. Not catchable from script, not consumed by a `TryCatch`
+`TerminateExecution` is callable from a thread other than the isolate's, as are
+`RequestInterrupt` (decision 24), `PostJob` and `PostDelayedJob` (decision 23)
+and the inspector's `RequestDispatch` (decision 29); nothing else is. Not
+catchable from script, not consumed by a `TryCatch`
 (`HasTerminated` is how a caller tells it from a throw), remembered if nothing
 is running yet, and **it does not interrupt a native callback** on either
 engine - a blocking native runs to completion and the unwind happens at the next
@@ -403,6 +426,14 @@ never off the engine's Message.** V8 will happily capture a trace for `throw 1`
 if asked, and a stack invented for a value that never carried one is the
 plausible wrong answer this whole API exists to prevent. A thrown non-Error
 answers empty.
+
+`TryCatch::Location` is the other half: V8's `v8::Message` - script, line,
+column and the text of the line - in one call, and the one thing to print a
+syntax error with, because a script that never compiled has no frame. Where the
+engine has no position at all - a throw from native code with no script under
+it - the answer is empty. Both engines answer that case with a location that
+names no line and differ in what they put in the rest, so the header settles it
+rather than either backend: no line is no location.
 
 ### 19. Compiled-code caching, and how "this engine cannot" is said (`unibind/script.h`)
 
@@ -616,10 +647,23 @@ and **nothing accelerates that** short of terminating what is running. The
 reasoning is under decision 24, because the thing an embedder reaches for first
 is the interrupt and it does not help.
 
+`PostDelayedJob` is `PostJob` with a floor on when - V8's `PostDelayedTask`,
+for the timer an embedder would otherwise keep beside the isolate - and the
+floor is all it adds. Measured on a steady clock from the call, a delayed job
+becomes posted work at the first pump after it falls due and joins the back of
+the queue there, so work posted before that pump runs first whenever it was
+posted; delayed jobs among themselves run in the order they fall due, and in
+posting order when they fall due together. **Nothing wakes the thread when one
+falls due**, for the same reason nothing wakes it for posted work, so an
+embedder that sleeps between pumps bounds the lateness by how long it sleeps.
+A delay of zero, a negative one or a NaN is no delay, and one still waiting at
+teardown is dropped like the rest.
+
 ### 24. What an interrupt callback may do (`unibind/isolate.h`)
 
-`RequestInterrupt` is the other cross-thread operation, and the only way to reach
-the isolate's thread without waiting for the script to finish. The contract is a
+`RequestInterrupt` is the other way to reach a running script from another
+thread, and - the inspector's `RequestDispatch` aside, which is built on it - the
+only way to reach the isolate's thread without waiting for the script to finish. The contract is a
 split, not a ban:
 
 | inside an interrupt callback | |
@@ -1040,6 +1084,20 @@ needs it.
   `NewFunctionWithReserved` function has exactly two slots and both are taken.
   A `CallbackData` function pays nothing for it on V8, which has a trampoline
   for each kind, and one flag test on SpiderMonkey.
+- **`HeapStatistics` has three figures every engine gives and six only V8
+  does.** `usedBytes`, `totalBytes` and `limitBytes` are always filled; the
+  physical, external, malloced and global-handle figures are `std::optional`
+  and empty on SpiderMonkey, whose only source for them is a full memory report
+  that walks the heap. Empty rather than zero, because zero would be a claim.
+  SpiderMonkey's `totalBytes` is the chunks its collector has reserved, so it is
+  not a repeat of `usedBytes`; only `usedBytes` compares across engines, and
+  only as a trend.
+- **`ReturnValue` and `Local`'s predicates are header-only.** V8's integer
+  setters (`int16_t` to `uint64_t`, each the integer when it fits in an
+  `int32_t` and a Number otherwise), `Set(const Global<T>&)`, `SetFalse`,
+  `SetEmptyString`, and `IsUndefined` through `IsPromise` are all written over
+  entry points every backend already had, so none of them has a capability row
+  or a backend change.
 
 ## What the suite pins, and what it deliberately does not
 
@@ -1058,9 +1116,10 @@ could assert on one backend and would then be wrong about the other.
 
 **Adding an operation to the headers?** Add its row to
 `tests/cmake/Capabilities.cmake` too, or the suite will never gate on it and an
-unimplemented backend will fail to link instead of reporting a skip. Decisions
-14-25 need these rows, and a backend that has not caught up will then report a
-skip rather than failing to link:
+unimplemented backend will fail to link instead of reporting a skip. The
+decisions from 14 on, and the operations added beside them, need these rows,
+and a backend that has not caught up will then report a skip rather than
+failing to link:
 
 ```
 "OWNERSHIP|ClassInstantiate,GetNativeBox"
@@ -1068,12 +1127,15 @@ skip rather than failing to link:
 "GLOBAL_IDENTITY|GlobalStrictEquals,GlobalSameValue,GlobalStrictEqualsSlot,GlobalSameValueSlot"
 "TERMINATION|TerminateExecution@Isolate,IsExecutionTerminating@Isolate,CancelTerminateExecution@Isolate,TryCatchHasTerminated"
 "STACK_FRAMES|CaptureStack,TryCatchStackFrames"
+"MESSAGE_LOCATION|TryCatchLocation"
+"OBJECT_ACCESSORS|SetAccessorProperty"
 "CODE_CACHE|CompileScriptWithCache,ScriptUsedCodeCache,ScriptCreateCodeCache"
 "STACK_LIMIT|New@Isolate"
 "BINARY_DATA|MakeArrayBuffer,ArrayBufferByteLength,ArrayBufferCopyOut,MakeTypedArray,TypedArrayElementType,TypedArrayLength,TypedArrayByteOffset,TypedArrayBuffer,TypedArrayCopyOut"
 "SERIALIZATION|SerializeValue,DeserializeValue"
 "PROMISES|MakePromise,ResolvePromise,RejectPromise,PromiseStateOf,PumpJobs@Isolate"
 "JOBS|PostJob@Isolate,PumpJobs@Isolate"
+"DELAYED_JOBS|PostDelayedJob@Isolate,PumpJobs@Isolate"
 "INTERRUPTS|RequestInterrupt@Isolate"
 "WORKER_THREADS|WorkerThreads@Platform"
 "HEAP_LIMIT|SetHeapLimitCallback@Isolate"

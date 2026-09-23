@@ -78,26 +78,28 @@ pointing inside SpiderMonkey's own crash macro.
 | handle lifetimes | `cases/handles_test.cpp` | `docs/lifetimes.md` section 5, one case per rule: LIFO nesting, copying and storing within a frame, escaping once, sixteen times, and through two frames, `Global` across frames, and frame spill past the inline slots |
 | frame exhaustion | `cases/handles_test.cpp` | rule 9: a frame that cannot grow yields an *empty* handle and reports out of memory - see below for where it can be provoked |
 | roots given back | `cases/handles_test.cpp` | frames and globals, measured through replaced `operator new` |
-| values | `cases/values_test.cpp` | kinds, the narrowing lattice, strict / same-value / loose equality, every coercion, UTF-8 round-trip and truncation, externals |
-| objects | `cases/objects_test.cpp` | get / set / delete / has / hasOwn, own-key filters, prototypes, attributes, arrays |
-| functions | `cases/functions_test.cpp` | arguments, receiver, every `ReturnValue` setter, typed callback data, calling and constructing both directions, reentrancy |
-| exceptions | `cases/exceptions_test.cpp` | throwing values and errors, every `ErrorKind`, nesting, re-throw, reset, a handler that does nothing consuming what it caught, stack shape |
+| values | `cases/values_test.cpp` | kinds, the narrowing lattice, V8's type predicates, strict / same-value / loose equality, every coercion, UTF-8 round-trip and truncation, `NewFromUtf8`'s repair of every kind of malformed sequence, externals |
+| objects | `cases/objects_test.cpp` | get / set / delete / has / hasOwn, own-key filters, prototypes, attributes, arrays, and an accessor on one object - native on every read and write, a real accessor to `getOwnPropertyDescriptor`, read-only without a setter |
+| functions | `cases/functions_test.cpp` | arguments, receiver, every `ReturnValue` setter and integer width, typed callback data, a script value as a function's data (one callback behind many functions, any kind of value, collected with its function, crossing a realm), text returned or thrown with bad bytes arriving repaired, calling and constructing both directions, reentrancy |
+| exceptions | `cases/exceptions_test.cpp` | throwing values and errors, every `ErrorKind`, nesting, re-throw, reset, a handler that does nothing consuming what it caught, stack shape, and `Location`: a runtime error, a syntax error that has no frame, a thrown non-error, and nothing caught |
 | scripts | `cases/scripts_test.cpp` | compile once run many, a script outliving its scope, origins in diagnostics |
 | realms | `cases/realms_test.cpp` | separate globals, values crossing, `instanceof` not crossing, nesting, refcounting. A value *works* in any realm of its isolate and that is asserted; its *identity* seen from a foreign realm is not guaranteed, because an engine that wraps hands out a distinct object, so nothing there compares objects across a realm boundary |
 | symbols | `cases/symbols_test.cpp` | identity, description, the registry, the well-known five, symbols as keys |
-| the isolate | `cases/isolate_test.cpp` | the typed embedder pointer, throwing from outside a callback, heap figures, collection requests, one isolate after another, and a second one at once being refused rather than made |
+| the isolate | `cases/isolate_test.cpp` | the typed embedder pointer, throwing from outside a callback, heap figures and their consistency with each other, collection requests, one isolate after another, and a second one at once being refused rather than made |
 | templates | `cases/templates_test.cpp` | constants, methods, accessors, nesting, inheritance, `HasInstance`, instantiation into several realms, and the call/construct grid: a template given a callback answers to both and tells them apart, while a method and both halves of an accessor answer to neither `new` |
 | interceptors | `cases/interceptors_test.cpp` | all five named and all five indexed hooks, driven through `in`, `Object.keys`, `getOwnPropertyDescriptor` and `delete` |
-| classes | `cases/classes_test.cpp` | construction, statics, accessors, `Wrap`, checked unwrapping, and finalizers |
-| ownership and destruction | `cases/ownership_test.cpp` | who owns a native and when it is destroyed: exactly once per native and never twice, a native still whole after a collection that spared it, two wrappers over one native, co-ownership with the embedder in both directions, the last reference winning whichever one it is, the no-op-deleter escape hatch, the failure paths that must not leak, an allocation failure walked through *every* step of the hand-over (which is where the double free lived), what a function and an external cost their isolate once they are collected, and that finalizing one instance costs the same however many the isolate has made |
+| classes | `cases/classes_test.cpp` | construction, a constructor that hands back a share with its own deleter, statics, accessors, one instance carrying an accessor its class does not, `Wrap`, checked unwrapping, and finalizers |
+| ownership and destruction | `cases/ownership_test.cpp` | who owns a native and when it is destroyed: exactly once per native and never twice, a native still whole after a collection that spared it, two wrappers over one native, co-ownership with the embedder in both directions, the last reference winning whichever one it is, the no-op-deleter escape hatch, the failure paths that must not leak, an allocation failure walked through *every* step of the hand-over (which is where the double free lived), what a function, a function carrying a script value that points back at it, and an external cost their isolate once they are collected, and that finalizing one instance costs the same however many the isolate has made |
 | a sandbox | `cases/sandbox_test.cpp` | the one composition: a second realm, an interceptor over every property, a `Global` held across calls, and a prototype method that has to survive the interceptor |
 | termination | `cases/termination_test.cpp` | stopping a running script from another thread, telling a stop from a throw, script not being able to catch one, a remembered stop, repeatability, and a blocking native running to completion |
 | stacks | `cases/stacks_test.cpp` | frames off a caught exception and off the running stack, the origin's line offset reaching a diagnostic, and the empty answers |
-| compiled-code caching | `cases/codecache_test.cpp` | a blob accepted, and - the half that matters - a damaged, truncated, foreign or empty one producing an ordinary compile with identical behaviour |
-| binary data and serialization | `cases/binary_test.cpp` | a span in and the same bytes at the same width out, views over part of a buffer, and a value moved to another isolate with equal contents and an identity of its own |
+| compiled-code caching | `cases/codecache_test.cpp` | a blob accepted, and - the half that matters - a damaged, truncated, foreign or empty one producing an ordinary compile with identical behaviour; an eager compile's blob covering functions that never ran, including after a lazy compile of the same source and after a refused blob |
+| binary data and serialization | `cases/binary_test.cpp` | a span in and the same bytes at the same width out, views over part of a buffer, a `DataView` and a typed array asked the same byte-level questions, a view whose buffer script detached, and a value moved to another isolate with equal contents and an identity of its own |
 | roots that name one value | `cases/handles_test.cpp` | `Global` identity: two roots over one object, a duplicate, a root against a `Local`, an empty root equal to nothing including another empty one, and the registry lookup the comparison exists for. The clause that needs **no scope open at all** runs in a process of its own - see below |
-| work that is not a call | `cases/jobs_test.cpp` | promise continuations waiting for `PumpJobs` and for nothing else, `async`/`await`, a chain draining in one pump, posted work ordered and never coalesced, work dropped when the isolate goes, a job's throw stopping at the pump, an interrupt reaching a running script while the job it announced waits for the drain, an interrupt callback making a handle, and a promise the embedder makes, settles, and has settled from a job |
+| work that is not a call | `cases/jobs_test.cpp` | promise continuations waiting for `PumpJobs` and for nothing else, `async`/`await`, a chain draining in one pump, posted work ordered and never coalesced, work dropped when the isolate goes, a job's throw stopping at the pump, an interrupt reaching a running script while the job it announced waits for the drain, an interrupt callback making a handle, and a promise the embedder makes, settles, and has settled from a job, and delayed work waiting for its delay and then for a pump, in the order it fell due |
 | the engine in trouble | `cases/faults_test.cpp` | decision 28: running out of memory reaching the embedder's handler with the right kind, the right isolate and its typed data; nothing reported while nothing is wrong (a script's own `throw` included); and, where the engine has the hook, a heap about to hit its ceiling being raised and the script that filled it stopped. See below for the kind that cannot be reached at all |
+| the inspector | `cases/inspector_test.cpp` | decision 29: that an inspector exists exactly where `Supported()` says, one per isolate; and where it does, `Runtime.evaluate`, a `debugger` statement pausing into the client's loop, a dispatch requested from another thread reaching a busy isolate and an idle one, a script's URL, and realms and sessions coming and going without growth |
+| the edges | `cases/coverage_test.cpp` | what the cases beside each feature added since the first release leave out: the predicates on boxed primitives, externals and the ends of the integer ranges; each integer width either side of `int32`; a share-returning constructor called both ways; an accessor's attributes, receiver and throw, and one pair of callbacks behind two names; a location's line offset, its CRLF and the handlers that have none; delayed work from another thread and dropped at teardown; a view over shared memory; eager compiles with a good blob and with none; dispatch order, dispatches dropped with their inspector, and a stopped session |
 | the harness itself | `cases/harness_test.cpp` | that a skipped area is visible rather than absent |
 
 ## What it does not cover
@@ -262,6 +264,37 @@ rather than passing quietly.
 `usedBytes` is comparable, and only as a trend. Nothing asserts a figure; the
 leak tests count C++ allocations instead, which is a question both engines
 answer the same way because neither of them is the one answering it.
+
+What is asserted is that the figures agree with *each other*: something is in
+use, what is reserved holds it, and the ceiling is above both. The six optional
+figures are empty on SpiderMonkey and filled on V8, so the case asserts only
+that the pairs come together - both malloced figures or neither, both
+global-handle figures or neither, and a pool at least as large as its use - and
+reports which it was given. It does not assert that the malloced peak is at
+least the current figure: V8 raises its peak only at certain points and reports
+a current figure above it in between.
+
+### The inspector, and shared memory
+
+Two things one backend has and the other does not, and both are reported as
+skips rather than branched on. The inspector's protocol cases ask
+`Inspector::Supported()` and skip where it says no, which is every one of them
+on SpiderMonkey (decision 29); the case that asks only whether an inspector
+exists runs on both. And `coverage: a view over shared memory ...` needs a
+`SharedArrayBuffer`, which a SpiderMonkey realm made here does not define - the
+engine exposes it only where shared memory is enabled at realm creation, and the
+backend does not ask - so it asks script whether the constructor exists and
+skips if not.
+
+### Eager compiles are seen through the blob
+
+Nothing outside an engine can see whether a function body was compiled, so the
+`EAGER_COMPILE` cases look at the one thing that is portable: the size of the
+code-cache blob. An eager blob of source that is mostly function bodies is over
+twice a lazy one on both engines, and the cases assert "more than one and a half
+times" and report the two sizes. That covers an eager compile after a lazy one
+of the same source in the same isolate - which V8 would otherwise answer from
+its own cache with the lazy result - and after a refused blob.
 
 ## What the new areas assert, and what they cannot
 

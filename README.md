@@ -21,7 +21,7 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting, a Chrome DevTools inspector |
 | V8 15.6 | implements all of it |
 | SpiderMonkey 153.3.0esr | implements all of it except two things its engine does not have: the near-heap-limit hook - a call to that one does not link, on purpose - and the inspector, which links and answers `Supported()` with false |
-| Tests | one suite, written once against `ub::`: 305 cases, green on both backends, every case compared backend against backend with no divergences |
+| Tests | one suite, written once against `ub::`: 330 cases, green on both backends, every case compared backend against backend with no divergences |
 | Not here | cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
@@ -125,16 +125,16 @@ to refuse the fetch outright and be told what to unpack where.
 bump repoints the tag, the asset and the directory together rather than
 silently reusing the old library.
 
-The number `ctest` prints is a little larger than 304 and depends on the tree,
+The number `ctest` prints is a little larger than 330 and depends on the tree,
 because it registers the suite's cases *and* a few things that cannot be cases
 among others: the whole suite again in one process, four checks that each need
 a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **305 cases is the figure that means the same thing everywhere** - it is
+built). **330 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
-different number of times on each engine, so V8 counts 9000 and SpiderMonkey
-8914, and neither number is the one to compare a run against.
+different number of times on each engine, so V8 counts 9379 and SpiderMonkey
+9249, and neither number is the one to compare a run against.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
 engine archives were built with, and therefore the one a consumer links
@@ -510,8 +510,18 @@ switch (value.Kind()) { case ub::ValueKind::Object: break; default: break; }
 ```
 
 `ValueKind` answers *what can I do with this*, so a Date, a RegExp, a Proxy and a
-typed array all report `Object`. Arrays, functions and the rest of the specific
-questions are `Is<T>()` / `To<T>()`.
+typed array all report `Object`; arrays and functions have kinds of their own.
+The more specific questions are `Is<T>()` / `To<T>()`.
+
+V8's type predicates are there as well, spelled as V8 spells them -
+`IsUndefined()`, `IsNullOrUndefined()`, `IsTrue()`, `IsInt32()`, `IsUint32()`,
+`IsObject()`, `IsArrayBufferView()`, `IsPromise()` and the rest - because a
+binding asks those questions constantly and ported code already asks them that
+way. Each is a `Kind()` or an `Is<T>()` underneath, and they answer as V8's do:
+`IsObject()` is true for an array or a function and false for `null`, `IsTrue()`
+is false for `new Boolean(true)`, and neither integer question counts `-0`. The
+one place they part from V8 is an `External`, which V8 counts as an object and
+this API, on both backends, does not.
 
 Arrays, keys, prototypes and attributes are where you would expect:
 
@@ -525,7 +535,9 @@ const auto keys = object->GetOwnPropertyNames(context, {.includeSymbols = true})
 const auto prototype = object->GetPrototype(context);
 
 // A property that runs native code on every read (and write, given a setter) -
-// on this one object, where a template would put it on every instance.
+// on this one object, where a template would put it on every instance. The
+// callbacks are kept for the life of the isolate, as a template's are, so this
+// is for an object made a bounded number of times, not one made on every call.
 (void)object->SetAccessor(context, "level", &ReadLevel, &WriteLevel, ub::CallbackData::For(state));
 ```
 
@@ -584,6 +596,13 @@ const auto fn = ub::Function::New(context, &Bump, ub::CallbackData::For(counters
 
 `info[i]` past the end is `undefined`, as script would see. A callback that
 writes nothing to `GetReturnValue()` returns `undefined`.
+
+`ReturnValue` has V8's full set of setters: a `Local`, a `Global` (returned as it
+is now, and `undefined` if it is empty), `bool`, `double`, text, `SetNull`,
+`SetUndefined`, `SetFalse`, `SetEmptyString`, and every integer width from
+`int16_t` to `uint64_t`. An integer is returned as that integer when it fits in
+an `int32_t` and as a Number otherwise - the nearest double, past 2^53, as V8
+answers - so `Set(std::uint32_t{...})` is never ambiguous and never negative.
 
 A function's data can instead be a *script value*, read back as `info.Data()` -
 one native callback behind many functions, each closing over its own value, and
@@ -685,6 +704,13 @@ The native goes when the last share does, whoever holds it - which may be you,
 after the isolate is gone. A native that must not be destroyed by the engine is
 handed over with a no-op deleter, said once at the call site:
 `std::shared_ptr<Counter>(&mine, [](Counter*) {})`.
+
+The same holds for what a constructor makes. `Construct` and `ConstructOrCall`
+take a callback that returns a `std::unique_ptr<T>`, or one that returns a
+`std::shared_ptr<T>` - for a native released through a deleter of its own, one
+that counts live instances say, or one the embedder already holds and hands
+script a share of. Either way the wrapper holds a share, and null after a throw
+declines the construction.
 
 ### 6. Calling script, and catching what it throws
 
@@ -882,7 +908,9 @@ is still queued when the isolate is destroyed is dropped, not run.
 `PostDelayedJob(callback, data, delayInSeconds)` is the same with a floor on
 when: V8's `PostDelayedTask`, for the timer you would otherwise keep beside the
 isolate. It still runs only at a pump, so an embedder that sleeps between pumps
-decides how late it can be.
+decides how late it can be. Delayed jobs run in the order they fall due and join
+the back of the queue at the first pump after that; a delay of zero, a negative
+one or a NaN is no delay at all.
 
 ### 9. Stopping a runaway script
 
@@ -909,11 +937,12 @@ a `TryCatch` does not swallow it. Until it is cancelled, every operation that
 would run script fails, which is settled rather than inherited: one engine would
 happily run the next script.
 
-`RequestInterrupt` is the other cross-thread call, and is narrow on purpose. It
-runs your callback on the isolate's thread while script is running, where it may
-make handles, read values and set flags - and **may not call a function, run a
-script, or throw**. It is for a profiler tick, or for a watchdog that has to read
-something on-thread before deciding to terminate.
+`RequestInterrupt` is the other way to reach a running script from another
+thread, and is narrow on purpose. It runs your callback on the isolate's thread
+while script is running, where it may make handles, read values and set flags -
+and **may not call a function, run a script, or throw**. It is for a profiler
+tick, or for a watchdog that has to read something on-thread before deciding to
+terminate.
 
 > **Both of these reach script, not your own C++. A watchdog cannot save you
 > from your own blocking callback.**
@@ -966,7 +995,7 @@ std::size_t Rescue(ub::Isolate& isolate, std::size_t current, std::size_t initia
     return initial * 2;                           // and leave room to unwind in
 }
 
-isolate->SetHeapLimitCallback(&Rescue, ub::CallbackData::For(policy));
+isolate.SetHeapLimitCallback(&Rescue, ub::CallbackData::For(policy));
 ```
 
 A heap about to hit `heapLimitBytes` is a *decision*, not a report, which is why
@@ -995,11 +1024,14 @@ class DevTools final : public ub::InspectorClient {
     // ...
 };
 
+std::unique_ptr<ub::Inspector> inspector;                       // after the isolate, before the realm goes
+std::unique_ptr<ub::InspectorSession> session;
 if (ub::Inspector::Supported()) {                               // false on SpiderMonkey, and it links anyway
-    const auto inspector = ub::Inspector::New(isolate, devTools);
+    inspector = ub::Inspector::New(isolate, devTools);          // null if this isolate already has one
     inspector->ContextCreated(context, "main");
-    const auto session = inspector->Connect();
+    session = inspector->Connect();
 }
+// ... and on the way out: session.reset(); inspector->ContextDestroyed(context); inspector.reset();
 ```
 
 DevTools talks to a session in protocol messages - JSON, UTF-8 -
@@ -1012,7 +1044,13 @@ A socket is read on a thread of its own, and a message read there reaches the
 isolate through `Inspector::RequestDispatch`, from any thread. It runs your
 callback on the isolate's thread at the next safe point - inside a running
 script, which is how a busy isolate still answers, or at the next `PumpJobs` if
-it is idle - and that callback may dispatch.
+it is idle - and that callback may dispatch. Requests run in the order they were
+made; any still waiting when the `Inspector` is destroyed are dropped, not run.
+
+A session goes before its inspector and an inspector before its isolate, all on
+the isolate's thread, and a realm is withdrawn with `ContextDestroyed` before
+the `Context` is let go. A connection that closes during a pause is `Stop`ped
+there - the session stops pausing script - and destroyed once the pause is over.
 
 ---
 
@@ -1185,7 +1223,8 @@ not link there. Both engines still report the failure itself as
 `MOZ_CRASH`, so the backend recognises the crash itself.
 
 **Not thread-safe, by contract.** Everything but `TerminateExecution`,
-`RequestInterrupt` and `PostJob` happens on the isolate's own thread.
+`RequestInterrupt`, `PostJob`, `PostDelayedJob` and the inspector's
+`RequestDispatch` happens on the isolate's own thread.
 
 **Windows only.** x86 and x64 are both built and tested, on both backends, and
 `CMakeLists.txt` refuses anything else rather than letting it fail later.
