@@ -773,6 +773,13 @@ class Isolate {
     ///
     /// Requests are ordered and each one runs once. What has not fired when the
     /// isolate is destroyed is dropped.
+    ///
+    /// **A pass runs until nothing is waiting**, so an interrupt asked for from
+    /// inside a callback runs in the same pass, before the script moves on - on
+    /// both backends, because V8's dispatch works that way and cannot be made
+    /// not to. A callback that asks for itself again unconditionally therefore
+    /// never lets the script continue: a sampler that wants a tick every so
+    /// often asks for each one from its own timer thread.
     void RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept;
 
     /// Queue `callback` to run on this isolate's thread the next time it pumps.

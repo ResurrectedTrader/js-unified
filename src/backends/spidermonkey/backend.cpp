@@ -3323,22 +3323,31 @@ bool OnInterrupt(JSContext* cx) {
     }
 
     // Whatever `RequestInterrupt` asked for, once each, in the order it was
-    // asked. Taken off the queue before any of it runs, so a callback that asks
-    // for another interrupt gets the next pass rather than this one.
-    std::vector<Isolate::Impl::PendingInterrupt> batch;
-    {
-        const std::lock_guard<std::mutex> lock(isolate->impl().interruptMutex);
-        batch.swap(isolate->impl().interrupts);
-    }
-    for (const Isolate::Impl::PendingInterrupt& pending : batch) {
-        // The callback may make handles and read values and may not run script.
-        // SpiderMonkey would permit script here - measured, and it works - but
-        // the portable rule is V8's, and it is the right rule anyway: an
-        // interrupt fires between two bytecodes of unrelated code, so anything
-        // a callback leaves pending is left for that code to trip over.
-        pending.callback(*isolate, pending.data);
-        if (JS_IsExceptionPending(cx)) {
-            JS_ClearPendingException(cx);
+    // asked - and round again until nothing is waiting, so an interrupt a
+    // callback asks for runs in this pass, before the script moves on. That is
+    // what V8 does and cannot be made not to: its dispatch runs its queue until
+    // it is empty, and a request made from inside it joins the queue. Taken off
+    // the queue before any of it runs, so the lock is not held by a callback.
+    for (;;) {
+        std::vector<Isolate::Impl::PendingInterrupt> batch;
+        {
+            const std::lock_guard<std::mutex> lock(isolate->impl().interruptMutex);
+            batch.swap(isolate->impl().interrupts);
+        }
+        if (batch.empty()) {
+            break;
+        }
+        for (const Isolate::Impl::PendingInterrupt& pending : batch) {
+            // The callback may make handles and read values and may not run
+            // script. SpiderMonkey would permit script here - measured, and it
+            // works - but the portable rule is V8's, and it is the right rule
+            // anyway: an interrupt fires between two bytecodes of unrelated
+            // code, so anything a callback leaves pending is left for that code
+            // to trip over.
+            pending.callback(*isolate, pending.data);
+            if (JS_IsExceptionPending(cx)) {
+                JS_ClearPendingException(cx);
+            }
         }
     }
 

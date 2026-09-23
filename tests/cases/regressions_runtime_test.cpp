@@ -6,6 +6,7 @@
 /// fix, and passes on every backend after it. The comment on each says what it
 /// caught.
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -168,4 +169,53 @@ UNIBIND_TEST_CASE2(PROMISES, TERMINATION, "regressions: the continuations queued
     (void)ub_test::Eval(fixture.context, "Promise.resolve().then(() => log('later'))");
     fixture.iso().PumpJobs();
     CHECK(log == std::vector<std::string>{"first stops", "later"});
+}
+
+namespace {
+
+/// An interrupt that asks for itself again from inside its own callback, a set
+/// number of times, noting how far the script had got each time it ran.
+struct Chain {
+    std::atomic<int> ticks{0};
+    std::vector<int> ranAtTick;
+    int remaining = 0;
+    std::atomic<bool> done{false};
+};
+
+void ChainLink(ub::Isolate& isolate, ub::CallbackData data) {
+    auto* chain = data.As<Chain>();
+    chain->ranAtTick.push_back(chain->ticks.load());
+    if (--chain->remaining > 0) {
+        isolate.RequestInterrupt(&ChainLink, data);
+    } else {
+        chain->done = true;
+    }
+}
+
+void TickUntilDone(const ub::CallbackInfo& info) {
+    auto* chain = info.Data<Chain>();
+    chain->ticks.fetch_add(1);
+    info.GetReturnValue().Set(chain->done.load());
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INTERRUPTS, "regressions: an interrupt asked for inside one runs in the same pass") {
+    // When an interrupt a callback asks for runs was the engine's choice: V8's
+    // dispatch runs its queue until it is empty, so the new request ran before
+    // the script moved on, while SpiderMonkey's waited for the next check - and
+    // a callback that re-armed itself was a sampler on one backend and a hang
+    // on the other. V8's cannot be changed, so both run it in the same pass.
+    ub_test::Fixture fixture;
+    Chain chain;
+    chain.remaining = 5;
+    const auto tick = ub::Function::New(fixture.context, &TickUntilDone, ub::CallbackData::For(chain));
+    REQUIRE(tick.has_value());
+    ub_test::Expose(fixture.context, "tick", *tick);
+
+    fixture.iso().RequestInterrupt(&ChainLink, ub::CallbackData::For(chain));
+    CHECK(ub_test::EvalInt(fixture.context, "let n = 0; while (!tick() && n < 1e7) { ++n; } 1") == 1);
+
+    REQUIRE(chain.ranAtTick.size() == 5);
+    CHECK(chain.ranAtTick == std::vector<int>(5, chain.ranAtTick.front()));
 }
