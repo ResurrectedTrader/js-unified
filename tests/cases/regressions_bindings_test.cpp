@@ -188,3 +188,84 @@ UNIBIND_TEST_CASE(TEMPLATES, "regressions: a primitive receiver reaches a native
         CHECK(ub_test::EvalTruth(fixture.context, "(() => { const r = {}; return " + call + "(r) === r; })()"));
     }
 }
+
+namespace {
+
+/// Which half of a handler each access reached, and with what.
+struct HookLog {
+    std::string seen;
+};
+
+ub::Intercepted EchoIndex(std::uint32_t index, const ub::PropertyCallbackInfo& info) {
+    info.Data<HookLog>()->seen += "i" + std::to_string(index) + " ";
+    info.GetReturnValue().Set(index);
+    return ub::Intercepted::Yes;
+}
+
+ub::Intercepted StoreIndex(std::uint32_t index, const ub::Local<ub::Value>& /*value*/,
+                           const ub::PropertyCallbackInfo& info) {
+    info.Data<HookLog>()->seen += "set-i" + std::to_string(index) + " ";
+    return ub::Intercepted::Yes;
+}
+
+std::optional<bool> DeleteIndex(std::uint32_t index, const ub::PropertyCallbackInfo& info) {
+    info.Data<HookLog>()->seen += "delete-i" + std::to_string(index) + " ";
+    return true;
+}
+
+ub::Intercepted EchoName(const ub::Local<ub::Name>& property, const ub::PropertyCallbackInfo& info) {
+    const auto text = property.To<ub::String>();
+    if (!text) {
+        return ub::Intercepted::No;
+    }
+    info.Data<HookLog>()->seen += "n" + text->Utf8Value() + " ";
+    if (!info.GetReturnValue().Set("named")) {
+        return ub::Intercepted::No;
+    }
+    return ub::Intercepted::Yes;
+}
+
+ub::Intercepted StoreName(const ub::Local<ub::Name>& property, const ub::Local<ub::Value>& /*value*/,
+                          const ub::PropertyCallbackInfo& info) {
+    const auto text = property.To<ub::String>();
+    info.Data<HookLog>()->seen += "set-n" + (text ? text->Utf8Value() : std::string("?")) + " ";
+    return ub::Intercepted::Yes;
+}
+
+std::optional<bool> DeleteName(const ub::Local<ub::Name>& property, const ub::PropertyCallbackInfo& info) {
+    const auto text = property.To<ub::String>();
+    info.Data<HookLog>()->seen += "delete-n" + (text ? text->Utf8Value() : std::string("?")) + " ";
+    return true;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: every array index reaches the indexed handler, however large") {
+    // An array index is any integer below 2^32 - 1, and V8 hands every one of
+    // them to the indexed half of a handler. SpiderMonkey keeps only indices
+    // that fit an int32 as integer keys; the rest are strings, and the backend
+    // sent those to the *named* half - so `o[3000000000]` reached a different
+    // hook, as text, on one engine.
+    ub_test::Fixture fixture;
+    HookLog log;
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.SetHandler(ub::IndexedPropertyHandler{
+        .getter = &EchoIndex, .setter = &StoreIndex, .deleter = &DeleteIndex, .data = ub::CallbackData::For(log)});
+    shape.SetHandler(ub::NamedPropertyHandler{
+        .getter = &EchoName, .setter = &StoreName, .deleter = &DeleteName, .data = ub::CallbackData::For(log)});
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalNumber(fixture.context, "o[2147483647]") == 2147483647.0);
+    CHECK(ub_test::EvalNumber(fixture.context, "o[2147483648]") == 2147483648.0);
+    CHECK(ub_test::EvalNumber(fixture.context, "o['4294967294']") == 4294967294.0);
+    ub_test::Eval(fixture.context, "o[3000000000] = 1; delete o[3000000000]");
+    CHECK(log.seen == "i2147483647 i2147483648 i4294967294 set-i3000000000 delete-i3000000000 ");
+
+    // 2^32 - 1 is not an array index, and neither is a non-canonical spelling.
+    log.seen.clear();
+    CHECK(ub_test::EvalText(fixture.context, "o[4294967295]") == "named");
+    CHECK(ub_test::EvalText(fixture.context, "o['01']") == "named");
+    CHECK(log.seen == "n4294967295 n01 ");
+}

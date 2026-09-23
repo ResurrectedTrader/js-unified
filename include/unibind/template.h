@@ -88,6 +88,10 @@ struct NamedPropertyHandler {
     CallbackData data;
 };
 
+/// The half that answers for array indices - every integer key from 0 to
+/// 2^32 - 2, however it was spelled in script, as long as it was spelled
+/// canonically. Every other key, `4294967295` and `"01"` among them, goes to
+/// the named half.
 struct IndexedPropertyHandler {
     IndexedGetterCallback getter = nullptr;
     IndexedSetterCallback setter = nullptr;

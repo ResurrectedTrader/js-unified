@@ -627,7 +627,15 @@ class HookCall {
 };
 
 /// An index if the key is one, for choosing between the two handler halves.
+///
+/// An array index is any integer below 2^32 - 1, which is what V8 hands the
+/// indexed half. This engine keeps only those that fit an int32 as integer
+/// keys and spells the rest as strings, so a string key is asked too - or
+/// `o[3000000000]` would reach the named half, as text.
 [[nodiscard]] bool AsIndex(JS::HandleId id, std::uint32_t* index) {
+    if (id.isString()) {
+        return js::StringIsArrayIndex(id.toLinearString(), index);
+    }
     if (!id.isInt()) {
         return false;
     }
@@ -644,8 +652,9 @@ bool InterceptorHandler::get(JSContext* cx, JS::HandleObject proxy, JS::HandleVa
     JS::RootedObject target(cx, TargetOf(proxy));
     TemplateRec* tpl = HooksOf(target);
     std::uint32_t index = 0;
+    const bool isIndex = AsIndex(id, &index);
     if (tpl != nullptr) {
-        if (AsIndex(id, &index) && tpl->hasIndexed && tpl->indexed.getter != nullptr) {
+        if (isIndex && tpl->hasIndexed && tpl->indexed.getter != nullptr) {
             HookCall call(cx, proxy);
             if (tpl->indexed.getter(index, call.Info(tpl->indexed.data)) == Intercepted::Yes) {
                 if (!call.TakeResult(cx, vp)) {
@@ -656,7 +665,7 @@ bool InterceptorHandler::get(JSContext* cx, JS::HandleObject proxy, JS::HandleVa
             if (JS_IsExceptionPending(cx)) {
                 return false;
             }
-        } else if (!id.isInt() && tpl->hasNamed && tpl->named.getter != nullptr) {
+        } else if (!isIndex && tpl->hasNamed && tpl->named.getter != nullptr) {
             HookCall call(cx, proxy);
             const Slot name = call.PushName(cx, id);
             if (tpl->named.getter(Local<Name>::FromSlot(name), call.Info(tpl->named.data)) == Intercepted::Yes) {
@@ -681,8 +690,9 @@ bool InterceptorHandler::set(JSContext* cx, JS::HandleObject proxy, JS::HandleId
     JS::RootedObject target(cx, TargetOf(proxy));
     TemplateRec* tpl = HooksOf(target);
     std::uint32_t index = 0;
+    const bool isIndex = AsIndex(id, &index);
     if (tpl != nullptr) {
-        if (AsIndex(id, &index) && tpl->hasIndexed && tpl->indexed.setter != nullptr) {
+        if (isIndex && tpl->hasIndexed && tpl->indexed.setter != nullptr) {
             HookCall call(cx, proxy);
             const Slot incoming = Push(call.isolate(), value);
             if (tpl->indexed.setter(index, Local<Value>::FromSlot(incoming), call.Info(tpl->indexed.data)) ==
@@ -692,7 +702,7 @@ bool InterceptorHandler::set(JSContext* cx, JS::HandleObject proxy, JS::HandleId
             if (JS_IsExceptionPending(cx)) {
                 return false;
             }
-        } else if (!id.isInt() && tpl->hasNamed && tpl->named.setter != nullptr) {
+        } else if (!isIndex && tpl->hasNamed && tpl->named.setter != nullptr) {
             HookCall call(cx, proxy);
             const Slot name = call.PushName(cx, id);
             const Slot incoming = Push(call.isolate(), value);
@@ -851,12 +861,13 @@ bool InterceptorHandler::delete_(JSContext* cx, JS::HandleObject proxy, JS::Hand
     JS::RootedObject target(cx, TargetOf(proxy));
     TemplateRec* tpl = HooksOf(target);
     std::uint32_t index = 0;
+    const bool isIndex = AsIndex(id, &index);
     if (tpl != nullptr) {
         Maybe<bool> answer;
-        if (AsIndex(id, &index) && tpl->hasIndexed && tpl->indexed.deleter != nullptr) {
+        if (isIndex && tpl->hasIndexed && tpl->indexed.deleter != nullptr) {
             HookCall call(cx, proxy);
             answer = tpl->indexed.deleter(index, call.Info(tpl->indexed.data));
-        } else if (!id.isInt() && tpl->hasNamed && tpl->named.deleter != nullptr) {
+        } else if (!isIndex && tpl->hasNamed && tpl->named.deleter != nullptr) {
             HookCall call(cx, proxy);
             const Slot name = call.PushName(cx, id);
             answer = tpl->named.deleter(Local<Name>::FromSlot(name), call.Info(tpl->named.data));
