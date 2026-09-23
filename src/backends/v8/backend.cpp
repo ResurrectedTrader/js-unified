@@ -3230,6 +3230,13 @@ bool TryCatchHasTerminated(const TryCatchState& state) noexcept {
 // ---------------------------------------------------------------------------
 
 ContextRec* NewContext(Isolate& isolate) {
+    // Ours first, before the engine is asked for anything: out of memory is
+    // then the empty answer `Context::New` documents, where after the realm
+    // was made it was a `std::bad_alloc` thrown out of it instead.
+    std::unique_ptr<ContextRec> rec(new (std::nothrow) ContextRec());
+    if (rec == nullptr) {
+        return nullptr;
+    }
     v8::HandleScope scope(Raw(isolate));
     v8::Local<v8::Context> context = v8::Context::New(Raw(isolate));
     if (context.IsEmpty()) {
@@ -3261,14 +3268,13 @@ ContextRec* NewContext(Isolate& isolate) {
         getPrototypeOf = getter.As<v8::Function>();
         setPrototypeOf = setter.As<v8::Function>();
     }
-    auto* rec = new ContextRec();
     rec->owner = &isolate;
     ++isolate.impl().embedderRefs;
     rec->handle.Reset(Raw(isolate), context);
     rec->getPrototypeOf.Reset(Raw(isolate), getPrototypeOf);
     rec->setPrototypeOf.Reset(Raw(isolate), setPrototypeOf);
-    context->SetAlignedPointerInEmbedderData(CONTEXT_SLOT, rec, v8::kEmbedderDataTypeTagDefault);
-    return rec;
+    context->SetAlignedPointerInEmbedderData(CONTEXT_SLOT, rec.get(), v8::kEmbedderDataTypeTagDefault);
+    return rec.release();
 }
 
 void RetainContext(ContextRec* rec) noexcept {

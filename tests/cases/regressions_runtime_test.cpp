@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -636,4 +637,30 @@ UNIBIND_TEST_CASE2(HEAP, JOBS, "regressions: heap figures agree with each other 
     CHECK(crowd.failures.load() == 0);
     CHECK(crowd.disagreements.load() == 0);
     CHECK(crowd.jobsRun.load() == Crowd::MEMBERS * Crowd::MEMBERS * Crowd::ROUNDS);
+}
+
+UNIBIND_TEST_CASE(REALMS, "regressions: a realm there is no memory for is no realm, not an exception") {
+    // Context::New answers empty when a realm cannot be made. V8's backend
+    // asked the engine for the realm first and made its own record of it
+    // after, so running out of memory was either a std::bad_alloc thrown
+    // through the engine's frames or, once the realm existed, one thrown out
+    // of Context::New - never the empty answer.
+    ub_test::Fixture fixture;
+    std::optional<ub::Context> refused;
+    long long fired = 0;
+    {
+        ub_test::AllocationFailure failing(1);
+        refused = ub::Context::New(fixture.iso());
+        fired = failing.Stop();
+    }
+    if (fired == 0) {
+        ub_test::ReportSkip("making a realm asked the allocator for nothing it could refuse");
+        return;
+    }
+    CHECK_FALSE(refused.has_value());
+
+    const auto made = ub::Context::New(fixture.iso());
+    REQUIRE(made.has_value());
+    const ub::ContextScope entered(*made);
+    CHECK(ub_test::EvalInt(*made, "6 * 7") == 42);
 }

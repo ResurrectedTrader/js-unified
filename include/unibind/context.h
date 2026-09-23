@@ -73,7 +73,8 @@ namespace ub {
 /// each backend would be worse than the rule, and the rule costs a line.
 class Context {
    public:
-    /// Empty if the engine could not create a realm.
+    /// Empty if a realm could not be made: the engine refused, or there was
+    /// not the memory for one.
     [[nodiscard]] static std::optional<Context> New(Isolate& isolate);
 
     constexpr Context() noexcept = default;
