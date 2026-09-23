@@ -487,3 +487,38 @@ UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: an intercepted object is the recei
           "true false");
     CHECK(log.seen.empty());
 }
+
+UNIBIND_TEST_CASE(CLASSES, "regressions: a new.target with no object prototype makes an Object of its own realm") {
+    // `Reflect.construct(C, args, N)` builds its object from `N.prototype`, and
+    // when that is not an object the language falls back to
+    // `Object.prototype` of N's realm - what V8 does for a class, as for any
+    // constructor script writes. SpiderMonkey's backend fell back to the
+    // class's own prototype instead, so one engine's instance had the class's
+    // methods and the other's did not.
+    ub_test::Fixture fixture;
+    const auto cls = ExposeGadgetClass<&MakeGadgetStamping>(fixture, "Stamped");
+    ub_test::Eval(fixture.context, "function NoPrototype() {} NoPrototype.prototype = 5");
+
+    const auto made = ub_test::Eval(fixture.context, "Reflect.construct(Stamped, [], NoPrototype)");
+    CHECK(cls.IsInstance(made));
+    ub_test::Expose(fixture.context, "made", made);
+    CHECK(ub_test::EvalTruth(fixture.context, "Object.getPrototypeOf(made) === Object.prototype"));
+    CHECK(ub_test::EvalInt(fixture.context, "made.stamped") == 42);
+
+    auto second = ub::Context::New(fixture.iso());
+    REQUIRE(second.has_value());
+    {
+        const ub::ContextScope entered(*second);  // NOLINT(bugprone-unchecked-optional-access)
+        const auto elsewhere =
+            ub_test::Eval(*second, "(function Elsewhere() {})");  // NOLINT(bugprone-unchecked-optional-access)
+        ub_test::Expose(*second, "Elsewhere", elsewhere);         // NOLINT(bugprone-unchecked-optional-access)
+        ub_test::Eval(*second, "Elsewhere.prototype = null");     // NOLINT(bugprone-unchecked-optional-access)
+        ub_test::Expose(*second, "secondObjectPrototype",
+                        ub_test::Eval(*second, "Object.prototype"));  // NOLINT(bugprone-unchecked-optional-access)
+    }
+    ub_test::Expose(fixture.context, "Elsewhere", ub_test::Eval(*second, "Elsewhere"));  // NOLINT
+    ub_test::Expose(fixture.context, "secondObjectPrototype",
+                    ub_test::Eval(*second, "secondObjectPrototype"));  // NOLINT
+    CHECK(ub_test::EvalTruth(
+        fixture.context, "Object.getPrototypeOf(Reflect.construct(Stamped, [], Elsewhere)) === secondObjectPrototype"));
+}

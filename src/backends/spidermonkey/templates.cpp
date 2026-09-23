@@ -1280,6 +1280,18 @@ bool ConstructInstance(JSContext* cx, JS::CallArgs& args, TemplateRec* tpl, Clas
         }
         if (prototypeValue.isObject()) {
             prototypeOverride = &prototypeValue.toObject();
+        } else {
+            // Not an object: the language's fallback is `Object.prototype` of
+            // new.target's realm (GetPrototypeFromConstructor), as for any
+            // constructor script writes - not this class's own prototype.
+            JS::RootedObject realmOf(cx, JS::GetNonCCWObjectGlobal(js::UncheckedUnwrap(newTarget)));
+            {
+                const JSAutoRealm there(cx, realmOf);
+                prototypeOverride = JS::GetRealmObjectPrototype(cx);
+            }
+            if (prototypeOverride == nullptr || !JS_WrapObject(cx, &prototypeOverride)) {
+                return false;
+            }
         }
     }
 
