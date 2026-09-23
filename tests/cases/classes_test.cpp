@@ -138,6 +138,55 @@ ub::Intercepted SparseGetter(const ub::Local<ub::Name>& property, const ub::Prop
     return ub::Intercepted::Yes;
 }
 
+/// What an embedder's own trampoline carries per member: which member it is,
+/// and how often it ran. The untyped `Class<T>` overloads exist so that a
+/// binding can go through one of these rather than straight to its body.
+struct CallCounter {
+    int calls = 0;
+};
+
+void CountedIncrement(const ub::CallbackInfo& info) {
+    ++info.Data<CallCounter>()->calls;
+    Counter* self = ub::Class<Counter>::Unwrap(info.This());
+    if (self == nullptr) {
+        info.ThrowTypeError("not a Counter");
+        return;
+    }
+    self->value += 1;
+    info.GetReturnValue().Set(self->value);
+}
+
+void CountedRead(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
+    ++info.Data<CallCounter>()->calls;
+    Counter* self = ub::Class<Counter>::Unwrap(info.This());
+    if (self == nullptr) {
+        info.ThrowTypeError("not a Counter");
+        return;
+    }
+    info.GetReturnValue().Set(self->value);
+}
+
+void CountedWrite(const ub::Local<ub::Name>& /*property*/, const ub::Local<ub::Value>& value,
+                  const ub::PropertyCallbackInfo& info) {
+    ++info.Data<CallCounter>()->calls;
+    Counter* self = ub::Class<Counter>::Unwrap(info.This());
+    const auto asInt = value.ToInt32(info.GetContext());
+    if (self == nullptr || !asInt) {
+        return;
+    }
+    self->value = *asInt;
+}
+
+void CountedIterate(const ub::CallbackInfo& info) {
+    ++info.Data<CallCounter>()->calls;
+    Counter* self = ub::Class<Counter>::Unwrap(info.This());
+    if (self == nullptr) {
+        info.ThrowTypeError("not a Counter");
+        return;
+    }
+    IterateCounter(*self, info);
+}
+
 /// Declares the class the rest of this file uses.
 ub::Class<Counter> DeclareCounter(ub::Isolate& isolate) {
     auto cls = ub::Class<Counter>::New(isolate, "Counter");
@@ -442,6 +491,37 @@ UNIBIND_TEST_CASE2(CLASSES, SYMBOL_METHODS, "classes: a class method under Symbo
 
     ub_test::Expose(fixture.context, "Countdown", *cls.GetConstructor(fixture.context));
     CHECK(ub_test::EvalText(fixture.context, "[...new Countdown(3)].join(',')") == "0,1,2");
+}
+
+UNIBIND_TEST_CASE2(CLASSES, SYMBOL_METHODS,
+                   "classes: members can be run-time callbacks with data, on the same prototype") {
+    Counter::Reset();
+    ub_test::Fixture fixture;
+
+    CallCounter method;
+    CallCounter accessor;
+    CallCounter iterator;
+    const auto cls = ub::Class<Counter>::New(fixture.iso(), "Hooked");
+    cls.Construct<&MakeCounter>();
+    cls.Method("increment", &CountedIncrement, ub::CallbackData::For(method));
+    cls.Accessor("value", &CountedRead, &CountedWrite, ub::CallbackData::For(accessor));
+    cls.SymbolMethod(ub::WellKnownSymbol::Iterator, &CountedIterate, ub::CallbackData::For(iterator));
+    ub_test::Expose(fixture.context, "Hooked", *cls.GetConstructor(fixture.context));
+
+    CHECK(ub_test::EvalInt(fixture.context,
+                           "const h = new Hooked(2); h.increment(); h.value = h.value + 10; h.value") == 13);
+    CHECK(ub_test::EvalText(fixture.context, "[...new Hooked(3)].join(',')") == "0,1,2");
+    CHECK(method.calls == 1);
+    CHECK(accessor.calls == 3);
+    CHECK(iterator.calls == 1);
+
+    CHECK_FALSE(ub_test::EvalTruth(fixture.context, "Object.hasOwn(new Hooked(0), 'increment')"));
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        (function () {
+            try { Hooked.prototype.increment.call({}); return false; }
+            catch (e) { return e instanceof TypeError; }
+        })()
+    )"));
 }
 
 // ---------------------------------------------------------------------------

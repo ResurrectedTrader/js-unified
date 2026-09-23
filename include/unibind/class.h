@@ -331,6 +331,30 @@ class Class {
         return *this;
     }
 
+    /// The untyped forms of `Method`, `SymbolMethod` and `Accessor`: a plain
+    /// callback chosen at run time, plus data, on the same prototype.
+    ///
+    /// For an embedder that sends every binding through one trampoline of its
+    /// own - a per-call profiling or stack-capture hook is the case this is
+    /// for - and so has a function *value* per member rather than a constant
+    /// it could name as a template argument. The callback unwraps the receiver
+    /// itself with `Unwrap(info.This())`, and gets null for a receiver that is
+    /// not a `T`, exactly as the typed trampolines do before they decline.
+    const Class& Method(std::string_view name, FunctionCallback callback, CallbackData data = {},
+                        PropertyAttribute attributes = PropertyAttribute::DontEnum) const {
+        detail::TemplateSetMethod(detail::ClassPrototypeTemplate(rec_), name, callback, data, attributes);
+        return *this;
+    }
+    const Class& SymbolMethod(WellKnownSymbol key, FunctionCallback callback, CallbackData data = {}) const {
+        detail::TemplateSetSymbolMethod(detail::ClassPrototypeTemplate(rec_), key, callback, data);
+        return *this;
+    }
+    const Class& Accessor(std::string_view name, AccessorGetterCallback getter, AccessorSetterCallback setter = nullptr,
+                          CallbackData data = {}, PropertyAttribute attributes = PropertyAttribute::None) const {
+        detail::TemplateSetAccessor(detail::ClassPrototypeTemplate(rec_), name, getter, setter, data, attributes);
+        return *this;
+    }
+
     /// Statics take a plain function callback: there is no instance to unwrap.
     const Class& StaticMethod(std::string_view name, FunctionCallback callback, CallbackData data = {}) const {
         detail::TemplateSetMethod(detail::ClassConstructorTemplate(rec_), name, callback, data,
