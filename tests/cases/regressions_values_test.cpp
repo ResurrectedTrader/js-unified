@@ -45,3 +45,59 @@ UNIBIND_TEST_CASE(ARRAYS, "regressions: the last index a uint32_t can say is a p
     CHECK(array->Length() == TOP);
     // NOLINTEND(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE2(EXCEPTIONS, FUNCTIONS,
+                   "regressions: a caught exception stays caught while more work is done before it is asked about") {
+    // A `TryCatch` catches when the exception is thrown, not when someone asks
+    // it: an embedder may make several calls and look once. SpiderMonkey keeps
+    // a throw pending on the context until the handler takes it, and it took it
+    // only when asked - so script run in between that threw and caught its own
+    // exception cleared the embedder's along with it, and the handler then said
+    // nothing had happened.
+    ub_test::Fixture fixture;
+
+    const auto object = ub_test::Eval(fixture.context, R"(({
+        get bad() { throw new Error('one'); },
+        get fine() { try { throw new Error('two'); } catch (e) {} return 5; },
+    }))")
+                            .To<ub::Object>();
+    REQUIRE(object.has_value());
+    {
+        ub::TryCatch handler(fixture.iso());
+        // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+        CHECK_FALSE(object->Get(fixture.context, "bad").has_value());
+        const auto fine = object->Get(fixture.context, "fine");
+        // NOLINTEND(bugprone-unchecked-optional-access)
+        REQUIRE(fine.has_value());
+        CHECK(fine->ToInt32(fixture.context).value_or(0) == 5);
+        REQUIRE(handler.HasCaught());
+        CHECK(handler.Message(fixture.context).value_or("").find("one") != std::string::npos);
+    }
+    {
+        // The same with the embedder's own throw, and a whole script after it.
+        ub::TryCatch handler(fixture.iso());
+        fixture.iso().ThrowError(ub::ErrorKind::RangeError, "mine");
+        CHECK(ub_test::EvalInt(fixture.context, "try { throw 1; } catch (e) {} 6") == 6);
+        REQUIRE(handler.HasCaught());
+        CHECK(handler.Message(fixture.context).value_or("").find("mine") != std::string::npos);
+    }
+
+    // What the fix must not do: a throw inside a native callback, with no
+    // handler of the callback's own, belongs to the script that called it -
+    // even when the callback goes on to do more work - and not to the
+    // embedder's handler further out.
+    const auto native = ub::Function::New(
+        fixture.context, +[](const ub::CallbackInfo& info) {
+            const auto target = info[0].To<ub::Object>();
+            if (target) {
+                (void)target->Get(info.GetContext(), "bad");
+                (void)ub::Object::New(info.GetContext());
+            }
+        });
+    REQUIRE(native.has_value());
+    ub_test::Expose(fixture.context, "native", *native);
+    ub_test::Expose(fixture.context, "target", *object);
+    ub::TryCatch outer(fixture.iso());
+    CHECK(ub_test::EvalText(fixture.context, "try { native(target); 'nothing'; } catch (e) { e.message; }") == "one");
+    CHECK_FALSE(outer.HasCaught());
+}

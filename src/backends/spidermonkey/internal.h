@@ -99,6 +99,13 @@ struct Isolate::Impl {
     CallbackData embedder;
     Isolate* self = nullptr;
     detail::TryCatchState* tryCatch = nullptr;
+    /// How many native calls - a function, an accessor, an interceptor hook -
+    /// are running on this isolate's stack, nested. A handler takes an
+    /// exception at the start of the next operation only if it was opened at
+    /// the depth the operation runs at: one opened further out does not own an
+    /// exception a native threw, which belongs to the script that called it.
+    /// See `CatchPendingException`.
+    std::uint32_t nativeDepth = 0;
 
     /// Whether `Isolate::TerminateExecution` is in force.
     ///
@@ -447,7 +454,8 @@ struct GlobalNode {
 /// SpiderMonkey has no `v8::TryCatch`: an exception is simply pending on the
 /// context until something takes it. So this is a stack of handlers the
 /// backend keeps itself, and "catching" is taking the pending exception off
-/// the context the first time anyone asks.
+/// the context the first time anyone asks - or sooner, at the start of the
+/// next operation that can run script (`CatchPendingException`).
 struct TryCatchState {
     Isolate* owner = nullptr;
     TryCatchState* prev = nullptr;
@@ -463,6 +471,8 @@ struct TryCatchState {
     /// not ours to catch, so it is parked here and put back on close.
     bool hadOuter = false;
     JS::PersistentRooted<JS::Value> outer;
+    /// `Isolate::Impl::nativeDepth` when this handler opened.
+    std::uint32_t nativeDepth = 0;
 };
 
 static_assert(sizeof(TryCatchState) <= UNIBIND_TRY_CATCH_STORAGE_SIZE, "UNIBIND_TRY_CATCH_STORAGE_SIZE is too small");
@@ -686,11 +696,31 @@ class IsolateRealm {
     bool usable_ = false;
 };
 
+/// Hand an exception still pending on the context to the innermost `TryCatch`,
+/// if that handler owns it.
+///
+/// V8's handler catches an exception when it is thrown; this engine leaves it
+/// pending on the context until someone takes it, and a handler took it only
+/// when asked. An embedder may make several calls before asking, and script
+/// run by one of them that throws and catches its own exception clears the
+/// context - taking the embedder's exception with it. So every operation that
+/// can run script takes what is pending first.
+///
+/// Only into a handler opened at the current native depth. A native that
+/// threw, or saw an operation throw, and carries on without a handler of its
+/// own is about to return to the script that called it, and the exception is
+/// that script's to catch - not the embedder's further out.
+void CatchPendingException(Isolate& isolate) noexcept;
+
 /// Every operation that takes a `Context` runs in that realm, which is what
-/// makes the context parameter mean the same thing it means on V8.
+/// makes the context parameter mean the same thing it means on V8. It also
+/// takes any exception a handler is owed before it starts; see
+/// `CatchPendingException`.
 class RealmGuard {
    public:
-    explicit RealmGuard(const Context& context) noexcept : realm_(Raw(context), GlobalOf(context)) {}
+    explicit RealmGuard(const Context& context) noexcept : realm_(Raw(context), GlobalOf(context)) {
+        CatchPendingException(OwnerOf(context));
+    }
 
     RealmGuard(const RealmGuard&) = delete;
     RealmGuard& operator=(const RealmGuard&) = delete;
@@ -841,8 +871,10 @@ class CallFrame {
     CallFrame(Isolate& isolate, const JS::CallArgs* args) : isolate_(&isolate) {
         frame_ = ::new (static_cast<void*>(storage_.bytes)) Frame(isolate, isolate.impl().current, args);
         isolate.impl().current = frame_;
+        ++isolate.impl().nativeDepth;
     }
     ~CallFrame() {
+        --isolate_->impl().nativeDepth;
         isolate_->impl().current = frame_->parent;
         frame_->~Frame();
     }

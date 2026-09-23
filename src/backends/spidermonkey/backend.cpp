@@ -2209,7 +2209,8 @@ bool GlobalSameValueSlot(const GlobalNode* lhs, Slot rhs) noexcept {
 //
 // SpiderMonkey has no TryCatch: an exception is simply pending on the context
 // until somebody takes it. So the backend keeps its own stack of handlers, and
-// "catching" is taking the pending exception the first time anyone asks.
+// "catching" is taking the pending exception the first time anyone asks, or at
+// the start of the next operation that can run script (`CatchPendingException`).
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -2248,6 +2249,15 @@ void Drain(TryCatchState& state) noexcept {
 }
 
 }  // namespace
+
+void CatchPendingException(Isolate& isolate) noexcept {
+    TryCatchState* handler = isolate.impl().tryCatch;
+    if (handler == nullptr || handler->nativeDepth != isolate.impl().nativeDepth ||
+        !JS_IsExceptionPending(Raw(isolate))) {
+        return;
+    }
+    Drain(*handler);
+}
 
 void ThrowValue(Isolate& isolate, Slot value) {
     JSContext* cx = Raw(isolate);
@@ -2289,7 +2299,8 @@ void TryCatchOpen(Isolate& isolate, TryCatchState& storage) noexcept {
                                                                      .prev = isolate.impl().tryCatch,
                                                                      .exception = JS::PersistentRooted<JS::Value>(cx),
                                                                      .stack = JS::PersistentRootedObject(cx),
-                                                                     .outer = JS::PersistentRooted<JS::Value>(cx)};
+                                                                     .outer = JS::PersistentRooted<JS::Value>(cx),
+                                                                     .nativeDepth = isolate.impl().nativeDepth};
     // Anything already pending was thrown before this handler existed, so it
     // is not ours to catch. Park it and put it back when we close.
     if (JS_IsExceptionPending(cx)) {

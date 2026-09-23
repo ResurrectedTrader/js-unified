@@ -186,10 +186,14 @@ SpiderMonkey has no scoped exception handler. An exception is simply *pending*
 on the `JSContext` until something takes it, and API calls signal failure by
 returning `false`. So `TryCatch` is built here, not mapped: the isolate keeps a
 stack of handlers, and "catching" is taking the pending exception off the
-context the first time anybody asks (`HasCaught`, `Exception`, `Message`,
-`StackTrace`, or the destructor). Anything already pending when a handler opens
-is parked and put back when it closes, because it was not thrown while the
-handler was in scope.
+context - the first time anybody asks (`HasCaught`, `Exception`, `Message`,
+`StackTrace`, or the destructor), and at the start of every operation that can
+run script, because script that throws and catches its own exception clears the
+context and would clear an embedder's along with it. That second take is only
+into a handler opened at the current native-call depth: an exception a native
+leaves behind without a handler of its own belongs to the script that called it.
+Anything already pending when a handler opens is parked and put back when it
+closes, because it was not thrown while the handler was in scope.
 
 One behavioural question this backend raised and could not answer for itself:
 what `~TryCatch` does with an exception nobody consumed. The header used to say
