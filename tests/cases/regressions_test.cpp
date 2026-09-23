@@ -828,3 +828,39 @@ UNIBIND_TEST_CASE(TEMPLATES, "regressions: a template member named like an array
     CHECK(ub_test::EvalText(fixture.context, "String([indexed[1](), indexed[1].name, indexed[2], indexed[3]])") ==
           "2,1,3,9");
 }
+
+UNIBIND_TEST_CASE(PROMISES, "regressions: settling a settled promise is false, and a promise settles from any realm") {
+    // `Resolve` and `Reject` answer false for a promise that is already
+    // settled - it is what the language does, and not an error - and they
+    // settle a promise whatever realm it was made in, as every other
+    // operation on a value works from any realm of its isolate.
+    ub_test::Fixture fixture;
+    auto& isolate = fixture.iso();
+
+    const auto rejected = ub::Promise::New(fixture.context);
+    REQUIRE(rejected.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(ub::Reject(fixture.context, *rejected, ub::Integer::New(isolate, 1)) == std::optional<bool>(true));
+    CHECK(ub::Resolve(fixture.context, *rejected, ub::Integer::New(isolate, 2)) == std::optional<bool>(false));
+    CHECK(ub::Reject(fixture.context, *rejected, ub::Integer::New(isolate, 3)) == std::optional<bool>(false));
+    CHECK(ub::GetState(*rejected) == ub::PromiseState::Rejected);
+
+    const auto fulfilled = ub::Promise::New(fixture.context);
+    REQUIRE(fulfilled.has_value());
+    CHECK(ub::Resolve(fixture.context, *fulfilled, ub::Integer::New(isolate, 4)) == std::optional<bool>(true));
+    CHECK(ub::Reject(fixture.context, *fulfilled, ub::Integer::New(isolate, 5)) == std::optional<bool>(false));
+    CHECK(ub::GetState(*fulfilled) == ub::PromiseState::Fulfilled);
+
+    auto other = ub::Context::New(isolate);
+    REQUIRE(other.has_value());
+    const auto foreign = ub::Promise::New(*other);
+    REQUIRE(foreign.has_value());
+    CHECK(ub::Resolve(fixture.context, *foreign, ub::Integer::New(isolate, 6)) == std::optional<bool>(true));
+    CHECK(ub::GetState(*foreign) == ub::PromiseState::Fulfilled);
+    const auto foreignRejected = ub::Promise::New(*other);
+    REQUIRE(foreignRejected.has_value());
+    CHECK(ub::Reject(fixture.context, *foreignRejected, ub::Integer::New(isolate, 7)) == std::optional<bool>(true));
+    CHECK(ub::GetState(*foreignRejected) == ub::PromiseState::Rejected);
+    // NOLINTEND(bugprone-unchecked-optional-access)
+    isolate.PumpJobs();
+}

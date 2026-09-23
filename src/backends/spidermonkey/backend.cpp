@@ -1451,58 +1451,52 @@ Maybe<Slot> MakePromise(const Context& context) {
 
 namespace {
 
-/// Both settle paths want the promise as an object in this realm and the value
-/// wrapped into it. A promise made in one realm and settled from another is an
-/// ordinary thing to do once `Global` can carry it across.
-bool SettleArgs(JSContext* cx, Slot promise, Slot value, JS::MutableHandleObject outPromise,
-                JS::MutableHandleValue outValue) {
+/// Settle `promise` with `value` through `settle` - resolving or rejecting.
+///
+/// The promise is settled in its own realm, with the value wrapped into it: a
+/// promise made in one realm and settled from another is an ordinary thing to
+/// do once `Global` can carry it across, and the engine takes the promise
+/// object itself, not the cross-compartment wrapper the caller's realm sees.
+/// One already settled answers false before the engine is asked - it is what
+/// the language does, and not an error - as it does on V8.
+std::optional<bool> Settle(const Context& context, Slot promise, Slot value,
+                           bool (*settle)(JSContext*, JS::HandleObject, JS::HandleValue)) {
+    JSContext* cx = Raw(context);
+    RealmGuard realm(context);
+    if (Terminating(context)) {
+        return std::nullopt;
+    }
     JS::RootedValue raw(cx);
     if (!ResolveHere(cx, promise, &raw) || !raw.isObject()) {
+        return std::nullopt;
+    }
+    JS::RootedObject target(cx, js::UncheckedUnwrap(&raw.toObject()));
+    if (target == nullptr || !JS::IsPromiseObject(target)) {
+        return std::nullopt;
+    }
+    if (JS::GetPromiseState(target) != JS::PromiseState::Pending) {
         return false;
     }
-    outPromise.set(&raw.toObject());
-    if (!JS::IsPromiseObject(outPromise)) {
-        return false;
+    JS::RootedValue with(cx);
+    if (!ResolveHere(cx, value, &with)) {
+        return std::nullopt;
     }
-    return ResolveHere(cx, value, outValue);
+    const JSAutoRealm inPromise(cx, target);
+    if (!JS_WrapValue(cx, &with) || !settle(cx, target, with)) {
+        JS_ClearPendingException(cx);
+        return std::nullopt;
+    }
+    return true;
 }
 
 }  // namespace
 
 Maybe<bool> ResolvePromise(const Context& context, Slot promise, Slot value) {
-    JSContext* cx = Raw(context);
-    RealmGuard realm(context);
-    if (Terminating(context)) {
-        return std::nullopt;
-    }
-    JS::RootedObject target(cx);
-    JS::RootedValue with(cx);
-    if (!SettleArgs(cx, promise, value, &target, &with)) {
-        return std::nullopt;
-    }
-    if (!JS::ResolvePromise(cx, target, with)) {
-        JS_ClearPendingException(cx);
-        return std::nullopt;
-    }
-    return true;
+    return Settle(context, promise, value, &JS::ResolvePromise);
 }
 
 Maybe<bool> RejectPromise(const Context& context, Slot promise, Slot reason) {
-    JSContext* cx = Raw(context);
-    RealmGuard realm(context);
-    if (Terminating(context)) {
-        return std::nullopt;
-    }
-    JS::RootedObject target(cx);
-    JS::RootedValue with(cx);
-    if (!SettleArgs(cx, promise, reason, &target, &with)) {
-        return std::nullopt;
-    }
-    if (!JS::RejectPromise(cx, target, with)) {
-        JS_ClearPendingException(cx);
-        return std::nullopt;
-    }
-    return true;
+    return Settle(context, promise, reason, &JS::RejectPromise);
 }
 
 PromiseState PromiseStateOf(Slot promise) noexcept {
