@@ -607,7 +607,7 @@ UNIBIND_TEST_CASE(EXCEPTIONS, "regressions: a caught value's message is read wit
     CHECK(messageOf("throw Object.create(null)").has_value());
     CHECK(messageOf("throw { toString() { throw new Error('from toString'); } }").has_value());
 
-    ub_test::Eval(fixture.context, "globalThis.conversions = 0");
+    (void)ub_test::Eval(fixture.context, "globalThis.conversions = 0");
     CHECK(messageOf("throw { toString() { ++conversions; return 'converted'; } }").has_value());
     CHECK(ub_test::EvalInt(fixture.context, "conversions") == 0);
 

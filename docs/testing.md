@@ -181,6 +181,14 @@ Where the *kind* of an error matters, the portable question is asked in script -
 `e instanceof TypeError`, `err.constructor.name` - rather than by parsing a
 message.
 
+### Which column an error is placed at
+
+`TryCatch::Location` and `StackFrame` agree on the script and the line, and the
+engines choose the column differently: for `null.x` V8 names the column of the
+property it could not read and SpiderMonkey the start of the expression. The
+suite asserts columns only relative to one another - a column offset moving a
+first line's columns by exactly itself - never as a number.
+
 ### Stack trace format
 
 `TryCatch::StackTrace` returns the engine's own format, and the two are not the
