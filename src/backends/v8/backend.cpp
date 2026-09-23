@@ -3755,17 +3755,19 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
         // is the isolate's thread, so here is as good a datum as exists.
         const char here = 0;
         const auto top = reinterpret_cast<uintptr_t>(&here);
-        // What was asked for, or else as much of the thread's stack as can be
-        // promised: native calls are held to it either way (see
-        // `RefuseDeeperNative`), and V8's own limit is moved only when asked.
-        const std::size_t wanted =
-            options.stackLimitBytes != 0 ? options.stackLimitBytes : std::numeric_limits<std::size_t>::max();
+        // What was asked for, or else V8's own default - its `--stack-size`,
+        // 984 KiB on every architecture - and either way no more of the
+        // thread's stack than can be promised. A default measured from here can
+        // run past the bottom of a 1 MiB thread stack by as much as the thread
+        // had used before the isolate was made, and x64's frames are big enough
+        // for runaway script recursion to get there. Native calls are held to
+        // the same limit (see `RefuseDeeperNative`).
+        constexpr std::size_t V8_DEFAULT_STACK = std::size_t{984} * 1024;
+        const std::size_t wanted = options.stackLimitBytes != 0 ? options.stackLimitBytes : V8_DEFAULT_STACK;
         const std::size_t limit = UsableStackBytes(top, wanted);
         if (top > limit) {
             impl->stackGuard = top - limit;
-            if (options.stackLimitBytes != 0) {
-                impl->isolate->SetStackLimit(top - limit);
-            }
+            impl->isolate->SetStackLimit(top - limit);
         }
     }
 
