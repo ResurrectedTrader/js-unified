@@ -682,3 +682,20 @@ UNIBIND_TEST_CASE2(TEMPLATES, CLASSES, "regressions: a name a template or class 
     // NOLINTEND(bugprone-unchecked-optional-access)
     CHECK(ub_test::EvalInt(fixture.context, "plain['got\ufffd']") == 3);
 }
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: a script named with bytes that are not UTF-8 can still throw") {
+    // A resource name is text an embedder often builds from a file path, and
+    // a path is bytes. One that is not UTF-8 is decoded as
+    // `String::NewFromUtf8` decodes - and it must not stop the script's errors
+    // being errors: on one engine the error could not be made, and the script
+    // stopped as though it had been terminated, with nothing to catch.
+    ub_test::Fixture fixture;
+
+    const auto location = LocationOfThrow(fixture, "var a = 1;\nnull.property;", {.resourceName = "bad\xFF.js"});
+    REQUIRE(location.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(location->scriptName == "bad\xEF\xBF\xBD.js");
+    CHECK(location->lineNumber == 2);
+    CHECK(location->sourceLine == std::optional<std::string>("null.property;"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}

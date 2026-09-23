@@ -2704,11 +2704,23 @@ namespace {
 /// Keep the text `TryCatch::Location` will quote from, for as long as the
 /// engine keeps `script`'s code; see `Isolate::Impl::sources`. Quoting is a
 /// convenience, so failing to keep it costs the quote and nothing else.
+/// The name a script is compiled under: its origin's resource name, decoded
+/// as `String::NewFromUtf8` decodes. The engine takes a file name as UTF-8 and
+/// cannot make an error that names a script whose name is not - the script's
+/// errors then stop it the way a termination does, with nothing to catch.
+std::string ResourceNameOf(const ScriptOrigin& origin) {
+    const std::size_t firstInvalid = FirstInvalidUtf8(origin.resourceName);
+    if (firstInvalid == std::string_view::npos) {
+        return std::string(origin.resourceName);
+    }
+    return ReplaceInvalidUtf8(origin.resourceName, firstInvalid);
+}
+
 void RetainSource(Isolate& isolate, JSScript* script, std::string_view source, const ScriptOrigin& origin) noexcept {
     try {
         auto kept = std::make_unique<Isolate::Impl::RetainedSource>(
             Isolate::Impl::RetainedSource{.owner = &isolate.impl(),
-                                          .name = std::string(origin.resourceName),
+                                          .name = ResourceNameOf(origin),
                                           .text = std::string(source),
                                           .firstLine = std::int64_t{origin.lineOffset} + 1});
         Isolate::Impl::RetainedSource* raw = kept.get();
@@ -2784,7 +2796,7 @@ ScriptRec* CompileScript(const Context& context, std::string_view source, const 
         return nullptr;
     }
 
-    const std::string resourceName(origin.resourceName);
+    const std::string resourceName = ResourceNameOf(origin);
     JS::CompileOptions options(cx);
     ApplyOrigin(options, resourceName, origin);
     ApplyCompileOptions(options, compileOptions);
@@ -2799,7 +2811,7 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
         return nullptr;
     }
 
-    const std::string resourceName(origin.resourceName);
+    const std::string resourceName = ResourceNameOf(origin);
     JS::CompileOptions options(cx);
     ApplyOrigin(options, resourceName, origin);
     // Set before the decode as well as the compile, harmlessly: a decoded

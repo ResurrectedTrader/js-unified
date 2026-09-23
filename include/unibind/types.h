@@ -247,7 +247,9 @@ struct KeyFilter {
     bool includeSymbols = false;
 };
 
-/// Where a script came from, for diagnostics.
+/// Where a script came from, for diagnostics. `resourceName` is UTF-8 text, and
+/// bytes in it that are not UTF-8 are decoded as `String::NewFromUtf8` decodes
+/// them - it is what every diagnostic naming the script will say.
 struct ScriptOrigin {
     std::string_view resourceName = "<anonymous>";
     int lineOffset = 0;
