@@ -554,3 +554,35 @@ UNIBIND_TEST_CASE(STACK_FRAMES, "regressions: capturing at most no frames captur
                            "function a() { captureNone(); return 1; } function b() { return a(); } b()") == 1);
     CHECK(g_zeroLimitFrames == 0);
 }
+
+namespace {
+std::string g_probeNames;
+void ProbeNames(const ub::CallbackInfo& info) {
+    const auto frames = ub::CaptureStackFrames(info.GetIsolate(), 1);
+    g_probeNames += "[" + (frames.empty() ? std::string("?") : frames.front().functionName) + "] ";
+}
+}  // namespace
+
+UNIBIND_TEST_CASE(STACK_FRAMES, "regressions: an anonymous function's frame has no name, and a guessed one no prefix") {
+    // `StackFrame::functionName` is empty for an anonymous function. One engine
+    // hands out the name it guessed for one instead, in a notation of its own
+    // - `g/<` for "an anonymous function inside g", `outer/obj.n` for a
+    // function assigned to `obj.n` inside `outer` - where the other names what
+    // was assigned and nothing for what was not.
+    ub_test::Fixture fixture;
+
+    const auto probe = ub::Function::New(fixture.context, &ProbeNames);
+    REQUIRE(probe.has_value());
+    ub_test::Expose(fixture.context, "p", *probe);  // NOLINT(bugprone-unchecked-optional-access)
+    g_probeNames.clear();
+    (void)ub_test::Eval(fixture.context, R"(
+        function g() { [1].map(x => p()); [1].map(function () { p(); }); }
+        g();
+        var obj = {};
+        function outer() { obj.n = function () { p(); }; obj.n(); return function () { p(); }; }
+        outer()();
+        const h = () => p(); h();
+        function named() { p(); } named();
+        0)");
+    CHECK(g_probeNames == "[] [] [obj.n] [] [h] [named] ");
+}

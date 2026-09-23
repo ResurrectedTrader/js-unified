@@ -2310,6 +2310,28 @@ Maybe<std::string> TryCatchStackTrace(const TryCatchState& state, const Context&
 
 namespace {
 
+/// A frame's function name as `StackFrame` promises it, from the display name
+/// the engine recorded.
+///
+/// For a function with no name of its own the engine records the name it
+/// guessed, in a notation of its own: `/` joins an enclosing function's name to
+/// what was guessed inside it, and `<` stands for "an anonymous function" -
+/// `g/<` is an anonymous function inside `g`, `outer/obj.n` a function assigned
+/// to `obj.n` inside `outer`. V8 names what a function was assigned to and
+/// nothing else, so the prefix goes, and a guess that is only "anonymous" is
+/// no name at all. A real name - an identifier, `get x`, a computed key - has
+/// neither character, short of a computed key written with one.
+std::string FunctionNameOf(std::string displayName) {
+    const std::size_t slash = displayName.rfind('/');
+    if (slash != std::string::npos) {
+        displayName.erase(0, slash + 1);
+    }
+    if (displayName.find('<') != std::string::npos) {
+        displayName.clear();
+    }
+    return displayName;
+}
+
 /// Walk a `SavedFrame` chain into the plain structs the API hands out.
 ///
 /// `limit` of 0 means everything the chain holds. Nothing here allocates an
@@ -2340,7 +2362,7 @@ std::vector<StackFrame> ReadSavedFrames(JSContext* cx, JS::HandleObject top, std
         JS::RootedString name(cx);
         if (JS::GetSavedFrameFunctionDisplayName(cx, nullptr, frame, &name, SCRIPT_ONLY) == JS::SavedFrameResult::Ok &&
             name != nullptr) {
-            out.functionName = EncodeToStdString(cx, name);
+            out.functionName = FunctionNameOf(EncodeToStdString(cx, name));
         }
         std::uint32_t line = 0;
         if (JS::GetSavedFrameLine(cx, nullptr, frame, &line, SCRIPT_ONLY) == JS::SavedFrameResult::Ok) {
