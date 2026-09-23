@@ -497,3 +497,36 @@ UNIBIND_TEST_CASE(CLASSES, "regressions: a constructor that declines without thr
                             "(() => { try { DeclinedToo(); return 'made'; } "
                             "catch (e) { return e instanceof Error ? 'refused' : 'odd'; } })()") == "refused");
 }
+
+namespace {
+
+std::unique_ptr<Declined> MakeThenStarve(const ub::CallbackInfo& /*info*/) {
+    auto made = std::make_unique<Declined>();
+    // The next allocation is the constructor machinery's own, taking the
+    // native over - and it fails.
+    ub_test::FailNextAllocations(1);
+    return made;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(CLASSES,
+                  "regressions: running out of memory taking a constructed native over is a failed construction") {
+    ub_test::Fixture fixture;
+
+    const auto cls = ub::Class<Declined>::New(fixture.iso(), "Starved");
+    cls.Construct<&MakeThenStarve>();
+    const auto constructor = cls.GetConstructor(fixture.context);
+    REQUIRE(constructor.has_value());
+    ub_test::Expose(fixture.context, "Starved", *constructor);  // NOLINT(bugprone-unchecked-optional-access)
+
+    ub::TryCatch tryCatch(fixture.iso());
+    const auto result = ub::Evaluate(fixture.context, "new Starved()");
+    const long long fired = ub_test::StopFailingAllocations();
+    if (fired == 0) {
+        ub_test::ReportSkip("the constructor machinery made no C++ allocation here");
+        return;
+    }
+    CHECK_FALSE(result.has_value());
+    CHECK(tryCatch.HasCaught());
+}

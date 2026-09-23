@@ -104,6 +104,7 @@
 
 #include <concepts>
 #include <memory>
+#include <new>
 #include <string_view>
 #include <utility>
 
@@ -200,13 +201,35 @@ std::optional<bool> ClassHasInstance(const Context& context, ClassRec* rec, Slot
 
 template <class T, auto Fn>
 NativeBox* ConstructorTrampoline(const CallbackInfo& info) {
-    auto native = Fn(info);
-    if (!native) {
-        return nullptr;  // the callback threw, or declined
+    // This runs inside an engine callback, and a C++ exception must not unwind
+    // through the engine's frames: it skips everything the engine would have
+    // done on the way out and leaves it in whatever state it was mid-call. So
+    // running out of memory - in the embedder's constructor, or here, taking
+    // its native over - fails the construction as a script exception instead.
+    // A consumer built without exceptions has no such unwinding to prevent.
+    const auto make = [&info]() -> NativeBox* {
+        auto native = Fn(info);
+        if (!native) {
+            return nullptr;  // the callback threw, or declined
+        }
+        // A `std::unique_ptr` becomes the wrapper's first share; a
+        // `std::shared_ptr` is taken as it is, deleter and all.
+        return new NativeHolder<T>(std::shared_ptr<T>(std::move(native)));
+    };
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+    try {
+        return make();
+    } catch (const std::bad_alloc&) {
+        try {
+            info.Throw(ErrorKind::RangeError, "out of memory making the instance's native state");
+        } catch (const std::bad_alloc&) {
+            // Nothing left to say it with; the construction still fails.
+        }
+        return nullptr;
     }
-    // A `std::unique_ptr` becomes the wrapper's first share; a
-    // `std::shared_ptr` is taken as it is, deleter and all.
-    return new NativeHolder<T>(std::shared_ptr<T>(std::move(native)));
+#else
+    return make();
+#endif
 }
 
 template <class T, void (*Fn)(T&, const CallbackInfo&)>
