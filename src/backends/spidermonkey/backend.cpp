@@ -2801,12 +2801,16 @@ namespace {
 /// as `String::NewFromUtf8` decodes. The engine takes a file name as UTF-8 and
 /// cannot make an error that names a script whose name is not - the script's
 /// errors then stop it the way a termination does, with nothing to catch.
+///
+/// It ends at a NUL: the engine takes the name as a C string, and the other
+/// backend stops there too, so that both report the same name.
 std::string ResourceNameOf(const ScriptOrigin& origin) {
-    const std::size_t firstInvalid = FirstInvalidUtf8(origin.resourceName);
+    const std::string_view name = origin.resourceName.substr(0, origin.resourceName.find('\0'));
+    const std::size_t firstInvalid = FirstInvalidUtf8(name);
     if (firstInvalid == std::string_view::npos) {
-        return std::string(origin.resourceName);
+        return std::string(name);
     }
-    return ReplaceInvalidUtf8(origin.resourceName, firstInvalid);
+    return ReplaceInvalidUtf8(name, firstInvalid);
 }
 
 void RetainSource(Isolate& isolate, JSScript* script, std::string_view source, const ScriptOrigin& origin) noexcept {

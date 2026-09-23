@@ -250,6 +250,8 @@ struct KeyFilter {
 /// Where a script came from, for diagnostics. `resourceName` is UTF-8 text, and
 /// bytes in it that are not UTF-8 are decoded as `String::NewFromUtf8` decodes
 /// them - it is what every diagnostic naming the script will say.
+/// It ends at the first NUL, if it has one: one engine takes a name as a C
+/// string, so the other stops there too.
 struct ScriptOrigin {
     std::string_view resourceName = "<anonymous>";
     int lineOffset = 0;

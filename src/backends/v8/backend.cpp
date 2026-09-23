@@ -3226,9 +3226,11 @@ namespace {
         return nullptr;
     }
     const bool eager = options == CompileOptions::EagerCompile;
-    v8::ScriptOrigin scriptOrigin(RawString(owner, origin.resourceName), origin.lineOffset, origin.columnOffset, false,
-                                  -1, {}, false, false, false,
-                                  eager ? EagerMarker(owner) : v8::Local<v8::PrimitiveArray>());
+    // A name ends at a NUL, as it must on the other engine, which takes it as a
+    // C string (`ScriptOrigin` in `unibind/types.h`).
+    const std::string_view resourceName = origin.resourceName.substr(0, origin.resourceName.find('\0'));
+    v8::ScriptOrigin scriptOrigin(RawString(owner, resourceName), origin.lineOffset, origin.columnOffset, false, -1, {},
+                                  false, false, false, eager ? EagerMarker(owner) : v8::Local<v8::PrimitiveArray>());
 
     // v8::ScriptCompiler::Source takes ownership of the CachedData object (not
     // of the buffer, which is the caller's), and `rejected` is only readable

@@ -402,3 +402,25 @@ UNIBIND_TEST_CASE(PROPERTY_ATTRIBUTES,
     REQUIRE(attributes.has_value());
     CHECK(*attributes == ub::PropertyAttribute::None);
 }
+
+UNIBIND_TEST_CASE2(STACK_FRAMES, MESSAGE_LOCATION, "regressions: a script's name ends at a NUL, on both engines") {
+    // One engine takes a script's name as a C string and cannot hold a NUL;
+    // the other kept every byte, so the same script reported two different
+    // names. It ends at the NUL on both.
+    ub_test::Fixture fixture;
+    const std::string name("first\0second.js", 15);
+
+    const auto script = ub::Script::Compile(fixture.context, "\nthrow new Error('x')", {.resourceName = name});
+    REQUIRE(script.has_value());
+    ub::TryCatch handler(fixture.iso());
+    CHECK_FALSE(script->Run(fixture.context).has_value());
+    REQUIRE(handler.HasCaught());
+    const auto location = handler.Location(fixture.context);
+    REQUIRE(location.has_value());
+    CHECK(location->scriptName == "first");
+    CHECK(location->lineNumber == 2);
+    const auto frames = handler.StackFrames(fixture.context);
+    REQUIRE(frames.has_value());
+    REQUIRE_FALSE(frames->empty());
+    CHECK(frames->front().scriptName == "first");
+}
