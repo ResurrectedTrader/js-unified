@@ -52,6 +52,16 @@ target_compile_definitions(unibind_backend_spidermonkey PRIVATE
 
 # The engine and the system libraries it was built against, as listed in
 # dependencies/README.md.
+# A debug engine is configured with --enable-debug, and its js-config.h refuses
+# to be included without DEBUG: the public headers lay some types out
+# differently with it, so compiling against them without it would be an ABI
+# mismatch rather than a style choice. The flavor is what says which engine this
+# is, so it is what decides.
+string(TOLOWER "${UNIBIND_ENGINE_FLAVOR}" unibindSpiderMonkeyFlavor)
+if(unibindSpiderMonkeyFlavor STREQUAL "debug")
+    target_compile_definitions(unibind_backend_spidermonkey PRIVATE DEBUG)
+endif()
+
 target_link_libraries(unibind_backend_spidermonkey PUBLIC
     "${UNIBIND_SPIDERMONKEY_DIR}/spidermonkey.lib"
     mincore ws2_32 advapi32 user32 ole32 oleaut32 shell32 userenv
