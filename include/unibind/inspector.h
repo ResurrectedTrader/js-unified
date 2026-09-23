@@ -163,7 +163,10 @@ class InspectorSession {
     /// `Debugger.enable` is refused. Still answered on a stopped isolate too -
     /// one `Isolate::TerminateExecution` has stopped and nothing has cancelled
     /// - but what it would run is stopped at once, as any other script there
-    /// is, and the answer is the error saying so.
+    /// is, and the answer is the error saying so. **Except during a pause**:
+    /// the engine holds every interrupt off while script is paused, a stop's
+    /// included, so a stop asked for then takes the paused script when it
+    /// resumes, and what DevTools evaluates before that still runs.
     void DispatchProtocolMessage(std::string_view message);
 
     /// Leave a pause from outside the protocol - on the embedder's own
