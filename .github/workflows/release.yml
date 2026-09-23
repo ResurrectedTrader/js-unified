@@ -1,0 +1,179 @@
+# Publishes a prefix a consumer can link without building this tree: the public
+# headers, the generated config.h, both backend libraries, and the CMake and
+# MSBuild files that describe them. Run by pushing a tag `vX.Y.Z`.
+#
+# One archive per architecture and flavor, holding both backends. That is the
+# shape a single-runtime consumer wants - it compiles its objects once against
+# the headers and chooses an engine at each final link - and it is the shape the
+# install rules already produce: a second backend installed into a prefix adds
+# one library and rewrites an identical config.h (see CMakeLists.txt,
+# "Installing"). So each backend is built and installed in its own job, and the
+# publish job merges the two prefixes; it refuses if their headers disagree,
+# since that would mean the two trees did not describe the same ABI.
+#
+# The engines are not in the archive. They are hundreds of megabytes each and
+# already published (see cmake/UnibindEngines.cmake), and a consumer that pins
+# them itself should not have to download them twice. What the archive records
+# instead is which engine builds these libraries were compiled against, in
+# engines.txt, and the MSVC toolset floor, in toolset.txt - the same file the
+# engine archives carry.
+#
+# The per-backend `unibind-engine-*.props` fragments are dropped from the
+# archive: each names the engine directory of the CI machine that built it,
+# which is a path that exists nowhere else. With no fragment, a consumer sets
+# UnibindV8Dir / UnibindSpiderMonkeyDir, and unibind.props says so if they do not.
+#
+# The flavor follows the engine: `debug` links the engine's debug build and the
+# debug CRT (/MTd), `release` the release ones (/MT). Nothing else about the
+# prefix differs.
+#
+# Tests are not built here. The suite runs on every push in v8.yml and
+# spidermonkey.yml, which is where a tag's commit was already judged; this job
+# only has to produce what that commit installs.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish (must already exist)
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TOOLSET: '14.44'
+
+jobs:
+  build:
+    name: ${{ matrix.backend }} ${{ matrix.arch }} ${{ matrix.flavor }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        backend: [v8, spidermonkey]
+        arch: [x86, x64]
+        flavor: [release, debug]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Configure, which fetches the engine
+        run: |
+          $platform = if ('${{ matrix.arch }}' -eq 'x86') { 'Win32' } else { 'x64' }
+          $triplet = if ('${{ matrix.arch }}' -eq 'x86') { 'x86-windows-static' } else { 'x64-windows-static' }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A $platform -T ClangCL `
+            -DUNIBIND_BACKEND=${{ matrix.backend }} `
+            -DUNIBIND_ENGINE_FLAVOR=${{ matrix.flavor }} `
+            -DUNIBIND_BUILD_TESTS=OFF `
+            -DUNIBIND_VCPKG_ROOT="${env:VCPKG_INSTALLATION_ROOT}" `
+            -DVCPKG_TARGET_TRIPLET=$triplet `
+            -DVCPKG_HOST_TRIPLET=x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and install
+        run: |
+          $config = if ('${{ matrix.flavor }}' -eq 'debug') { 'Debug' } else { 'Release' }
+          cmake --build build --config $config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --install build --config $config --prefix prefix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem -Recurse -File prefix | ForEach-Object { $_.FullName.Substring((Resolve-Path prefix).Path.Length + 1) }
+
+      - name: Record the engine this was built against
+        run: |
+          $cache = Get-Content build/CMakeCache.txt
+          $key = if ('${{ matrix.backend }}' -eq 'v8') { 'UNIBIND_V8_VERSION' } else { 'UNIBIND_SPIDERMONKEY_VERSION' }
+          $match = $cache | Select-String "^${key}:[A-Z]+=(.*)$"
+          if (-not $match) { throw "$key is not in the cache" }
+          "${{ matrix.backend }} $($match.Matches[0].Groups[1].Value)" |
+            Out-File -Encoding ascii prefix/engine-${{ matrix.backend }}.txt
+          Get-Content prefix/engine-${{ matrix.backend }}.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prefix-${{ matrix.arch }}-${{ matrix.flavor }}-${{ matrix.backend }}
+          path: prefix
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge each architecture's two backends into one prefix, and archive it
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          $version = $tag.TrimStart('v')
+          New-Item -ItemType Directory -Force out | Out-Null
+          foreach ($arch in 'x86', 'x64') {
+            foreach ($flavor in 'release', 'debug') {
+              $v8 = "artifacts/prefix-$arch-$flavor-v8"
+              $sm = "artifacts/prefix-$arch-$flavor-spidermonkey"
+
+              # Every header both trees installed must be byte-identical, config.h
+              # included: that is the claim that one compile serves both engines.
+              Get-ChildItem -Recurse -File "$v8/include" | ForEach-Object {
+                $rel = $_.FullName.Substring((Resolve-Path $v8).Path.Length + 1)
+                $other = Join-Path $sm $rel
+                if (-not (Test-Path $other)) { throw "$rel is in the V8 prefix only" }
+                if ((Get-FileHash $_.FullName).Hash -ne (Get-FileHash $other).Hash) {
+                  throw "$rel differs between the V8 and SpiderMonkey prefixes ($arch $flavor)"
+                }
+              }
+
+              $stage = "stage/$arch-$flavor"
+              New-Item -ItemType Directory -Force $stage | Out-Null
+              Copy-Item -Recurse -Force "$v8/*" $stage
+              Copy-Item -Recurse -Force "$sm/*" $stage
+              Get-ChildItem "$stage/msbuild" -Filter 'unibind-engine-*.props' | Remove-Item
+
+              (Get-Content "$stage/engine-v8.txt", "$stage/engine-spidermonkey.txt") |
+                Out-File -Encoding ascii "$stage/engines.txt"
+              Remove-Item "$stage/engine-v8.txt", "$stage/engine-spidermonkey.txt"
+              $env:TOOLSET | Out-File -Encoding ascii -NoNewline "$stage/toolset.txt"
+              Copy-Item LICENSE "$stage/LICENSE"
+
+              $asset = "unibind-$version-$arch-$flavor-msvc$env:TOOLSET.zip"
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $stage).Path, (Join-Path (Resolve-Path out).Path $asset))
+              $hash = (Get-FileHash "out/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $asset" | Out-File -Encoding ascii "out/$asset.sha256"
+              "$asset  $hash"
+            }
+          }
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          $engines = Get-Content stage/x86-release/engines.txt | ForEach-Object { "- $_" }
+          $notes = @(
+            "Prebuilt unibind: headers, generated config.h, and both backend libraries, per architecture and flavor."
+            ""
+            "Built with ClangCL against MSVC $env:TOOLSET (a floor: an older toolset fails the link). Engines are not included; these libraries were compiled against:"
+            ""
+          ) + $engines + @(
+            ""
+            "Import ``msbuild/unibind.props`` and set ``UnibindBackend`` plus ``UnibindV8Dir`` or ``UnibindSpiderMonkeyDir``, or use ``find_package(unibind)`` from ``lib/cmake/unibind``. See the README."
+          )
+          $notes -join "`n" | Out-File -Encoding utf8 notes.md
+          gh release create $tag (Get-ChildItem out/*).FullName --title $tag --notes-file notes.md --verify-tag
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

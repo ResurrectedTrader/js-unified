@@ -178,6 +178,18 @@ got past both fails to link.
 
 ## Using it from your project
 
+You do not have to build this tree to use it. Every `vX.Y.Z` tag publishes a
+prefix per architecture and flavor on the
+[releases page](https://github.com/ResurrectedTrader/unibind/releases), named
+`unibind-X.Y.Z-<x86|x64>-<release|debug>-msvc14.44.zip`, with a `.sha256` next
+to each. One archive holds the headers, `config.h`, and **both** backend
+libraries, so the same objects link either engine. `engines.txt` in the archive
+names the engine versions those libraries were compiled against. The engines are
+not included: fetch the matching ones from the releases that
+`cmake/UnibindEngines.cmake` names, and point `UnibindV8Dir` /
+`UnibindSpiderMonkeyDir` (or `UNIBIND_V8_DIR` / `UNIBIND_SPIDERMONKEY_DIR`) at
+them. The `debug` flavor links the engines' debug builds and `/MTd`.
+
 ### MSBuild (`.vcxproj`)
 
 One line, in the property-sheet slot every C++ project already has:
