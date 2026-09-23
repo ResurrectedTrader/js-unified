@@ -1,0 +1,878 @@
+# Gotchas
+
+Everything in this file cost somebody a day, or would have. It is collected
+here so that you can read it in ten minutes instead - before you lose the day,
+not while you are losing it.
+
+The ones worth fearing are not the crashes. A crash tells you where it happened.
+These are the ones where **the code compiles, links, runs, and gives you the
+wrong answer**: a `TypeError` that arrives as a `SyntaxError`, a cached blob
+that runs a different script than the one you asked for, an allocator hook that
+silently stops hooking, a promise continuation that simply never happens. Every
+entry below says whether it is silent.
+
+If you are here because something is already wrong, the index is the fastest
+way in.
+
+## The ones you will not diagnose from the symptom
+
+Twelve of these give a wrong answer and no error at all. The thirteenth gives an
+error that blames something else entirely, which is the same problem wearing a
+disguise.
+
+| | |
+|---|---|
+| Every engine symbol undefined, as if the archive were missing | [A 32-bit `lld-link` loses the engine without saying so](#a-32-bit-lld-link-silently-fails-to-link-the-engine-archive) |
+| Asking for a `TypeError` and getting a `SyntaxError` | [`js-config.h` is a record of the build, and it is wrong](#js-configh-does-not-describe-the-build-it-shipped-with) |
+| A leak counter or failure injector that stopped working | [An engine header replaces your `operator new`](#an-engine-header-replaces-your-operator-new) |
+| A cached compile that runs the wrong source | [A code-cache blob is keyed to the engine, not to your source](#a-code-cache-blob-says-which-engine-built-it-not-which-source-it-came-from) |
+| `async` code that never continues | [Nothing drains promises but `PumpJobs`](#if-you-never-call-pumpjobs-promise-continuations-never-run) |
+| A registry lookup that never finds the callback it was given | [Comparing two `Global`s compares roots, not values](#comparing-two-globals-as-handles-asks-the-wrong-question) |
+| An interceptor setter whose result is ignored | [Four of the hooks discard their return value](#an-interceptor-setter-query-deleter-or-enumerator-discards-what-you-write-to-the-return-value) |
+| `Constant("name")` arriving as `true` | [Pointer-to-bool beats every user-defined conversion](#constantliteral-is-constanttrue) |
+| A read-only accessor that is not read-only | [`ReadOnly` is meaningless on an accessor](#propertyattributereadonly-is-ignored-on-an-accessor) |
+| A `switch` on `Kind()` that never sees your typed array | [`ValueKind` answers what you can *do*, not what it *is*](#valuekind-collapses-date-regexp-proxy-and-typed-arrays-into-object) |
+| A copy that copies nothing | [`CopyElements<T>` refuses a type mismatch by writing zero](#copyelementst-with-the-wrong-t-copies-nothing-and-says-0) |
+| A stale handle that reads a plausible value | [`UNIBIND_HANDLE_CHECKS` is an ABI flag, not a debug flag](#unibind_handle_checks-is-an-abi-flag-and-it-changes-behaviour) |
+| Every operation on an isolate doing nothing, over and over | [A stopped isolate stays stopped](#a-stopped-isolate-stays-stopped-and-does-nothing-quietly) |
+
+---
+
+## Building and linking against an engine
+
+### A 32-bit `lld-link` silently fails to link the engine archive
+
+**Loud, and it blames the wrong thing entirely.** An x86 MSBuild project takes
+the 32-bit host toolchain by default (`VC\Tools\Llvm\bin`, not
+`...\Llvm\x64\bin`), and a 32-bit `lld-link` cannot get through an archive the
+size of an engine - V8's monolith is 1.2 GB. It does not say so. It opens the
+archive, loads no member from it, and reports *every* engine symbol as
+undefined, exactly as though the library had not been passed at all.
+
+So what a reader sees is hundreds of undefined V8 symbols, and what a reader
+concludes is that the archive is missing, corrupt, or the wrong architecture.
+Nothing in the output points at the linker's own bitness.
+
+Set `<PreferredToolArchitecture>x64</PreferredToolArchitecture>` in the
+project's `Globals` group, above the import of `Microsoft.Cpp.Default.props`.
+`unibind.props` checks for this and stops the build with a sentence, but it cannot
+fix it: by the time a property sheet is imported, the toolchain has been chosen.
+
+CMake happens to pick the 64-bit tools already, which is why this went
+unnoticed - and why it now lands on the most likely newcomer of all, the one who
+cloned, had the engine fetched for them, and then could not link.
+
+### An engine header replaces your `operator new`
+
+**Silent, except for a warning nobody reads.** `mozilla/cxxalloc.h`, which
+`jsapi.h` pulls in transitively, defines `operator new` and `operator delete` as
+always-inline forwards to `moz_xmalloc`. So a `::operator new` written in *any*
+translation unit that has seen a SpiderMonkey header is not the program's
+replaceable `operator new`. A leak counter, an allocation-failure injector or an
+arena stops working in that TU and nothing says so; the only outward sign is
+`LNK4217` warnings about `moz_xmalloc` in the build log.
+
+Put such code in a file that includes no engine header. This repository does
+exactly that: `src/backends/spidermonkey/frame_alloc.cpp` exists solely to own
+the two lines that call `::operator new` and `::operator delete`, and adding an
+engine include to it would redirect frame allocation back to `moz_xmalloc` and
+quietly un-test the frame-exhaustion rule.
+
+### The x64 V8 monolith replaces your `operator new` too, and it is a link error
+
+**Loud, and only on x64.** The published x64 V8 build carries PartitionAlloc's
+Windows allocator shim - `allocator_shim_win_static.obj` - which defines
+`malloc`, `free`, `_aligned_malloc` **and twelve of the twenty allocation
+operators**: nothrow `new`, aligned `new`, sized `delete`, aligned `delete`. Any
+link mentions `malloc`, so that object is always pulled in, so those definitions
+are always present. A program that replaces them itself gets LNK2005 on all
+twelve and does not build.
+
+It is the same trap as SpiderMonkey's above with the polarity reversed: that one
+is silent and this one is loud, and neither leaves you owning your allocator. The
+x86 monolith has no shim at all - PartitionAlloc is not used as malloc on 32-bit
+Windows - which is why an x86 build of the same tree links and an x64 build does
+not.
+
+There is no way to take only part of that object, so a program that must own
+those operators links with `/FORCE:MULTIPLE` and relies on the order: an object
+named on the command line is seen before an archive scanned after it, so its
+definitions win and the shim's are dropped. Memory stays consistent, because the
+operators still call the shim's `malloc`. This tree's test suite does exactly
+that, only in the configuration that needs it, and only after probing the
+archive's symbol index to find out - `tests/cmake/EngineAllocator.cmake`.
+
+### `js-config.h` does not describe the build it shipped with
+
+**Silent, and the most expensive one here.** `js-config.h` is the header
+bundle's own record of what the library was compiled with, and the bundle used
+here omits `ENABLE_EXPLICIT_RESOURCE_MANAGEMENT` although the library was
+plainly built with it. That macro gates `JSEXN_SUPPRESSEDERR` in the **middle**
+of `JSExnType`, and entries in `JSProtoKey` and `JS::SymbolCode`, so every
+enumerator after it means one thing inside the library and another in your
+translation unit.
+
+It compiles. It links. It runs. And then asking for a `TypeError` hands back a
+`SyntaxError`, and asking for a `SyntaxError` hands back a `SuppressedError`.
+Three test cases found it, off by exactly one in exactly the predicted
+direction, which is what made the diagnosis certain rather than plausible.
+
+If an enum-valued answer from an engine is off by one position, suspect a build
+flag missing from its config header before you suspect your own code. Assume
+`js-config.h` is incomplete rather than authoritative, and define the missing
+macro yourself to match how the library was actually built.
+
+### The engine's headers lay out different objects without its own defines
+
+**Silent, and it is an ABI mismatch rather than a compile error.** SpiderMonkey
+needs `STATIC_JS_API`, `MOZ_STATIC_JS` and `XP_WIN`; V8 needs `V8_GN_HEADER`,
+which makes `v8config.h` pull in the bundled `v8-gn.h` carrying the exact define
+set the monolith was built with. Without them the public headers fall back to
+their defaults and lay objects out differently from the library, and that
+"mostly does not show up as a compile error".
+
+Both backends set these in their `CMakeLists.txt` with a comment saying why.
+Do not tidy them away.
+
+### The toolset is a floor, and it is a link error a long way from its cause
+
+**Loud, eventually.** Both prebuilt engines were compiled against the MSVC 14.44
+STL and call helpers that ship only in that toolset's own `libcpmt.lib`. An
+older toolset fails at link with undefined `__std_*` symbols, which names
+nothing useful. `CMakeLists.txt` refuses at configure time instead, with the
+reason.
+
+The other half of the same rule is the CRT, and it fails at *link* rather than
+at compile, which is a long way from the flag that caused it. The engines link
+the static CRT, so a `/MD` consumer gets LNK2038 - the MSVC STL stamps
+`RuntimeLibrary` into every object with the same `#pragma detect_mismatch`
+mechanism `unibind/config.h` uses for its own ABI tag, so at least the error names
+the CRT. A Debug build of this tree wants `/MTd` and therefore a *debug* engine
+tree; that is the same LNK2038 for the same reason.
+
+### The public headers need clang-cl
+
+**Loud.** MSVC's own `cl.exe` does not accept them today: at `/std:c++latest` it
+instantiates `std::optional<Local<T>>` while `Local<T>` is still being defined
+and reports C7637. clang-cl accepts them, and clang-cl is what the whole tree is
+built with. The CI job pins the ClangCL toolset for this reason rather than
+hiding it.
+
+### mozglue defines `DllMain`
+
+**Loud, and only if you are building a DLL.** `WindowsDllMain.obj` inside
+mozglue defines `DllMain`, so a host DLL that defines its own fails to link with
+a duplicate symbol. Irrelevant for a static library or an executable. If it
+comes up: either let mozglue's run, or exclude that object.
+
+### `UNIBIND_HANDLE_CHECKS` is an ABI flag, and it changes behaviour
+
+**Silent in both directions.** It puts a frame epoch in every `Local<T>`, which
+changes `sizeof(Local<T>)` from 8 to 12 on x86 - on x64 it changes nothing, the
+epoch fits in padding - *and* decides whether using a handle after its scope
+closed is diagnosed or silently reads a stale slot. A frame's storage is the
+caller's stack, so a dead frame's address is routinely reused by a live one -
+without the epoch, a stale handle reads a plausible value belonging to
+something else. **The flag being free on x64 does not make it the same ABI**:
+an object compiled with it and one compiled without it still disagree about
+whether the epoch is checked, and the tag below is what keeps them apart.
+
+It is on by default in *every* configuration, and that is the half people get
+backwards in the other direction: the comparison is an assertion, so a Release
+build carries the epoch and never tests it. Diagnosing a stale handle needs the
+flag **and** a build with assertions live. `docs/testing.md` says which CTest
+test that is and why it is expected to die.
+
+This is why it lives in a **generated** `unibind/config.h` rather than in a
+per-target `-D`: every translation unit of a build tree must agree, and so must
+every consumer of an installed library. The same goes for the inline storage
+sizes, which `TryCatch` and `ContextScope` `reinterpret_cast` their raw byte
+arrays to - a mismatch there is memory corruption, not a link error. The
+generated header carries a `#pragma detect_mismatch` so that disagreeing objects
+fail to link (LNK2038) rather than agreeing to differ.
+
+---
+
+## Handles, scopes, and what "empty" means
+
+### An empty handle is not `undefined`
+
+**By construction, not silent - and that is the point.** Growing a frame is
+fallible: SpiderMonkey's `RootedVector::append` reports OOM and nothing portable
+makes it infallible. A slot-allocating operation that cannot grow the frame
+therefore yields an **empty** handle and reports the condition the way the
+engine reports allocation failure. It must never yield a slot that reads as
+`undefined`, because then running out of memory would be indistinguishable from
+a property that was not there.
+
+Reading an empty handle is a programming error: diagnosed in checked builds, a
+hard failure otherwise. If you care about surviving OOM, `IsEmpty()` once after
+a batch of allocations.
+
+### An empty `std::optional` never means "the value was `undefined`"
+
+**Silent if you conflate them.** `undefined` is a value and arrives as one. An
+empty optional means *the operation did not produce a value*, and there are
+three different reasons: a script threw (exception pending, `TryCatch::HasCaught`),
+the engine failed (`Isolate::HasPendingException`, and there may be no
+JavaScript exception at all), or execution was terminated from another thread
+(`TryCatch::HasTerminated`, and there is no value, no message and no stack).
+Handling the wrong one means either calling back into an engine with an
+exception pending or looping forever on a terminated isolate.
+
+Note the two shapes side by side: handles report failure by being empty,
+everything else by an empty optional. So `if (maybe)` on an
+`std::optional<Local<T>>` is true even when the `Local` inside it is empty.
+
+### Scopes are stack-only and close in reverse order
+
+**Silent in a release build, which is the worst of both.** A `HandleScope` owns
+its frame in place, because on SpiderMonkey the frame *is* a `JS::Rooted` and
+`JS::Rooted` is stack-only and strictly LIFO. `~Rooted` asserts the ordering in
+a debug engine build and **corrupts the root list** in a release one.
+`operator new` is deleted on the scope type, so it cannot be heap-allocated, but
+nothing stops you from destroying two scopes out of order.
+
+The API's rule and the engine's precondition are the same rule, restated. A
+checked build of `unibind` asserts it before the engine gets a chance to.
+
+### To return a handle you must escape it, and escapability is decided when the scope opens
+
+**Silent at the point of the mistake.** A bare `return local;` out of a function
+that opened its own `HandleScope` returns a dangling handle, and there is no way
+to make that a compile error; it is caught at the point of *use*, in a checked
+build, and not at all in a release one.
+
+`Escape` is a member of `EscapableHandleScope` rather than a free function for a
+reason that is not stylistic: it copies the value into the parent frame while
+both frames are still live roots, so the value is never momentarily unrooted.
+And escapability has to be chosen when the scope is opened because V8 must
+reserve the parent's slot up front. On V8 the first escape from a scope is free
+and each later one costs a global root; on SpiderMonkey escaping is a `JS::Value`
+copy and is free and unbounded. That is a cost difference, not a rule you have
+to remember.
+
+### Comparing two `Global`s as handles asks the wrong question
+
+**Silent.** `Duplicate()`, or rooting the same function twice, makes two roots
+over one object. Comparing the roots answers "are these the same root", and the
+canonical way to get bitten is a registry of callbacks kept as `Global`s: the
+caller hands back the same function through a different handle, the removal
+compares roots, finds nothing, and removes nothing.
+
+Use `StrictEquals` or `SameValue` (both spellings exist because they differ on
+`NaN` and `-0`; there is deliberately no `operator==`). They need no open
+`HandleScope`, on purpose - so a caller with no scope open gets an answer rather
+than a failure that would read as "not equal". An empty `Global` is equal to
+nothing at all, **including another empty one**, which reads like "two different
+objects" if you were using it as a null check; ask `IsEmpty()`.
+
+### A handle belongs to one isolate and one thread
+
+And nothing releases handles individually: both engines are traced, there is no
+per-value release call, and a frame gives back its slots wholesale when it
+closes. If a value must outlive every frame, move it into a `Global<T>`; nothing
+else does.
+
+---
+
+## Values and properties
+
+### `Constant("literal")` is `Constant(true)`
+
+**Silent, and no warning.** Pointer-to-bool is a standard conversion and beats
+the user-defined one to `std::string_view`. `ub::Constant` and
+`ReturnValue::Set` each carry an explicit `const char*` overload for exactly
+this reason. Any new sink you add that takes both a `bool` and a `string_view`
+needs the same guard, and will not warn you that it does not have one.
+
+### `ValueKind` collapses Date, RegExp, Proxy and typed arrays into `Object`
+
+**Silent if you `switch` on it.** `ValueKind` answers what you can *do* with a
+value, and `Object` is exactly the set of property operations offered for all of
+them. There is no exotic kind, deliberately: the list differs by engine and by
+version, and an engine with no interceptor of its own builds ours out of
+proxies, so a kind that singled proxies out would make a sandbox object report
+differently on two backends purely because of how it was built.
+
+Ask `Is<ArrayBuffer>()` or `To<TypedArray>()`, which answer without a kind of
+their own. `ValueKind::Other` is not the exotic-object answer - it means the
+backend could not classify the value at all, which today happens for no value on
+either engine.
+
+### `Integer` is a question about the value, not about the type
+
+`Is<Integer>()` asks whether this number is an exact int32 with `-0` excluded,
+not how the engine happens to be storing it. So it is true for `1.0` and false
+for `1.5`, and the same JavaScript expression can narrow or fail to narrow
+depending on what it evaluated to. That is deliberate: SpiderMonkey has one
+number type, and asking V8's storage question would have given two backends two
+answers.
+
+### `Object::Set` is not `DefineOwnProperty`
+
+**Silent.** `Set` performs an ordinary assignment, so a setter anywhere on the
+prototype chain runs and your property may never be installed.
+`DefineOwnProperty` installs a data property with explicit attributes and
+ignores setters. If you mean "put this property here", say the second one.
+
+### `PropertyAttribute::ReadOnly` is ignored on an accessor
+
+**Silent.** An accessor is an ECMAScript accessor property, so it has no
+`[[Writable]]`: a getter with no setter *is* the read-only form. Both backends
+drop the flag. Asking for it and getting a writable accessor is not a bug in the
+backend.
+
+Accessors are installed as real accessor properties rather than native data
+properties for a reason worth knowing: a `Class<T>::Accessor` lives on the
+*prototype*, and V8's `PropertyCallbackInfo` reports the holder, which under a
+native data property would be the prototype - carrying no native at all. A
+function call has a receiver; that is what buys the accessor one.
+
+### `GetPropertyAttributes` has to ask whether the property exists first
+
+V8 reports `None` for an absent property, and `None` is also what an ordinary
+writable/enumerable/configurable property reports. The extra lookup is what lets
+an absent property answer empty instead of lying. A backend that skips it is
+wrong in a way no caller can detect.
+
+### Recovering embedder data is exact-type, and a mismatch is null
+
+**Silent.** `External::As<D>()`, `info.Data<D>()`, `ExternalValue<D>` and
+`Isolate::GetEmbedderData<D>` all yield null unless `D` is exactly the type that
+was stored - cv-qualifiers aside. A base class, a derived class or a typedef of
+a different type gets you null, which is also what "nothing was stored" looks
+like. And the pointee is yours: it must outlive every callback that can see it.
+
+---
+
+## Callbacks, interceptors and accessors
+
+### An interceptor setter, query, deleter or enumerator discards what you write to the return value
+
+**Silent, and maximally so.** One `CallbackState` serves every shape of call, so
+every hook has the `SetReturn*` entry points whether or not the language reads
+its result. A hook whose answer is its **C++ return value** - a setter, a query,
+a deleter, an enumerator - discards anything written through
+`GetReturnValue()`. Writing there is legal and does nothing.
+
+The answer these hooks give is the returned `Intercepted`,
+`std::optional<PropertyAttribute>`, `std::optional<bool>` or
+`std::optional<Local<Array>>`. Script still sees the ordinary thing: an
+intercepted assignment evaluates to the assigned value.
+
+### `Intercepted` has three states and the third is the whole point
+
+**Silent if you collapse it.** `Intercepted::No` means "carry on with the
+ordinary lookup", which is *not* the same as "handled, and the answer is
+`undefined`". An engine with no interceptor of its own implements these hooks as
+proxy traps, which are the only construct that runs on every access *and* can
+hand the access back to the ordinary object. A resolve-style hook cannot: it
+fires only on a miss, what it defines sticks, and it has no setter.
+
+### An enumerator's empty answer means "no own keys", not "I decline"
+
+V8's enumerator has no decline path, so an engine that has one may read an empty
+answer as declining. Do not depend on the difference.
+
+### `This()` and `Holder()` may be the same object, and which you get is the engine's business
+
+**Silent.** `Holder()` is the object carrying the handler that ran; `This()` is
+the receiver of the access. Where an engine hands a property hook only one of
+the pair - V8 15.6 gives an interceptor the holder and nothing else - the two
+name the same object. Code that unwraps one expecting the other gets the other
+one, with no diagnostic, on one backend only.
+
+For an inherited accessor the holder is the prototype. `Class<T>`'s own
+trampolines unwrap `This()` and throw a `TypeError` if it is not a `T`, so a
+class method borrowed through `.call()` fails loudly, which is the safe half.
+
+### Use the context the callback was handed, not one you captured
+
+**Silent.** `info.GetContext()` is the realm the call is actually happening in.
+Making values in, or reading properties through, a context captured at
+declaration time puts them in the wrong realm.
+
+### Reading past the end of the argument list is `undefined`, not an error
+
+As in JavaScript. If "not passed" has to differ from "passed `undefined`", ask
+`Length()`.
+
+### Throwing does not stop your C++
+
+**Silent if ignored.** `Throw` marks an exception pending; it takes effect when
+control returns to the engine. The caller should return promptly and not call
+further into the engine - on SpiderMonkey, calling back in with an exception
+pending is a crash, not an error (stringifying a pending exception with
+`JS::ToString` before taking it off the context is the measured example).
+
+Related: `ReturnValue::Set(std::string_view)` can fail, and then nothing was
+set, and the callback returns `undefined`. It is `[[nodiscard]]` for that
+reason.
+
+### An engine-fault handler may not allocate, and the commonest fault is that allocation is failing
+
+**Silent until it is not, and then it is a crash inside your own reporting
+code.** `PlatformOptions::onEngineFault` is called at the moment the engine has
+decided it is in trouble, and the kind that arrives most often is
+`EngineFault::OutOfMemory`. A handler that builds a `std::string`, formats into
+a stream, pushes onto a vector or opens a file is allocating in order to say
+that allocation failed. Reserve the buffer, open the log, and size the strings
+before you need them; the report itself is borrowed views and costs nothing to
+deliver.
+
+The rest of the contract is `RequestInterrupt`'s, minus handles: embedder state
+and `TerminateExecution` yes, a handle or a value or a call into the engine no.
+It may also be called **on any thread**, including one that never had an
+isolate, so `EngineFaultReport::isolate` can be null and whatever the handler
+touches has to be safe for that.
+
+### `EngineFault` is not `ErrorKind`, and they mean nearly opposite things
+
+`ErrorKind` names a JavaScript `Error` constructor - what native code *throws*,
+a value, catchable by script, part of the program working. `EngineFault` is the
+engine reporting that *it* is failing: not a value, not catchable, and not
+something a script did. They are spelled with no word in common on purpose.
+
+The one place they touch is the one to be careful about: a script's own `throw`
+must never arrive on the fault channel, and does not.
+
+---
+
+## Realms
+
+### Enter a realm before reading through an object that belongs to it
+
+**Loud, but it looks like your hook never ran.** A value made in one realm is a
+value in another - that is guaranteed, and it is what makes a sandbox useful at
+all. But a realm's **global object** is access-checked: reading a property of
+one while a different realm is current fails, on V8 with `TypeError: no access`,
+*before any embedder code runs*.
+
+So the obvious sandbox - hold the inner realm's global and read properties of it
+from an interceptor - throws on V8 and works on SpiderMonkey. The portable
+answer is one line per hook: open a `ContextScope` on the realm that owns the
+object first. It costs nothing on the engine that did not need it.
+
+### Identity across a realm boundary is not guaranteed
+
+**Silent.** Where an engine wraps a value into a compartment, the wrapper is a
+distinct object, so "is this the same object" asked across a realm boundary can
+answer differently on two backends. Compare within one realm, or compare
+something the values carry. A portable program does not ask.
+
+There is deliberately no way to say "these two realms trust each other": V8
+spells that as a shared security token, SpiderMonkey has no token at all, and
+the two do not describe the same thing closely enough to promise one.
+
+### `instanceof` does not cross a realm, and for a sandbox that is the normal case
+
+An error thrown inside a sandbox was built by the inner realm, so its
+constructor is the inner realm's `SyntaxError` and `e instanceof SyntaxError` in
+the outer realm is false. Ask `e.constructor.name`.
+
+### A compiled script sees the globals of the realm it runs in
+
+Not the realm it was compiled in. That is what makes "compile once, run in every
+sandbox" work, and the alternative would make `Run`'s context parameter a lie -
+but if you assumed a script stayed bound to where it was compiled, it does not.
+
+---
+
+## Exceptions
+
+### Closing a `TryCatch` consumes what it caught
+
+**Silent if you expected the other rule.** A handler is a `catch` block, not an
+observer. Call `ReThrow` to send the exception on to the enclosing handler.
+
+The opposite rule - propagate unless explicitly consumed - was rejected because
+its failure is worse: a forgotten call leaks a pending exception into code that
+never went near the throw, and it surfaces somewhere else entirely. A swallow at
+least happens where the handler is.
+
+`Reset()` consumes now, so the rest of the scope can call into the engine again;
+after it there is nothing left for `ReThrow` to send on, so `Reset` then
+`ReThrow` is a silent no-op.
+
+### A termination is the one thing a handler does not consume
+
+`HasCaught()` is true, `HasTerminated()` is true, and closing the handler lets
+the unwind continue whether or not `ReThrow` was called. There is no exception
+value, no message and no stack; `Reset` and `ReThrow` mean nothing. Only
+`CancelTerminateExecution`, on the isolate's own thread, clears it.
+
+### A stack comes off the Error object, never off the engine's Message
+
+**Silent, and it took a round trip to find.** V8 will happily capture a trace
+for `throw 1` if you ask it that way - and a stack invented for a value that
+never carried one is exactly the plausible wrong answer this API exists to
+prevent. A thrown non-Error answers empty. That is the right answer, not a
+missing feature.
+
+### The stack *text* is for a human; a short stack is not evidence
+
+`TryCatch::StackTrace` returns the engine's own format, which differs between
+engines and is not parseable across them - it will parse on one backend and
+mis-parse on the other. To read a stack, ask `StackFrames`.
+
+And engines cap captured frames at their own configured depth (V8 at
+`Error.stackTraceLimit`), so a short trace is not evidence that there were no
+more frames. In a `StackFrame`, an empty function name means top-level or
+anonymous, an empty script name means compiled with no origin, and a line or
+column of 0 means the engine did not say - lines and columns are 1-based.
+
+### Error wording is the engine's
+
+Both engines put your text in the message and wrap it in their own decoration.
+Assert that your text survived, never the whole string; and where the *kind*
+matters, ask in script (`e instanceof TypeError`, `err.constructor.name`) rather
+than parsing a message.
+
+---
+
+## Stopping a script, interrupts, and the job queue
+
+### A blocking native cannot be interrupted, and a running script cannot be made to yield
+
+**Silent: the watchdog appears to do nothing.** Every checkpoint either engine
+has is inside JavaScript. A native that spins, blocks on a socket or waits on a
+lock is not one: it runs to completion, and the unwind happens at the next
+JavaScript checkpoint after it returns. Neither `TerminateExecution` nor
+`RequestInterrupt` reaches your own C++.
+
+This is the bound worth knowing *before* you build a timeout rather than after:
+**a running script cannot be made to give the thread back, only terminated**,
+and there is no yield, suspend or resume anywhere in this API. Keep scripts
+short and pump between them, or terminate and restart. A native that wants to
+cooperate polls `IsExecutionTerminating()` itself.
+
+### A stopped isolate stays stopped, and does nothing quietly
+
+**Silent.** Everything that would run script keeps failing until
+`CancelTerminateExecution`, so an operation whose result is checked but whose
+failure is ignored will silently do nothing, over and over.
+
+That rule is the library's rather than either engine's. SpiderMonkey's context
+is usable the instant the unwind finishes, with nothing to reset; V8 keeps its
+termination pending. Taking the permissive answer would let a stop requested
+from another thread race the very next `Script::Run` and sometimes lose,
+silently, on one backend only. So `IsExecutionTerminating()` here answers a flag
+the library owns - which also means that reaching around this API to the engine
+while a stop is pending gets you an engine that will happily run script.
+
+One more edge: cancel only after every native frame the termination unwound has
+returned. Cancelling from inside one resumes a script that was told to stop.
+
+### An interrupt callback may not run script, even where the engine allows it
+
+**Silent, and the nastiest entry on this page.** A staged probe inside a live
+SpiderMonkey interrupt, fired from another thread into a `while (true)` loop,
+got all the way through: made an object, set a property, called a JavaScript
+function that really ran, compiled and ran a fresh script, captured a stack -
+after which the loop terminated normally and the isolate was fine. V8 refuses
+the same thing outright.
+
+The stricter rule stands, and not for symmetry. An interrupt fires *between two
+bytecodes of whatever was running*, so script run there runs at an arbitrary
+point inside unrelated code, and anything it leaves pending - an exception above
+all - is left for the interrupted frame to trip over. That probe survived only
+because it cleared its own exceptions at every stage; a callback that threw and
+returned normally would hand the interrupted code an exception it never threw.
+
+Allowed: make and read handles, inspect values, read and write embedder state,
+set a flag, queue a job. Not allowed: call a JavaScript function, run a script,
+throw.
+
+### An interrupt never fires while the thread is idle
+
+**Silent: it just never runs.** There is no checkpoint between scripts, so an
+interrupt requested while nothing is running waits for the next script.
+
+### An interrupt cannot make posted work run sooner
+
+**Silent, and it had to be traced rather than assumed.** If the script thread is
+inside a long-running script, the interrupt fires, the callback cannot run the
+work and cannot make the script yield, so the script resumes, runs to
+completion, and the thread pumps afterwards - which is what would have happened
+with no interrupt at all. If the thread is idle, no script is running, no
+checkpoint is reached, and the interrupt never fires. Neither state moves
+forward.
+
+### If you never call `PumpJobs`, promise continuations never run
+
+**Silent in the worst way.** Script containing `async`/`await` compiles and
+runs, and its continuations never execute: no error, no exception, the work
+simply does not happen. `Isolate::PumpJobs` is the one drain, for engine jobs
+and for posted work alike.
+
+The engines' own automatic draining is deliberately turned **off**: V8's default
+policy drains when a call returns and SpiderMonkey's never does, so left alone
+the same script would run its continuations after every `Script::Run` on one
+backend and never on the other. When a continuation runs is something a script
+can observe, so it is made uniform rather than left as a hint.
+
+Call it with no native frame on the stack. It catches and **discards** anything
+a job throws - a pump is not a call and has nowhere to put an exception - and it
+does nothing at all while a termination is pending, though the queues survive
+that.
+
+### Posting does not wake anything, and what is queued at teardown is dropped
+
+**Silent.** `PostJob` queues work from any thread; the work runs when the script
+thread next pumps, and nothing accelerates that short of terminating what is
+running. Jobs are ordered and never coalesced, so posting the same callback
+twice runs it twice.
+
+Whatever is still queued when the isolate is destroyed is **dropped, not run** -
+said out loud because "it will run eventually" is what a caller would otherwise
+assume. Unfired interrupts go the same way.
+
+A posted callback is not inside a call: no realm is current and no handle scope
+is open. Open your own `HandleScope` and `ContextScope`, let nothing escape, and
+wrap engine calls in a `TryCatch`.
+
+### A stack quota larger than the thread's real stack is not a limit
+
+**Fatal, and it is the failure the knob exists to prevent.** `stackLimitBytes`
+turns runaway recursion into an exception a script can catch - but only if the
+figure is below the stack the thread actually has. Set it above and the engine
+recurses happily past it until the *thread* runs out, which no engine can turn
+into an exception. The suite measures at 128 KiB and 512 KiB on a 1 MiB thread.
+
+*Which* error you get is the engine's business - `RangeError` on one,
+`InternalError` on the other - so a portable script catches it rather than
+asking what it is.
+
+### One isolate per thread, and the second one comes back empty
+
+**Loud if you check, a crash if you do not.** SpiderMonkey keeps the running
+`JSContext` in a single thread-local slot: *"there must be exactly one JSContext
+for each thread running JS/Wasm"*. A debug engine build asserts on the second
+call; the release build walks into undefined behaviour and dies.
+
+So `Isolate::New` **returns empty** rather than throwing, which is what it
+already did for a heap that could not be made. V8 would allow a second one and
+refuses anyway, because a program that works on one backend and not the other is
+the failure this library exists to prevent. Two heaps at once is two threads.
+
+### `workerThreads` is a hint at every value, including zero
+
+**Silent on one backend, by choice.** SpiderMonkey builds its helper pool in
+`JS_Init` for the whole process, ignores `JSGC_MAX_HELPER_THREADS = 0` outright,
+and the one hook that replaces the pool accepts your callback and then segfaults
+on the first collection - it fails late and it fails looking like it worked.
+
+Of "ignore silently", "crash later" and "refuse", only the first survives, so
+the option is a hint - and `Platform::WorkerThreads()` reports the count actually
+in effect so that the hint is observable. **An empty answer is not zero**: it
+means the engine would not say, so assume it has threads.
+
+`engineFlags` is on `Platform` and not on an isolate for a related reason: a
+flag string set per isolate would silently apply to every isolate made before
+it.
+
+---
+
+## Ownership and finalizers
+
+### A native may outlive its isolate, and that is not a leak
+
+There are two invariants, not one, and conflating them forbids the case shared
+ownership exists for:
+
+1. **Every box** - the per-wrapper cell holding the share - is destroyed exactly
+   once, and all of them by the time the isolate is gone. V8 does not promise to
+   run a weak callback before an isolate goes away, so the backend keeps a
+   record of every live instance and destroys the survivors itself.
+2. **Every native** is destroyed exactly once, when its last share goes, which
+   may be **after** the isolate, because the last share may be the embedder's.
+
+The sentence to hold a backend to is "the engine gives back every share it took,
+exactly once, by the time its isolate is gone".
+
+### A box must be given back on the isolate's own thread
+
+**Silent, and it does not reproduce.** Dropping a box drops a `std::shared_ptr`
+whose other holders are the embedder's, so running it on a background collector
+or helper thread races them - and a race in a finalizer is exactly the failure
+that a test counting destructions will never see. Where an engine offers the
+choice, SpiderMonkey's `JSCLASS_FOREGROUND_FINALIZE`, the foreground one is
+**required**, and the code says so in a comment because nothing else about it
+would.
+
+This looks like tidiness right up until somebody removes it.
+
+### A finalizer cannot call back into the engine
+
+By design: `JSFinalizeOp` is handed a `JS::GCContext*`, not a `JSContext*`. A
+native whose destructor touches JavaScript was always forbidden; shared
+ownership does not widen that, it only makes it likelier that somebody tries,
+because the destructor may now run at a moment nobody chose.
+
+### `Unwrap` hands back a borrowed pointer
+
+**Silent.** The `T*` from `Unwrap` is valid only as long as the wrapper you
+unwrapped. To keep it longer, take a share with `UnwrapShared` - one atomic
+increment. And unwrapping is exact-type: a related class or a derived native
+unwraps to null, which is also what "not an instance" looks like.
+
+---
+
+## Compiled code and serialized values
+
+### A code-cache blob says which engine built it, not which source it came from
+
+**Silent, and it cost two bugs in one afternoon.** Both engines stamp a blob
+with an engine-build identity and refuse one from another build, and that check
+is easy to mistake for the whole of it. Neither checks that the blob came from
+the source you are offering it for: a SpiderMonkey stencil encoded from `"a"`
+decodes cleanly when offered for `"b"`, reports success, and **runs `a`**. You
+asked to run one script and got another, with nothing in the result to suggest
+anything happened.
+
+It is one safety property at three scales: *these bytes came from this engine*
+(the engines check it), *these bytes came from this source* (neither does), and
+*these bytes are a blob at all* (neither reliably does). `unibind/script.h` frames
+every blob it emits - magic and format, a hash of the source with its origin and
+the backend name, the payload's length and hash - and checks it before the
+engine sees anything.
+
+**A backend author porting this to a third engine must assume the keying is
+theirs** until a test proves otherwise, and the test to write is the one that
+encodes from one source, offers the blob for another, and then checks *what
+actually ran* rather than what the API reported.
+
+### `UsedCodeCache()` answers about your blob, and an engine will lie by accident
+
+**Silent.** An engine may answer a repeat compile out of its own in-isolate
+compilation cache without parsing and without looking at your blob at all - it
+is then in no position to say whether the blob was good, which is how
+`UsedCodeCache()` came to report true for a payload that had been bit-flipped or
+cut in half. V8 only checksums a blob on consume when
+`--verify-snapshot-checksum` is on, which it is not in a release build. The
+payload length and hash settle it without asking the engine anything.
+
+The other direction is true too: `UsedCodeCache()` can be false for a compile
+that was instant anyway, because that is a different question.
+
+### `JS::EncodeStencil` dereferences a null function pointer
+
+**A crash, not a failure code**, if `JS::SetProcessBuildIdOp` was never called.
+It does not return `Failure_BadBuildId` and it does not throw. That is
+process-wide state, so the backend installs a build-id op during `Platform`
+construction, before an embedder can reach a cache API at all.
+
+### An absent operation is a link error at your call site, on purpose
+
+**Loud, and it is the design.** Caching is three separate entry points rather
+than a parameter on `Compile` precisely so that a backend whose engine has no
+code cache can define none of them: calling one is then a link error where you
+called it. A parameter a backend quietly ignored would have been the silent
+answer, and there is no way to ask a linker about half a function. Backends are
+told, in the header: do not define a stub.
+
+### A serialized value is opaque bytes belonging to one engine build
+
+`Serialize`/`Deserialize` move a value between isolates of one engine. A blob is
+not an interchange format and not a storage format; keeping one past the process
+is outside what it promises, and an engine upgrade is where that goes wrong.
+`Deserialize` refuses a blob it did not write rather than misreading it.
+
+A value that will not clone fails the **whole** call rather than becoming
+`undefined` somewhere inside the result. Neither engine can substitute below the
+top level without reimplementing the algorithm, and a rule that held for a
+top-level function but not for one two properties down would be worse than no
+rule. Serialize per value if you need per-value decisions.
+
+---
+
+## Strings and binary data
+
+### `Utf8Length()` excludes the terminator and `WriteUtf8` does not write one
+
+**Silent.** Size a buffer by `Utf8Length()`, treat it as a C string, and you read
+past the end. `WriteUtf8` truncates at a code point boundary if it does not fit
+and returns how many bytes it wrote - a short buffer gives you a valid,
+truncated string rather than an error, so compare the return against
+`Utf8Length()`.
+
+The same trap exists the other way round in the engine's own API:
+`JS_EncodeStringToUTF8` hands back a NUL-terminated buffer, which silently
+truncates any JavaScript string containing a NUL. Everything that reads a string
+out of the engine here takes the deflated length first and copies exactly that
+many bytes.
+
+### Strings are copied, and `String::New` can come back empty for two reasons
+
+There is no borrowing a string's bytes on a moving collector, so `Utf8Value()`
+allocates and `String::New` copies out of the view you hand it. An empty result
+means the bytes were not valid UTF-8 **or** the engine could not allocate, and
+the two are indistinguishable. The same applies to the `std::string_view`
+overloads of `Get`/`Set`: a key that could not be built and a property access
+that failed both arrive as an empty optional.
+
+### Binary data is copied in both directions, and there is no borrowing
+
+A buffer backed by embedder memory was rejected on three counts, any one
+sufficient: script can **detach** a buffer, so ownership moves on a schedule
+script controls; neither collector offers a stable interior pointer, so a
+borrowed span would be a handle with none of the rules handles have here; and
+the engines' free-callback contracts do not match.
+
+`ByteLength` is zero for a buffer script has detached, which is indistinguishable
+from an empty one. `CopyBytes` and `CopyElements` truncate silently and return
+how much they wrote; ask `ByteLength` first if you mean to take all of it.
+
+### `CopyElements<T>` with the wrong `T` copies nothing and says 0
+
+**Silent, and 0 is also a legitimate answer for an empty view.** This does not
+convert: a `Float64Array` read as `std::int32_t` is a mistake, not a rounding,
+and silently obliging would be exactly the "looks like it succeeded" failure the
+API exists to prevent.
+
+---
+
+## Working on the library itself
+
+### Add a row to `tests/cmake/Capabilities.cmake` when you add an operation
+
+Otherwise the suite never gates on it, and a backend that has not implemented it
+yet **fails to link** instead of reporting a skip. The skip is the useful
+answer.
+
+### The frame-exhaustion lever only reaches a frame that grows through the C++ heap
+
+**Silently proves nothing otherwise.** The suite provokes OOM by replacing
+global `operator new`. A backend whose frame spills through the *engine's*
+allocator is invisible to that - `JS::RootedVector` defaults to
+`js::TempAllocPolicy`, which allocates through `js_malloc`, so the SpiderMonkey
+frame had to be given an allocation policy of its own before the test could see
+it (and then see the `operator new` trap at the top of this page).
+
+The case checks whether an injected failure actually fired and reports a skip if
+none did, rather than claiming coverage it does not have.
+
+### A case that encodes a promise is left red, never weakened
+
+Weakening it turns a bug into coverage nobody has, which is the one thing the
+suite exists to prevent. The two cases that were ever in that state found the
+two code-cache bugs above, and both were found the same way: **assert on what
+ran, not on what the API reported.**
+
+### The storage sizes are a compile error, never a heap fallback
+
+`UNIBIND_FRAME_STORAGE_SIZE` and friends are checked by `static_assert` in each
+backend. If a backend type grows past one, raise the number - a frame on the
+heap is not a `JS::Rooted` on SpiderMonkey, and falling back to one would quietly
+give up the property the whole handle model is built on.
+
+### Two small things that will bite exactly once
+
+- **V8 deletes `HandleScope::operator new`**, which also hides the *global
+  placement* new, so every in-place construction of one spells `::new`.
+- **`JS_DisableInterruptCallback` / `JS_ResetInterruptCallback`** are a
+  save/restore pair with a confusing spelling: `Disable` returns the *previous*
+  state and `Reset` takes a parameter named `enable`. Feeding the first straight
+  into the second is the round trip that works. Do not try to reason about the
+  parameter's name.

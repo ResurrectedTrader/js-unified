@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  unibind, for an MSBuild C++ project.
+
+  One line in a .vcxproj, in the property sheet slot - after Microsoft.Cpp.props,
+  which is where the <ImportGroup Label="PropertySheets"> already is:
+
+      <Import Project="C:\path\to\unibind-prefix\msbuild\unibind.props" />
+
+  That sets the include directory (the public headers and the generated
+  config.h, which is one set for every backend), the link inputs (this library,
+  the engine, and the engine's system libraries), and checks the things that
+  would otherwise fail late and obscurely.
+
+  The backend is a *link* choice and nothing more. Nothing a consumer compiles
+  differs between engines - no public header names one - so switching
+  UnibindBackend changes which libraries are linked and leaves every object
+  file's command line alone.
+
+  Properties a consumer may set before the import:
+
+    UnibindBackend          v8 | spidermonkey. Defaults to whichever this
+                            prefix holds, and to v8 when it holds both.
+    UnibindRoot             the installed prefix. Defaults to this file's
+                            parent, so it is normally not set at all.
+    UnibindV8Dir            prebuilt V8: a directory holding include/ and
+                            v8_monolith.lib.
+    UnibindSpiderMonkeyDir  prebuilt SpiderMonkey: a directory holding include/
+                            and spidermonkey.lib.
+
+  The engine defaults are the paths this prefix was built against - one small
+  unibind-engine-<backend>.props per backend installed, imported by wildcard
+  below. Nothing here needs the engine's *headers*: a consumer of unibind
+  includes no engine header, which is the whole point of the library, so the
+  engine's own required defines (V8_GN_HEADER, STATIC_JS_API, XP_WIN) do not
+  apply to consumer code. They applied when the backend was compiled, and they
+  are recorded in dependencies/README.md.
+
+  Requirements this file checks, because each one otherwise fails as a link
+  error nobody can read: the architecture this prefix was built for, the static
+  CRT (/MT), and a backend library actually present in the prefix. The MSVC
+  toolset floor of 14.44 is SpiderMonkey's and cannot be checked from here - an
+  older one fails at link with undefined __std_* symbols.
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="unibind defaults">
+    <UnibindRoot Condition="'$(UnibindRoot)' == ''">$(MSBuildThisFileDirectory)..\</UnibindRoot>
+    <!--
+      Which backend, when the project did not say: whichever this prefix holds,
+      and V8 when it holds both. A fixed order rather than "the one installed
+      most recently", which is what the value baked into this file would mean
+      and is not something a consumer can see.
+    -->
+    <UnibindBackend Condition="'$(UnibindBackend)' == '' and Exists('$(UnibindRoot)lib\unibind_backend_v8.lib')">v8</UnibindBackend>
+    <UnibindBackend Condition="'$(UnibindBackend)' == '' and Exists('$(UnibindRoot)lib\unibind_backend_spidermonkey.lib')">spidermonkey</UnibindBackend>
+    <UnibindBackend Condition="'$(UnibindBackend)' == ''">@UNIBIND_BACKEND@</UnibindBackend>
+    <!--
+      The architecture this prefix was installed for, and the MSBuild platform
+      name that goes with it. Not a knob: a prefix holds one library per
+      backend and nothing in the layout distinguishes an x86 one from an x64
+      one, so the value is baked in when it is installed and compared below.
+      The generated config.h names the architecture in its detect_mismatch
+      tag, which is what catches a consumer that reached around this file.
+    -->
+    <UnibindArch>@UNIBIND_ARCH@</UnibindArch>
+    <UnibindPlatform Condition="'$(UnibindArch)' == 'x86'">Win32</UnibindPlatform>
+    <UnibindPlatform Condition="'$(UnibindArch)' != 'x86'">$(UnibindArch)</UnibindPlatform>
+  </PropertyGroup>
+
+  <!--
+    Where each engine was when this prefix was built, one fragment per backend
+    installed. A wildcard rather than two names, for the same reason
+    find_package globs unibind-backend-*.cmake: a prefix may hold more than one
+    backend, each installed by a build tree that knew only its own engine's
+    path, so one file written by whichever tree went last would blank the
+    other. Each fragment defers to a property the consumer already set.
+  -->
+  <ImportGroup Label="unibind engine defaults">
+    <Import Project="$(MSBuildThisFileDirectory)unibind-engine-*.props" />
+  </ImportGroup>
+
+  <!--
+    The backend decides two things, and both are link inputs: which library is
+    linked and which engine it needs. They are set together here so that they
+    cannot be chosen apart.
+  -->
+  <PropertyGroup Label="unibind backend" Condition="'$(UnibindBackend)' == 'v8'">
+    <UnibindEngineDir>$([MSBuild]::EnsureTrailingSlash($(UnibindV8Dir)))</UnibindEngineDir>
+    <UnibindEngineLib>$([MSBuild]::NormalizePath($(UnibindEngineDir), 'v8_monolith.lib'))</UnibindEngineLib>
+    <UnibindEngineSystemLibs>winmm.lib;dbghelp.lib;advapi32.lib;shlwapi.lib;ws2_32.lib;user32.lib;kernel32.lib;ole32.lib;oleaut32.lib;psapi.lib;version.lib;ntdll.lib;userenv.lib;bcrypt.lib</UnibindEngineSystemLibs>
+  </PropertyGroup>
+
+  <PropertyGroup Label="unibind backend" Condition="'$(UnibindBackend)' == 'spidermonkey'">
+    <UnibindEngineDir>$([MSBuild]::EnsureTrailingSlash($(UnibindSpiderMonkeyDir)))</UnibindEngineDir>
+    <UnibindEngineLib>$([MSBuild]::NormalizePath($(UnibindEngineDir), 'spidermonkey.lib'))</UnibindEngineLib>
+    <UnibindEngineSystemLibs>mincore.lib;ws2_32.lib;advapi32.lib;user32.lib;ole32.lib;oleaut32.lib;shell32.lib;userenv.lib;bcrypt.lib;ntdll.lib;dbghelp.lib;psapi.lib;winmm.lib;shlwapi.lib</UnibindEngineSystemLibs>
+  </PropertyGroup>
+
+  <PropertyGroup Label="unibind derived">
+    <!--
+      One include directory, holding the public headers and the generated
+      config.h beside them. config.h describes the architecture, the handle
+      layout and the storage budgets - all of which are the same for every
+      backend of an architecture - so there is nothing per-engine to choose
+      here, and a consumer's objects are the same objects whichever library
+      they are linked against.
+    -->
+    <UnibindIncludeDir>$([MSBuild]::NormalizeDirectory($(UnibindRoot), 'include'))</UnibindIncludeDir>
+    <UnibindBackendLib>$([MSBuild]::NormalizePath($(UnibindRoot), 'lib', 'unibind_backend_$(UnibindBackend).lib'))</UnibindBackendLib>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(UnibindIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(UnibindBackendLib);$(UnibindEngineLib);$(UnibindEngineSystemLibs);%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <Target Name="UnibindCheckEnvironment" BeforeTargets="ClCompile">
+    <Error Condition="'$(UnibindBackend)' != 'v8' and '$(UnibindBackend)' != 'spidermonkey'"
+           Text="unibind: UnibindBackend is '$(UnibindBackend)'; expected v8 or spidermonkey." />
+    <Error Condition="!Exists('$(UnibindBackendLib)')"
+           Text="unibind: no $(UnibindBackendLib). This prefix does not hold the '$(UnibindBackend)' backend - install that build tree into it, or set UnibindBackend to one it does hold." />
+    <Error Condition="!Exists('$(UnibindIncludeDir)unibind\config.h')"
+           Text="unibind: no $(UnibindIncludeDir)unibind\config.h. It is generated by the build and installed beside the public headers; a prefix without it is broken." />
+    <Error Condition="!Exists('$(UnibindEngineLib)')"
+           Text="unibind: no $(UnibindEngineLib). The engine is yours to supply: point UnibindV8Dir or UnibindSpiderMonkeyDir at a prebuilt $(UnibindArch) /MT engine tree." />
+    <Error Condition="'$(Platform)' != '$(UnibindPlatform)'"
+           Text="unibind: Platform is '$(Platform)' but this prefix was installed for $(UnibindArch); build this project as $(UnibindPlatform), or import the prefix that was built for '$(Platform)'." />
+    <!--
+      The one that costs an afternoon if it is not checked. An x86 project takes
+      the 32-bit host tools by default - VC\Tools\Llvm\bin rather than
+      VC\Tools\Llvm\x64\bin - and a 32-bit lld-link cannot get through an engine
+      archive this size (V8's monolith is 1.2 GB). It does not report that: the
+      archive is opened, no member is ever loaded from it, and every engine
+      symbol comes back undefined, exactly as though the library had not been on
+      the command line. Nothing about the message points at the linker.
+
+      It cannot be fixed from here - by the time this file is imported the
+      toolchain is chosen - so it is reported instead. An x64 project already
+      gets the 64-bit tools without asking, so the check is the x86 one.
+    -->
+    <Error Condition="'$(UnibindArch)' == 'x86' and ('$(PreferredToolArchitecture)' == '' or '$(PreferredToolArchitecture)' == 'x86')"
+           Text="unibind: this project uses the 32-bit host toolchain, which cannot link an engine of this size - it will report every engine symbol as undefined. Add &lt;PreferredToolArchitecture&gt;x64&lt;/PreferredToolArchitecture&gt; to the project's Globals property group, above the import of Microsoft.Cpp.Default.props." />
+    <!--
+      Batched over the ClCompile items, so it reads what the project actually
+      set rather than a property. A /MD consumer would also be caught at link -
+      the MSVC STL stamps RuntimeLibrary into every object with the same
+      detect_mismatch mechanism unibind's config.h uses - but LNK2038 arrives after
+      a full compile and names the CRT rather than the cause.
+    -->
+    <Error Condition="'%(ClCompile.RuntimeLibrary)' != '' and '%(ClCompile.RuntimeLibrary)' != 'MultiThreaded' and '%(ClCompile.RuntimeLibrary)' != 'MultiThreadedDebug'"
+           Text="unibind: RuntimeLibrary is '%(ClCompile.RuntimeLibrary)'. The prebuilt engines link the static CRT: use MultiThreaded (/MT), or MultiThreadedDebug (/MTd) against a debug engine tree." />
+  </Target>
+</Project>

@@ -1,0 +1,118 @@
+# Two checks that read the tree rather than run it: the formatter, and
+# clang-tidy.
+#
+# **The formatter is cheap and the tidy jobs are not.** `format` needs nothing
+# but a checkout and finishes in seconds; a tidy job has to compile, which means
+# an engine, which means the same quarter-gigabyte download the suite jobs make.
+# They are separate jobs so the formatting answer arrives immediately and does
+# not wait behind a download.
+#
+# **Why clang-tidy needs a second build tree.** The Visual Studio generator does
+# not write a `compile_commands.json`, so there is nothing for clang-tidy to
+# read: it has no idea what defines, include paths and standard a file is
+# compiled with, and an engine header without its defines does not even parse.
+# The `tidy-*` presets exist only to produce that file - Ninja, the same ClangCL
+# toolchain, the same flags - and nothing is linked from them.
+#
+# **x64 here, both architectures in the engine jobs.** Ninja has no `-A`, and
+# clang-cl targets the host, so these trees are x64. Nothing clang-tidy reports
+# is architecture-dependent - the one thing that differs between the two builds
+# is the value of a storage-size macro - and the engine workflows are what
+# answer the architecture question.
+#
+# **Only this repository's own code is read.** Both backends mark the engine
+# include directory `SYSTEM`, and `.clang-tidy` names the include roots it will
+# report on and excludes `dependencies/`. Without that a run would walk into
+# V8 and SpiderMonkey through every `#include` and report on a third-party tree
+# nobody is going to change.
+#
+# **Run from the repository root.** clang-tidy decides whether a diagnostic is
+# in one of "our" headers against the working directory, so a run started
+# somewhere else silently reports far less than this one does. The default
+# working directory is the checkout, which is what makes that true here.
+#
+# Both jobs are blocking, because the tree is clean today and the point of
+# getting it there was to keep it there. `v8.yml` has the non-blocking canary if
+# a future check wants to start that way.
+
+name: lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: clang-format
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version matters: clang-format 19 is what `.clang-format` was checked
+      # with, and its predecessors disagree about AccessModifierOffset here. The
+      # one in the pinned image's ClangCL toolset is the one to use, found the
+      # way the other workflows find that toolset.
+      - name: Check every tracked C++ file against .clang-format
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = & $vswhere -latest -products * -property installationPath
+          $llvm = "$install\VC\Tools\Llvm\x64\bin"
+          if (-not (Test-Path "$llvm\clang-format.exe")) {
+              throw "no clang-format in the ClangCL toolset on this image"
+          }
+          & "$llvm\clang-format.exe" --version
+          $files = git ls-files '*.h' '*.cpp'
+          "checking $($files.Count) files"
+          & "$llvm\clang-format.exe" --dry-run -Werror $files
+          if ($LASTEXITCODE -ne 0) {
+              throw "some files are not formatted; run clang-format -i on them"
+          }
+
+  tidy:
+    name: clang-tidy against ${{ matrix.backend }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [v8, spidermonkey]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the tools, and refuse an image without them
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = & $vswhere -latest -products * -property installationPath
+          $llvm = "$install\VC\Tools\Llvm\x64\bin"
+          foreach ($tool in 'clang-cl.exe', 'clang-tidy.exe', 'run-clang-tidy') {
+              if (-not (Test-Path "$llvm\$tool")) { throw "no $tool in the ClangCL toolset on this image" }
+          }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+              throw "no ninja on this image; the compile database is generated with it"
+          }
+          & "$llvm\clang-tidy.exe" --version
+          "UNIBIND_LLVM=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The preset reads VCPKG_ROOT; the runner calls it VCPKG_INSTALLATION_ROOT.
+      - name: Configure the compile database, which fetches the engine
+        run: |
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          cmake --preset tidy-${{ matrix.backend }}
+
+      # Not a build of anything that runs: the suite includes a header the build
+      # generates by asking the backend library which operations it defines, so
+      # that one header - and the backend it is read from - has to exist before
+      # any test file will parse.
+      - name: Generate the header the suite is compiled against
+        run: cmake --build build/tidy-${{ matrix.backend }} --target tests/generated/unibind_test_capabilities.h
+
+      - name: clang-tidy
+        run: >
+          python "${env:UNIBIND_LLVM}\run-clang-tidy"
+          -p build/tidy-${{ matrix.backend }}
+          -quiet
+          -warnings-as-errors='*'

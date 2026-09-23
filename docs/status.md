@@ -1,0 +1,994 @@
+# What is implemented
+
+The suite in `tests/` is written once, against the public API only, and runs
+against every built backend - `ctest -R parity` prints one row per case and a
+row that differs is the thing to look at.
+
+An operation that is declared but not defined is a **link error at the call
+site**, not a silent no-op or a runtime abort. That is now load-bearing rather
+than incidental: it is how this API says "this engine cannot do that" - see
+decision 19, where the compiled-code cache is three entry points precisely so a
+backend without one can define none of them.
+
+**Where the two backends are.** Both implement everything the headers declare
+that their engines can do, decisions 1-28, and the suite agrees case for case:
+264 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
+harness's own test of the skip path, which exists so that the machinery for
+reporting a missing area is exercised on every backend rather than only on the
+day one falls behind.
+
+Two rows are `SKIPPED | PASSED`, and they are the first ones here that are not a
+backend falling behind. `HEAP_LIMIT` is decision 28's near-heap-limit hook:
+SpiderMonkey has no such thing to implement, so it defines nothing, a call does
+not link, and the two cases report a skip. That is the shape decision 19
+designed for an absent operation, working as designed - it is a gap in the
+*engines*, and the report saying so is the point rather than a defect in it.
+
+- V8 15.6: `src/backends/v8/`.
+- SpiderMonkey 153.3.0esr: `src/backends/spidermonkey/`. Its own notes - what
+  had to bend, and what it measured - are in `docs/spidermonkey.md`, and they
+  are the better read for anyone writing a third backend.
+
+**What compiles the public headers: clang, including clang-cl, and not MSVC's
+`cl.exe`.** That is a compiler bug rather than an API problem and it is written
+up at the top of `unibind/unibind.h`, with the workaround and what it would cost. The
+build pins ClangCL.
+
+## Decisions a backend author has to know
+
+These are the places where the two engines wanted different things and the
+answer had to be picked rather than discovered. Each one is normative in a
+public header; this is the index, not the text.
+
+### 1. The callback return sink (`unibind/function.h`)
+
+V8 types a callback's return slot by the hook that owns it -
+`PropertyCallbackInfo<Value>` for a getter, `<Integer>` for a query,
+`<Boolean>` for a setter or deleter, `<Array>` for an enumerator - and the
+setters differ between them: a `ReturnValue<Integer>` will not take a `double`
+and says so at compile time. The six `SetReturn*` entry points are one set for
+every hook, so they cannot name one V8 type.
+
+The V8 backend erases that with a `ReturnSink`: six function pointers, one
+static table per hook shape, chosen where the `CallbackState` is built - the
+one place that statically knows the shape. SpiderMonkey needs no erasure at
+all; every native there writes into a `JS::Value`, so its `CallbackState`
+carries one `JS::Value*` and the six entry points are six stores.
+
+That difference is the point: **nothing public names the sink.**
+`CallbackState` is each backend's own type. What is shared is behaviour, and it
+is written at the top of `unibind/function.h`:
+
+- One `CallbackState` serves every shape of call. The public wrapper decides
+  what may be asked of it, so a property hook is never asked for an argument
+  list or for `IsConstructCall`.
+- A hook whose answer is its C++ return value - an interceptor setter, query,
+  deleter or enumerator - **discards** writes through `GetReturnValue()`.
+  Legal, does nothing, must not corrupt the hook's protocol. Script sees this:
+  an intercepted assignment still evaluates to the assigned value.
+- `Holder()` is the object carrying the handler, `This()` the receiver. Where
+  an engine hands a property hook only one of the pair - V8 15.6 gives an
+  interceptor the holder and nothing else - they are the same object.
+
+### 2. A frame that cannot grow yields an empty handle (`unibind/handle.h`, rule 9)
+
+Adding a slot is fallible: SpiderMonkey's `RootedVector::append` reports OOM,
+and V8's overflow vector throws. A slot-allocating operation that cannot grow
+the frame therefore hands back an **empty** `Slot` - an empty optional where the
+signature has one - and reports the condition the way the engine reports
+running out of memory.
+
+It must never hand back a slot that reads as `undefined`. That was the
+SpiderMonkey backend's original behaviour and it is the one failure this API
+exists to prevent: an allocation failure arriving as a plausible value.
+`std::optional<Slot>` on every maker was the alternative and is worse - it would
+put an unwrap on `Undefined()`, `GlobalObject()`, `Global::Get()` and
+`info.This()` at every call site forever. `Local` already had `IsEmpty()`; this
+rule is what it is for. The reasoning is in `docs/lifetimes.md` under "Running
+out of slots".
+
+### 3. `~TryCatch` consumes what it caught (`unibind/exception.h`)
+
+Unless `ReThrow` was called. A handler is a `catch` block, not an observer.
+Both backends already did this; the header used to say the opposite. The other
+rule - propagate unless explicitly consumed - is worse: a forgotten call leaks
+a pending exception into code that never went near the throw, and it surfaces
+somewhere else entirely.
+
+### 4. A value may be used with any realm of its isolate (`unibind/context.h`)
+
+A handle belongs to an isolate and a thread, not a realm, so an object made in
+one realm works in another - which is what makes a sandbox useful at all. V8
+needs nothing for this; SpiderMonkey must wrap into the target compartment
+(`JS_WrapValue`). Guaranteeing it costs one backend a call; the alternative
+would have cost the API its most useful realm feature.
+
+What is **not** guaranteed is identity as seen from a foreign realm: where an
+engine wraps, the wrapper is a distinct object. Compare within one realm.
+
+Bounded again by what the sandbox composition found: **enter a realm before
+reading through an object that belongs to it.** A value crosses freely, but a
+realm's *global object* is access-checked, and reading a property of one while a
+different realm is current fails - on V8 with a `TypeError: no access`, before
+any embedder code runs. So a property hook that answers by reading an inner
+realm's `globalThis` opens a `ContextScope` on that realm first. One line, both
+backends, and it is a rule rather than tidiness.
+
+There is deliberately no way to say "these two realms trust each other". V8
+spells that as a shared security token; SpiderMonkey has no token, only
+compartments and principals, and the two do not describe the same thing closely
+enough to promise one.
+
+### 5. Interceptors are three-state because of proxies, not resolve hooks
+
+`Intercepted::No` has to be distinguishable from "handled, and the answer is
+undefined". An engine with no interceptor of its own implements the hooks as
+proxy traps - the only construct that runs on every access *and* can hand the
+access back to the ordinary object. A resolve-style hook cannot: it fires only
+on a miss, what it defines sticks, and it has no setter.
+
+### 6. Accessors are ECMAScript accessor properties, not native data properties
+
+V8 15.6's `PropertyCallbackInfo` reports `Holder()` and not `This()`. For an
+interceptor that is a documented limit (see 1). For an accessor it would have
+been fatal: `Class<T>::Accessor` installs on the *prototype*, and the
+trampolines in `unibind/class.h` unwrap `info.This()`, which under a native data
+property would be the prototype, carrying no native. So `TemplateSetAccessor`
+installs a real accessor property backed by two function templates. A function
+call has a receiver, so the accessor has one.
+
+Consequence: `PropertyAttribute::ReadOnly` is meaningless on an accessor - a
+getter with no setter *is* the read-only form - and both backends drop it.
+
+### 7. Boxes and natives are destroyed exactly once, finalizer or not
+
+This was one invariant until decision 14, because under exclusive ownership
+there was one thing to destroy. A share separates the wrapper's cell from the
+thing it points at, so it is now two - and the old single sentence is not merely
+imprecise, it is *false* of the interesting case, since a native the embedder
+co-owns deliberately outlives the isolate.
+
+1. **Every box is destroyed exactly once, and all of them by the time the
+   isolate is gone.** A box is the per-wrapper cell holding the share. This is
+   the half a backend works for: V8 does not promise to run a weak callback
+   before an isolate goes away, so its isolate keeps a record of every live
+   instance and destroys the survivors in `~Isolate`; SpiderMonkey does run
+   finalizers at `JS_DestroyContext` and keeps the same list anyway. Without the
+   guarantee there is no destruction parity test to write, which is why it is a
+   rule and not an implementation detail.
+2. **Every native is destroyed exactly once, when its last share goes** - which
+   may be *after* the isolate, because the last share may be the embedder's.
+   Not a leak and not a violation of (1): the engine gave back everything it
+   took, and what remains is something the embedder still holds and still owns.
+
+So the sentence to hold a backend to is "the engine gives back every share it
+took, exactly once, by the time its isolate is gone".
+
+**And it gives them back on the isolate's own thread.** Never a background
+collector or helper thread: `destroy` drops a `shared_ptr` whose other holders
+are the embedder's, so running it off-thread races them. This looks like a
+tidiness choice right up until someone removes it, and the failure does not
+reproduce - so where an engine offers the choice, SpiderMonkey's
+`JSCLASS_FOREGROUND_FINALIZE`, the foreground one is **required** and the code
+says so in a comment. That backend verified all 200 of its finalizers run on the
+JS thread.
+
+Shared ownership cost that backend nothing else at all, which is the second
+piece of evidence that decision 14 put the boundary in the right place - the
+first being that no backend signature changed.
+
+### 8. `ValueKind` answers what you can do with a value (`unibind/types.h`)
+
+A Date, a RegExp, a Proxy and a typed array are all `Object`, because `Object`
+is exactly the set of operations the API offers for them. There is no exotic
+kind: the list differs by engine and by version, and it is a *negative* answer
+no caller can act on. `Proxy` settles it - an engine with no interceptor of its
+own builds ours out of proxies, so a kind that singled proxies out would make a
+sandbox object report differently on two backends purely because of how we
+built it. `ValueKind::Other` is for a value a backend cannot classify at all,
+which today is no value on either engine.
+
+### 9. A native function is callable; a constructor is asked for (`unibind/value.h`)
+
+`Function::New` produces something `new` refuses - a TypeError from script, a
+failure from `NewInstance` - and so does a template method and either half of an
+accessor. `FunctionTemplate` and `Class<T>` are how an embedder asks for a
+constructor, and they still are one.
+
+A function that can be `new`-ed without anyone asking hands script a fresh empty
+object instead of the callback's result, and the callback cannot tell unless it
+thought to check `IsConstructCall()`. The engines defaulted opposite ways; this
+is the stricter one, and the one an ordinary JavaScript method already follows.
+
+### 10. A script sees the globals of the realm it runs in (`unibind/script.h`)
+
+Not the realm it was compiled in. `unibind/script.h` already argued that compiled
+source is an artefact rather than a member of a realm - that is why `Script` is
+not a handle - and this is the rest of that sentence. Compile once, run in every
+sandbox is the job a compiled script is cached for; the alternative makes
+`Run`'s context parameter a lie. V8 pays one `BindToCurrentContext` per run,
+which is its own facility for exactly this.
+
+### 11. One isolate per thread at a time (`unibind/isolate.h`)
+
+A second isolate while the first is alive on that thread is refused -
+`Isolate::New` returns empty - and one after another is fine. The restriction is
+SpiderMonkey's: it keeps the running `JSContext` in a single thread-local slot,
+so a second one on a thread is not a heap it can make. V8 would allow it and
+refuses anyway, because a program that works on one backend and not the other is
+the failure this library exists to prevent. Empty was already the documented
+answer for a heap that could not be made, so no signature changed. A crash never
+was one of the available answers.
+
+Two heaps at once is two threads, which costs nothing this design had not
+already charged: handles, scopes and contexts are thread-bound anyway.
+
+**And an isolate does not move**, which is why `New` hands back a pointer rather
+than a value the way `Global<T>` does. It is asked about often enough to be
+worth an entry: the *address* of the `Isolate` is what everything remembers it
+by - the engine's own embedder slot, so a callback handed only an engine context
+can get home; the thread-local that enforces the rule above; and an `Isolate*`
+on every frame, context, script, template, class, root and handler. Storing the
+implementation's address instead would work, at a load per recovery, but
+immovability is worth having anyway: `HandleScope`, `ContextScope` and
+`TryCatch` are stack objects pointing at the isolate, and a movable one could be
+moved out from under an open scope with nothing to catch it.
+
+The only shape that removes the dereference is a plain `Isolate` with its own
+empty state, and that trades a null pointer - which cannot be used by accident -
+for a valid-looking object whose methods are undefined. `Local` makes exactly
+that trade and says so, because handles are made constantly; an isolate is made
+once, so the check is free and the trade is not worth making twice.
+
+**`Platform` has the opposite shape and the same question**, and the answer was
+already in the API: a constructor cannot report failure, but `IsInitialized()`
+can, and `Isolate::New` already refuses when it is false. What was missing was a
+backend honouring it - V8's `Initialize` and SpiderMonkey's `JS_Init` both report
+failure, and both were being ignored. A `Platform` that fails to bring the engine
+up is now an object that exists and did nothing, rather than one that did half.
+Worth separating from decision 20 while they are next to each other: the
+`workerThreads` hint was *not* caused by the missing channel. That was argued on
+observable-semantics grounds and would have come out the same with a way to
+refuse.
+
+### 12. A `FunctionTemplate` is a function as well as a constructor
+
+Its function may be *called* as well as constructed, and the callback tells the
+two apart with `IsConstructCall()`. A `Class<T>` constructor still requires
+`new`. Together with decision 9 that is a grid with no redundant row and no
+unreachable one:
+
+| made by | `f()` | `new f()` |
+|---|---|---|
+| `Function::New` | yes | TypeError |
+| `FunctionTemplate` | yes | yes |
+| `Class<T>` | TypeError | yes |
+
+A `FunctionTemplate` that refused a plain call would be a strictly worse
+`Class<T>`, and nothing would be left in the API to express a built-in like
+`Error` that means something both ways - which is also the only thing that makes
+`IsConstructCall()` worth having. A template given *no* callback is still
+constructable; what a plain call to one does is left unspecified, because there
+is nothing to run.
+
+### 13. Templates outlive nothing
+
+`TemplateRec`, `ClassRec` and the accessor and interceptor records are
+isolate-owned and isolate-lifetime by design (see the header comment in
+`unibind/template.h`). They are raw pointers into containers the isolate owns, and
+they must not become refcounted. Everything holding an engine root is released
+before the isolate is torn down.
+
+### 14. A wrapper owns a *share* of its native (`unibind/class.h`)
+
+`Class<T>` used to own its native exclusively, which made two ordinary things
+inexpressible: two wrappers naming one native (a collection hands out a child,
+an enumeration of the same collection hands out the same child), and a native
+co-owned with the embedder. Under exclusive ownership one wrapper frees a native
+the other still reads, and nothing at the call site says which.
+
+`NativeHolder<T>` now holds a `std::shared_ptr<T>`, so destroying a wrapper
+gives back a share and the native goes when the last holder does - which may be
+the embedder's. `Wrap` takes a share (a `unique_ptr` converts), `Unwrap` still
+hands back a bare `T*`, and `UnwrapShared` is how a native outlives the wrapper
+it came from.
+
+Rejected, and why, in the header: a **borrowed wrapper** (the bug this
+prevents), a **per-class dial** (a type parameter on the most-used type in the
+API, or a runtime flag that is this design with a branch in front), an
+**intrusive count** (cannot wrap a type the embedder did not write, and cannot
+be co-owned with an embedder holding a `shared_ptr`).
+
+Cost: one atomic pair per wrapper, nothing per `Unwrap`, and nothing per native
+if it is built with `make_shared`. **No backend signature changed** - `NativeBox`
+is untouched - which is the clearest evidence the boundary was in the right
+place.
+
+**This splits decision 7 in two**, and decision 7 now carries both halves: a
+*box* is destroyed exactly once and all of them before the isolate goes, while a
+*native* is destroyed exactly once when its last share goes, which may be after
+the isolate. The old single sentence - "every native is destroyed by the time
+its isolate is gone" - is not merely imprecise now, it forbids in plain terms
+the case this decision exists for.
+
+### 15. Stopping a script from another thread (`unibind/isolate.h`)
+
+`TerminateExecution` is one of the two operations callable from a thread other
+than the isolate's. Not catchable from script, not consumed by a `TryCatch`
+(`HasTerminated` is how a caller tells it from a throw), remembered if nothing
+is running yet, and **it does not interrupt a native callback** on either
+engine - a blocking native runs to completion and the unwind happens at the next
+JavaScript checkpoint.
+
+That last one is stated bluntly at both `TerminateExecution` and
+`RequestInterrupt`, because it is what an embedder needs *before* building a
+timeout rather than after: **these reach script, not your own C++, and a watchdog
+cannot save you from your own blocking callback.** Every checkpoint either engine
+has is inside script; a native that spins, blocks on a socket or waits on a lock
+is not one, and has to poll `IsExecutionTerminating()` itself.
+
+Two things a backend must do rather than delegate:
+
+- **The "stop requested" bit is the library's, on both engines.** Neither has
+  one. V8's `IsExecutionTerminating` is true only while the termination
+  exception is pending, which is essentially never while a native is running, so
+  the native that unibind tells to poll would poll false forever; SpiderMonkey has
+  nothing sticky at all. An atomic flag set on request and cleared on cancel is
+  what makes the promise keepable - and makes it *ours to keep*.
+- **A handler re-arms the stop, it does not re-throw it.** `Reset` takes the
+  engine's pending termination away with everything else, so both `Reset` and
+  the close re-request termination while the flag is set.
+
+And one thing settled rather than inherited, because the engines answer
+differently: **a stopped isolate stays stopped until it is cancelled**, whatever
+the engine would allow. SpiderMonkey's context is usable the instant the unwind
+finishes, with nothing to reset; V8 keeps its termination pending. Taking the
+permissive answer would let a stop requested from another thread race the very
+next `Script::Run` and sometimes lose, silently, on one backend only.
+`CancelTerminateExecution` is not book-keeping - it is how an isolate is made
+usable again.
+
+### 16. `Global<T>` compares values, not roots (`unibind/handle.h`)
+
+Two `Global`s can be two roots over one object - `Duplicate` makes exactly that,
+and so does rooting the same function twice - so comparing the nodes answers the
+wrong question and answers it silently. The shape that gets bitten is a registry
+of callbacks kept as `Global`s: the caller hands back the same function through a
+different handle and the removal finds nothing.
+
+`StrictEquals` and `SameValue`, against another `Global` or against a `Local`.
+Both spellings for the same reason `Local` has both - they differ on `NaN` and
+`-0` - and no `operator==`, because a language with two defensible equalities
+should not spell one of them with the punctuation that hides which.
+
+**No open `HandleScope` is required**, and that is the load-bearing part: the
+backend roots what it needs for the duration of the comparison, so there is no
+failure that a caller could mistake for "not equal". An empty `Global` is equal
+to nothing at all, including another empty one.
+
+### 17. A class can be callable as well as constructable (`unibind/class.h`)
+
+`Class<T>::ConstructOrCall` opts a class into the middle row of decision 12's
+grid; `Construct` stays construct-only and stays the default. The callback is the
+same one and tells the two apart with `IsConstructCall()`, and **a plain call
+yields an instance**, as `Error()` does.
+
+Letting a plain call return something that is *not* an instance was rejected:
+that is a function with a constructor bolted on, which is what `FunctionTemplate`
+already is, and it would need a second callback with a different signature - at
+which point the one thing the typed layer guarantees, that what comes out of a
+`Class<T>` carries a `T`, stops being true.
+
+| made by | `f()` | `new f()` |
+|---|---|---|
+| `Function::New` | yes | TypeError |
+| `FunctionTemplate` | yes | yes |
+| `Class<T>` + `Construct` | TypeError | yes |
+| `Class<T>` + `ConstructOrCall` | yes, and it makes an instance | yes |
+
+### 18. A stack is frames, and the text is for a human (`unibind/exception.h`)
+
+`StackFrame` carries the three things both engines will name - function name,
+script name, line - plus a column where the engine gives one.
+`TryCatch::StackFrames` reads one off a caught exception and
+`CaptureStackFrames` asks where a native was called from. `TryCatch::StackTrace`
+still returns the engine's own text, which is what you show a human and is not
+parseable across engines.
+
+The rule that cost a round trip to find: **a stack comes off the Error object,
+never off the engine's Message.** V8 will happily capture a trace for `throw 1`
+if asked, and a stack invented for a value that never carried one is the
+plausible wrong answer this whole API exists to prevent. A thrown non-Error
+answers empty.
+
+### 19. Compiled-code caching, and how "this engine cannot" is said (`unibind/script.h`)
+
+`CompileWithCache` / `UsedCodeCache` / `CreateCodeCache`. A blob is opaque and
+keyed on source *and* engine build *and* flags; a blob that does not match is
+rejected and the source compiled normally, so a stale blob costs a wasted compile
+rather than a crash - and the key is in the blob, so an embedder keeping blobs
+on disk does not have to invent one.
+
+**The engine half of that key is the engine's build identity, not its name**,
+and that is the correction this decision needed. Keying on
+`Platform::BackendName()` alone is a cache that stops working silently: upgrade
+the engine and every stored blob still keys identically, while the engine's own
+build-id check refuses all of them, so `UsedCodeCache()` answers false on every
+compile for ever and nothing says why. So `detail::BackendBuildId()` - V8's
+`ScriptCompiler::CachedDataVersionTag()` behind the backend's name,
+SpiderMonkey's process build id, which is the same string the engine is handed
+through `SetProcessBuildIdOp` - is what goes into the key. A stale blob is then
+rejected here, cheaply, by the check that can also say so, rather than
+underneath by the one that cannot.
+
+`Platform::BackendVersion()` is the other half of the same gap and deliberately
+*not* the key: it is what the engine calls its own build, in the engine's own
+words, for a log line or a bug report. **Diagnostic only and not parseable** -
+the two engines' schemes have nothing in common to promise, and a version can
+move without the build identity moving or the other way round. An embedder who
+needs to branch on an engine version is asking for something this API does not
+do.
+
+Caching is **three separate entry points rather than a parameter on `Compile`**,
+and that is the decision: a backend whose engine has no code cache defines none
+of them, so a caller that reaches for one gets a link error at its own call
+site - this library's existing answer for an absent operation. A parameter a
+backend quietly ignored would have been the silent answer, and there is no way
+to ask a linker about half a function.
+
+**A blob is keyed to its source here, once, and not in a backend.** This is the
+part that had to be discovered, and it cost two bugs in one afternoon to find:
+neither engine checks that a blob came from the source you are offering it for.
+Both stamp a blob with an engine-build identity and refuse one from another
+build, and that check is easy to mistake for the whole of it - a SpiderMonkey
+stencil encoded from `"a"` decodes cleanly when offered for `"b"`, reports
+success, and runs `a`.
+
+It is one safety property at three scales: *these bytes came from this engine*
+(the engines check it), *these bytes came from this source* (neither does), and
+*these bytes are a blob at all* (neither reliably does). So `unibind/script.h` frames
+every blob it emits - magic and format, a hash of the source with its origin and
+the backend name, and the payload's length and hash - and checks it before the
+engine sees anything. A blob that does not match is never offered.
+
+Scale 3 is the one that cannot be delegated, and it is what was wrong on V8: an
+engine may answer a repeat compile out of its own in-isolate compilation cache
+without looking at your blob, and is then in no position to say whether the blob
+was good - which is how `UsedCodeCache()` came to report true for a payload that
+had been bit-flipped or cut in half. The payload length and hash settle it
+without asking the engine anything.
+
+**This is not a security property.** A caller that lets someone else choose its
+cache file has already lost. It catches the case the promise is about: source
+that moved on without its cache. And the only test that sees the failure
+**checks what actually ran, not what the API reported** - encode from one
+source, offer the blob for another, and run the result.
+
+Two engine traps: V8 only checksums a blob on consume when
+`--verify-snapshot-checksum` is on, which it is not in a release build; and
+SpiderMonkey's `JS::EncodeStencil` dereferences a null function pointer, rather
+than failing, if `JS::SetProcessBuildIdOp` was never called - process-wide state
+that belongs in `Platform`'s constructor, so that an embedder cannot reach a
+cache API before it exists.
+
+### 20. What belongs to an isolate, what belongs to the process (`unibind/isolate.h`)
+
+`IsolateOptions` gains `stackLimitBytes`, which turns runaway recursion into an
+exception a script can catch instead of a stack overflow in the host process:
+per-isolate on both engines, measured the same way, and preventing a failure an
+embedder cannot catch by other means - though *which* error is the engine's
+business and the two do not agree (`RangeError` on one, `InternalError` on the
+other), so a portable script catches it rather than asking what it is.
+
+Refused, in writing and with reasons: interpreter-only /
+jitless, collector tuning, `eval` control (per *realm*, so it would go on
+`Context`), microtask policy (`PumpJobs` *is* the policy, and fixed on purpose),
+locale and random seed.
+
+`PlatformOptions` is new and holds what is the process's on both engines:
+`engineFlags`, which moved off `IsolateOptions` because a flag string set per
+isolate would silently apply to every isolate before it, and `workerThreads`.
+
+`workerThreads` is a **hint at every value, with an observable answer** -
+`Platform::WorkerThreads()`, which reports the count actually in effect. A bool
+would not do: honoured, clamped and ignored are the three outcomes an embedder
+has to tell apart, and an empty answer means the engine would not say, which is
+not the same as zero. SpiderMonkey cannot comply: it builds its
+pool in `JS_Init`, ignores `JSGC_MAX_HELPER_THREADS = 0`, and the one hook that
+replaces the pool accepts the callback and then crashes on the first collection.
+Of "ignore silently", "crash later" and "refuse", only the first survives - and a
+hint nobody can observe is the mistake `UsedCodeCache` avoids.
+
+Why this is a hint while a second isolate is refused outright (decision 11),
+which looks like the opposite policy: **that rule is about semantics a program
+observes**, and this is not. Worker threads change timing and where work happens,
+never what a script sees. An ignored hint is not a portability cliff; making V8
+refuse a mode it supports perfectly well would throw a real capability away to
+buy symmetry.
+
+### 21. Binary data is copied, in both directions (`unibind/value.h`)
+
+`ArrayBuffer` and `TypedArray`, so an embedder can hand over a
+`std::span<const T>` in one crossing instead of N `Array::Set` calls building the
+type script did not want. A buffer backed by embedder memory was rejected on
+three counts, any one sufficient: **detachment** (script can detach a buffer, so
+ownership moves on a schedule script controls, and the engines hand it back on
+different terms), **no stable interior pointer** (both collectors move, so a
+borrowed span would be a handle with none of the rules handles have here), and
+**free-callback contracts that do not match**.
+
+This does not disturb decision 8. A typed array still reports `ValueKind::Object`
+because `Object` is still exactly the set of *property* operations offered for
+it; the new operations are reached through `Is<ArrayBuffer>()` and
+`To<TypedArray>()`, which answer without a kind of their own - which is what the
+argument for collapsing exotic objects into `Object` predicted.
+
+### 22. Moving a value between isolates is structured clone (`unibind/value.h`)
+
+One isolate per thread (decision 11) means several scripts is several isolates,
+and a handle belongs to one of them, so the portable answer is to write the value
+down and build it again. `Serialize` / `Deserialize`.
+
+**A blob is opaque bytes belonging to the engine build that wrote them**, and
+that is the whole contract. Values move between isolates of *one* engine, which
+is the stated scope rather than a limitation to route around: this library picks
+an engine at build time, and a format two engines could both read is a different
+and much larger thing to design. Keeping one past the process is outside what it
+promises.
+
+Two sub-decisions. **Owned bytes, not a span into engine storage** - a span
+would have to survive operations that collect and be released on the isolate's
+own thread, which is the thread the blob is being carried away from. And **a
+value that will not clone fails the whole call** rather than becoming
+`undefined`: neither engine can substitute below the top level without
+reimplementing the algorithm, and a rule that held for a top-level function but
+not for one two properties down is worse than no rule. A caller serialising a
+list calls this once per value and decides for itself, which keeps the list's
+shape and puts the decision where it can be seen.
+
+### 23. One drain, for promises and for posted work (`unibind/isolate.h`)
+
+The hole this closes was silent in the worst way: script containing
+`async`/`await` compiled and ran and its continuations never executed - no error,
+no exception, the work simply did not happen. `Isolate::PumpJobs` is the drain,
+`unibind/value.h` says so where an embedder will read it, and the promise surface is
+deliberately small (make a pending promise, hand it to script, settle it later),
+with native `then`, unhandled-rejection reporting and native async functions
+written down as out of scope rather than left to be discovered.
+
+**The engine's own automatic draining is turned off.** V8's default policy drains
+when a call returns and SpiderMonkey's never does, so left alone the same script
+would run its continuations after every `Script::Run` on one backend and never on
+the other. When a continuation runs is something a script can observe, so unlike
+a worker-thread count it is made uniform rather than left as a hint - decision
+11's principle, applied to the case it was written for.
+
+`PostJob` queues work from any thread and `PumpJobs` runs it, engine jobs first,
+then posted work, then round again, so work that settles a promise sees its
+continuations in the same pump. Ordered, never coalesced; whatever is queued when
+the isolate is destroyed is **dropped, not run**, said out loud because "it will
+run eventually" is what a caller would otherwise assume.
+
+And posting does not wake anything: work runs when the script thread next pumps,
+and **nothing accelerates that** short of terminating what is running. The
+reasoning is under decision 24, because the thing an embedder reaches for first
+is the interrupt and it does not help.
+
+### 24. What an interrupt callback may do (`unibind/isolate.h`)
+
+`RequestInterrupt` is the other cross-thread operation, and the only way to reach
+the isolate's thread without waiting for the script to finish. The contract is a
+split, not a ban:
+
+| inside an interrupt callback | |
+|---|---|
+| make and read handles, inspect values | yes |
+| read and write embedder state, set a flag, queue a job | yes |
+| call a JavaScript function, run a script, throw | **no** |
+
+Handles are fine because the engine sets a scope up for exactly this - V8 opens a
+fresh `HandleScope` and an external VM state around the call, deliberately
+unsealing what the stack guard had sealed.
+
+Running script is not, and the engines were measured rather than assumed: a
+staged probe inside a live SpiderMonkey interrupt, fired from another thread into
+a `while (true)` loop, got all the way through - made an object, set a property,
+called a JavaScript function that really ran, compiled and ran a fresh script,
+captured a stack - after which the loop terminated normally and the isolate was
+fine. V8 refuses the same thing outright.
+
+**The stricter rule stands, and not for symmetry.** An interrupt fires between
+two bytecodes of whatever was running, so script run there runs at an arbitrary
+point inside unrelated code and anything it leaves pending - an exception above
+all - is left for the interrupted frame to trip over. That probe survived only
+because it cleared its own exceptions at every stage; a callback that threw and
+returned normally would hand the interrupted code an exception it never threw.
+The identical hazard is visible in V8's dispatch, where a termination is also
+processed earlier in the *same* interrupt pass - two engines, arrived at
+independently, which is about as good as this kind of evidence gets.
+
+*"You may, but you must clean up perfectly afterwards" is exactly the kind of
+rule that is better written as "you may not."* Obeying it leaves no capability
+unimplemented and makes nothing slower: the restriction falls on the embedder
+rather than on a backend, which is the right place for it.
+
+So **a posted job runs at the drain point, never inside the interrupt** - that
+sentence is the difference between this working and failing under load.
+
+What an interrupt *is* for is narrow, and both uses share the one property a
+foreign thread cannot arrange any other way, being **on the isolate's thread
+while script is running**: a profiler tick, and a watchdog that samples state
+on-thread before deciding whether to terminate. Both read; neither runs. Note
+that `TerminateExecution` is callable from any thread by itself, so the
+interrupt earns its place in the second only when the decision needs to read
+something first.
+
+**It is not a way to make posted work run sooner, and that had to be traced
+rather than assumed.** If the script thread is in a long-running script, the
+interrupt fires, the callback cannot run the work and cannot make the script
+yield - there is no yield, suspend or resume anywhere in this API - so the script
+resumes, runs to completion, and the thread pumps afterwards, which is what
+would have happened with no interrupt at all. If the thread is idle, no script is
+running, no checkpoint is reached, and the interrupt never fires. Neither state
+moves forward, so the pairing advice `PostJob` used to carry is gone.
+
+That bounds what "promptly" can mean for an event-driven embedding, and the
+bound is worth stating in one place: **a running script cannot be made to give
+the thread back, only terminated**, and a native that blocks is not interruptible
+either. Keep scripts short and pump between them, or terminate and restart.
+
+### 25. `ub::Maybe` is gone (`unibind/types.h`)
+
+It renamed `std::optional` and bought nothing. The part worth keeping was the
+prose hanging off it - what an empty optional means, and where to ask *why* - and
+that is now a section at the top of `unibind/types.h` covering all three causes: a
+script throw (pending on the isolate, `TryCatch::HasCaught`), an engine failure
+(`Isolate::HasPendingException`), and a termination (`TryCatch::HasTerminated`),
+plus why a handle is the one deliberate exception to the shape.
+
+Nothing under `include/unibind/`, `src/backends/v8/` or `tests/` names it. One
+transitional typedef remains in `unibind/types.h` for
+`src/backends/spidermonkey/`, which is the last user; it goes when that backend
+is respelled.
+
+### 26. The engine is chosen at the link, not at the compile (`include/unibind/config.h`)
+
+A consumer compiles their own code **once**, against the public headers, and
+picks `unibind_backend_v8` or `unibind_backend_spidermonkey` at the final link.
+Before this, the generated `config.h` carried the backend's identity and the
+`detect_mismatch` tag carried its name, so an object compiled for one engine
+was refused by the other's link and a program that shipped both engines had to
+compile everything twice.
+
+Nothing was actually *making* that true - it was being enforced. No public
+header branched on `UNIBIND_BACKEND_V8` or `UNIBIND_BACKEND_SPIDERMONKEY`, the
+storage budgets were already one set of numbers rather than per-backend ones,
+and the headers-only target was already compiling the whole surface with no
+backend at all. All three were checked rather than assumed before the identity
+came out.
+
+What is in the tag now is what a difference in really is corruption: the
+architecture, `UNIBIND_HANDLE_CHECKS`, and the three storage budgets with the
+frame's slot count. The `config/<backend>/` install directory is gone with it -
+`config.h` sits beside the public headers, because it is the same file for
+every backend of an architecture - and the CMake package grew the split that
+goes with it: `unibind::headers` (no engine), `unibind::backend_<name>` (one
+engine, as a link input), and `unibind::unibind` for the ordinary consumer who
+links one.
+
+Two rules come out of the tag and have to be written down, because nothing
+would catch breaking them otherwise:
+
+- **No public header may name the backend.** It cannot be a compile error -
+  `#if UNIBIND_BACKEND_V8` against a macro nobody defines is silently false in
+  every build, including the V8 one - so it is read rather than compiled, by
+  `tools/headers_only/backend_neutral.cmake`, which fails the build. That is
+  the same directory and the same discipline as the rule about engine headers,
+  which is compiled; the two halves sit together on purpose. Which backend is
+  linked has a runtime answer, `Platform::BackendName()`, and `unibind/script.h`
+  is the proof that runtime is early enough: it keys a cache blob on the engine
+  and the same object gets the right key under either one.
+- **Each storage budget is the maximum across every backend for that
+  architecture**, not a per-backend figure. A consumer compiles those sizes
+  into their own stack frames once, so a number that varied by engine would be
+  a different `HandleScope` per engine and the single compile would be a lie. A
+  future backend whose frame is larger raises the number **for everyone**; it
+  does not get one of its own. The cost is stack bytes in a scope the caller
+  already had.
+
+Architecture stays in the tag, and stays per-architecture, because a build is
+one architecture and always was: x86 and x64 are separate prefixes, so x86 is
+not charged for x64's growth.
+
+The proof is `examples/embed`, which compiles `main.cpp` into one object
+library against `unibind::headers` and links it once per backend the prefix
+holds. Two executables, one compile, and each prints its own engine.
+
+### 27. Nothing an isolate handed out may outlive it (`unibind/isolate.h`)
+
+A `Context`, a `Script` and a `Global<T>` are the three things an embedder can
+hold across handle frames, and all three are `new`ed on demand and `delete`d by
+the call that gives them back - which is the embedder's to make. Unlike
+templates, classes and boxes, they are in no container the isolate can empty at
+teardown, so one still alive when `~Isolate` runs is **two** faults at once:
+its memory is never given back, and the release that eventually comes resets an
+engine handle against a disposed isolate - on SpiderMonkey, unlinks a
+`PersistentRooted` from a runtime that no longer exists.
+
+The rule was true and unstated, which is the worst of the three available
+states. Of the two ways to fix that - document it, or make teardown tolerant -
+this is the first, because the second is not cheap: tolerance means every one
+of those records carries an owner-validity check on every use, for a case that
+is an embedder's ordering mistake rather than something the API asks for.
+Declaring the isolate before everything that uses it is enough, and is what
+every example here already does.
+
+So it is written where an embedder reads it (the `Isolate` class comment, with
+a line at `Context`, `Script` and `Global<T>`) and a checked build counts them
+and asserts in `~Isolate`, where the mistake is, rather than leaving it to be
+found at the crash. A release build does neither check nor tolerate it, which
+is the same bargain `UNIBIND_HANDLE_CHECKS` already makes for a handle used
+after its frame closed.
+
+**The assert goes at the end of the teardown, not the start**, and that is not
+a detail - it is the rule saying precisely what it means. A native the isolate
+destroys may itself own a realm and a root: the sandbox in
+`cases/sandbox_test.cpp` is a `Class<T>` whose native holds a `Context` and a
+`Global<Object>`, and `~Isolate` destroying that box is what gives them back.
+Those are the isolate's to release, at teardown, and counting them as a
+violation would make the composition the suite is proudest of illegal. What is
+outstanding *after* the isolate has emptied everything it owns is what nothing
+but the embedder holds, and that is the thing the rule is about.
+
+This does not disturb decision 13. Templates and their records outlive nothing
+and are the isolate's own; these three are the embedder's, and that is exactly
+why they need a rule rather than a container.
+
+### 28. The engine reporting that *it* is in trouble (`unibind/isolate.h`)
+
+Everything else in this API reports a failure to whoever asked for something.
+There was no channel at all for the other direction - no out-of-memory
+notification, no near-heap-limit hook, no fatal-error handler - so a
+long-running embedder, which is this library's stated case, found out that its
+engine was failing by dying.
+
+`PlatformOptions::onEngineFault` is that channel: **one callback with a kind,
+not four callbacks.** `EngineFault` is `OutOfMemory` and `Fatal` today, and
+`EngineFaultReport` carries the kind, the isolate it happened in (or null), and
+the engine's own words for where and what.
+
+**It is `EngineFault`, not `EngineError`.** `ErrorKind` already exists and means
+almost the opposite - a JavaScript `Error` constructor that native code
+*throws*, a value, catchable by script - and `EngineError` beside `ErrorKind` is
+two names sharing a word for two things sharing nothing. Renaming the existing
+one instead (`ThrowKind`, say) was considered and dropped: it touches every
+throwing call site in the tree and in an embedder's code, and it buys nothing
+once the new name shares no word with it.
+
+#### `NearHeapLimit` is not a kind, and the reason is a link error
+
+V8's near-heap-limit callback **returns a new heap limit**: raise it, or hand
+back the current one and let the isolate die. That does not fit a `void`
+reporting callback, and it is the most valuable thing here for an embedder that
+must not be killed by one runaway script. Two shapes were available and the
+rejected one is worse for a reason that is not about types:
+
+- *Rejected:* fold it in and let the reporting callback return something the
+  other kinds ignore. **SpiderMonkey has no near-heap-limit hook at all** -
+  checked before assuming, because this project has been wrong twice about
+  whose shape is the portable one. Not a differently-shaped hook: nothing. Its
+  memory callbacks are `SetOutOfMemoryCallback`, which fires *after* an
+  allocation has already failed, and `SetProcessLargeAllocationFailureCallback`,
+  which is process-wide, takes no context, and asks the embedder to *free*
+  memory before a retry rather than asking it to decide a limit. So folding it
+  in produces a `case NearHeapLimit: return raisedLimit;` that compiles on
+  SpiderMonkey and never once runs - the silent half-portable surface this
+  library exists to prevent.
+- *Chosen:* `Isolate::SetHeapLimitCallback`, its own entry point with its own
+  shape, **defined only by the backend that has it**. A SpiderMonkey build does
+  not link a call to it. That is decision 19's answer applied unchanged - the
+  compiled-code cache is three entry points for exactly this reason - and it is
+  better than documentation, because it is a build error at the call site rather
+  than a paragraph the embedder has to have read.
+
+It is also not a *fault*, which is the second half of the same argument: nothing
+has failed when it runs. The heap is near its ceiling, collection did not help,
+and what happens next is decided by what the embedder returns. A report and a
+decision are different things and reading one as the other is how an API grows a
+return value that means nothing three quarters of the time.
+
+The policy the header documents is raise **and** terminate: enough ceiling to
+unwind in, plus a stop for the script that filled the heap. Either alone is
+useless - a bigger heap for a runaway script, or an unwind with no room to
+happen in - and together they turn "the process dies" into "that script
+stopped".
+
+#### `Platform`, with the isolate in the report
+
+The kinds are not all at the same scope. On V8, out-of-memory and near-heap-limit
+are per-isolate while a failed internal check is process-wide; on SpiderMonkey
+the out-of-memory hook is per-context, which is per-isolate here.
+
+*Rejected: on `Isolate`.* It reads right - the one kind both engines raise is
+per-isolate on both - and it is deaf at the three moments this exists for. A
+fault inside `Isolate::New` has no isolate to have been registered on, and that
+is the single moment an embedder most wants to hear about; so is a failure on a
+thread of the engine's own; so is V8's process-wide check, which names a file
+and a line and no heap.
+
+*Chosen: `PlatformOptions`, with `EngineFaultReport::isolate`.* A `Platform` is
+the scope of the whole program's use of the engine, so a handler installed there
+is armed before the first isolate and still armed after the last - and the
+report gives back everything the per-isolate shape would have bought.
+`workerThreads` is the precedent and decision 11 is what makes it cheap: one
+isolate per thread means a fault that names no heap can still be attributed to
+one, so `isolate` is populated far more often than the engines' own hooks would
+manage, and null is a real answer rather than a shrug.
+
+*And it is set at construction rather than by a setter*, which is the part that
+would be easy to get wrong in the other direction. It can arrive **on any
+thread**; a settable handler is a function pointer plus a data pointer that one
+thread may be part-way through reading while another faults, and the obvious fix
+is a lock taken at out-of-memory, possibly by the thread already holding it.
+Fixed for the life of the `Platform` it needs neither, and it is what the
+engines want anyway: V8's process-level handlers are state to install before the
+engine comes up, and SpiderMonkey's process hook may be set at most once. An
+embedder whose policy changes changes it behind the fixed handler, through
+`engineFaultData` - the indirection this API asks for everywhere else.
+
+#### Which kinds each backend can actually raise, and the one that is nobody's
+
+| kind | V8 | SpiderMonkey |
+|---|---|---|
+| `OutOfMemory` | `Isolate::SetOOMErrorHandler`, plus the library's own frame exhaustion | `JS::SetOutOfMemoryCallback`, which every internal out-of-memory funnels through - frame exhaustion included, because the backend already reports that one through `JS_ReportOutOfMemory` |
+| `Fatal` | `Isolate::SetFatalErrorHandler` and `V8::SetFatalErrorHandler` | **never** |
+
+`Fatal` is the one that is not portable, and the header says so in a table
+rather than leaving it to be discovered: SpiderMonkey's fatal path is
+`MOZ_CRASH`, which is not embedder-facing at all.
+
+**There is deliberately no `Assertion` kind**, which is the shape the enum
+nearly had. V8 spells it `SetDcheckErrorHandler` and SpiderMonkey spells it
+`MOZ_ASSERT`, and *both compile out of a release engine*, which is what this
+ships against. A kind no shipped build of either backend can raise is strictly
+worse than one only V8 can - it is a promise with no keeper at all - and an
+engine assertion that does fire is a bug in the engine or in a backend rather
+than something an embedder acts on.
+
+`Fatal` **ends the process, and installing a handler does not change that.**
+V8 with no handler prints and aborts; V8 *with* one would hand the failed check
+back to whatever was running. A diagnostic hook that decided whether the program
+survives would be the worst of both, so the backend reports first and ends the
+process second, and `Fatal` means one thing rather than two.
+
+`OutOfMemory` could not be made uniform in the other direction, and this is the
+one place the decision settles for less than a promise. Whether anything
+survives depends on *which* allocation failed and on which engine: the library's
+own failures are recoverable on both - the operation answers empty, the isolate
+carries on, and the suite asserts exactly that - while the engines' own are not
+comparable, SpiderMonkey reporting an out-of-memory condition into the running
+operation and carrying on where V8 treats its heap giving out as fatal and ends
+the process once the callback returns. Nor does the report reliably say which
+one this is.
+
+Making it uniform would mean either making V8 survive its own fatal
+out-of-memory, which is not in an embedder's gift, or making SpiderMonkey die
+where it need not, which is decision 20's mistake in a worse place. So the
+header gives one rule that is correct under all four combinations - **write a
+handler that is correct if the next line never runs** - and tells an embedder
+*not* to try to tell recovery from death, because the information to do it with
+is not there.
+
+#### What a handler may do, and the one rule that is not caution
+
+The contract is `RequestInterrupt`'s (decision 24) minus handles, minus
+allocation. Embedder state and `TerminateExecution` yes; a handle, a value, a
+call into the engine, script, a throw - no.
+
+**Allocating is not merely discouraged, it is the definition of the situation.**
+The report that arrives most often says that allocation is failing, so
+allocating in order to report it is a bug in every case and a crash in the
+interesting one. That rule was already being kept inside the backends, in the
+place this decision had to plug into: the message a frame that cannot grow
+carries is a string literal *precisely so that saying it costs nothing*. So the
+report is a stack aggregate of borrowed views, nothing in delivering it
+allocates, and the header tells an embedder to reserve the buffer and open the
+log file before it needs them.
+
+Handles are refused for a second reason on top of that one: an interrupt may
+make them because the engine sets a scope up for exactly that, and nothing sets
+one up here.
+
+### A note on the debugger, which is out of scope
+
+Deliberately, and this is the conclusion rather than a deferral. V8's debugging
+surface is the inspector protocol - a C++ channel carrying CDP messages -
+while SpiderMonkey's is the `Debugger` object, a JavaScript API installed into a
+debuggee realm. They do not share a shape, a vocabulary, or even a language: one
+is bytes over a channel, the other is script calling script. There is no common
+C++ surface to abstract, and the only honest common denominator would be "ask the
+backend whether it has a debugger and how to reach it", which is a string, not an
+abstraction. A `unibind` debugger belongs to a `unibind` *frontend* built per engine, not
+to this API.
+
+## Smaller things worth knowing
+
+- **`Frame` is placement-constructed into the caller's `HandleScope`.** V8
+  deletes `HandleScope::operator new`, which hides the global placement new, so
+  every in-place construction in that backend spells `::new`.
+- **The storage sizes in `CMakeLists.txt`** (`UNIBIND_FRAME_STORAGE_SIZE` and
+  friends) are checked by `static_assert` in each backend. If a backend type
+  grows past one, raise the number - never fall back to the heap, because a
+  frame on the heap is not a `JS::Rooted` on SpiderMonkey. Neither backend has
+  needed a raise. Each is the maximum across *all* backends for the
+  architecture, so raising one raises it for every backend; decision 26 says
+  why that is the rule rather than a convenience.
+- **`GetPropertyAttributes` asks whether the property exists first.** V8 reports
+  `None` for a property that is absent, and `None` is also what an ordinary
+  writable/enumerable/configurable property reports. The extra lookup is what
+  lets an absent property answer empty instead of lying. Any backend should
+  answer empty for an absent property.
+- **An enumerator's empty answer means "no own keys", not "declined".** V8's
+  enumerator has no decline path. `unibind/template.h` says so.
+- **`ub::Constant("literal")` needs its own overload.** Without one it binds to
+  `Constant(bool)`: pointer-to-bool is a standard conversion and beats the
+  user-defined one to `string_view`, silently. `ReturnValue::Set` has the same
+  guard for the same reason.
+
+## What the suite pins, and what it deliberately does not
+
+Every decision above is held to by at least one assertion, on both backends.
+That was not true twice before in this document's history, so it is worth saying
+what changed rather than only that it did: the three that used to be listed here
+as unpinned - a constructable template also being callable (12), one isolate per
+thread (11), and a value crossing realms (4) - all have cases now, and the
+decisions added since arrived with theirs.
+
+What is *not* asserted is a separate list and a deliberate one: engine wording,
+stack-trace layout, finalizer timing, identity seen from a foreign realm, and a
+handful of others. `docs/testing.md` is its own account of those and is the file
+to read before adding an assertion, because most of them are things a test
+could assert on one backend and would then be wrong about the other.
+
+**Adding an operation to the headers?** Add its row to
+`tests/cmake/Capabilities.cmake` too, or the suite will never gate on it and an
+unimplemented backend will fail to link instead of reporting a skip. Decisions
+14-25 need these rows, and a backend that has not caught up will then report a
+skip rather than failing to link:
+
+```
+"OWNERSHIP|ClassInstantiate,GetNativeBox"
+"CALLABLE_CLASS|ClassSetConstructor,ClassInstantiate"
+"GLOBAL_IDENTITY|GlobalStrictEquals,GlobalSameValue,GlobalStrictEqualsSlot,GlobalSameValueSlot"
+"TERMINATION|TerminateExecution@Isolate,IsExecutionTerminating@Isolate,CancelTerminateExecution@Isolate,TryCatchHasTerminated"
+"STACK_FRAMES|CaptureStack,TryCatchStackFrames"
+"CODE_CACHE|CompileScriptWithCache,ScriptUsedCodeCache,ScriptCreateCodeCache"
+"STACK_LIMIT|New@Isolate"
+"BINARY_DATA|MakeArrayBuffer,ArrayBufferByteLength,ArrayBufferCopyOut,MakeTypedArray,TypedArrayElementType,TypedArrayLength,TypedArrayByteOffset,TypedArrayBuffer,TypedArrayCopyOut"
+"SERIALIZATION|SerializeValue,DeserializeValue"
+"PROMISES|MakePromise,ResolvePromise,RejectPromise,PromiseStateOf,PumpJobs@Isolate"
+"JOBS|PostJob@Isolate,PumpJobs@Isolate"
+"INTERRUPTS|RequestInterrupt@Isolate"
+"WORKER_THREADS|WorkerThreads@Platform"
+"HEAP_LIMIT|SetHeapLimitCallback@Isolate"
+```
+
+Decision 28 is the clearest case that rule was written for, and it splits in
+two: `HEAP_LIMIT` earns a row because one engine has the hook and the other has
+nothing of the kind, so a SpiderMonkey build defines nothing and a call does not
+link. The fault channel itself earns none - `PlatformOptions::onEngineFault` is
+a field rather than an entry point, every backend honours it, and what differs
+is which *kinds* arrive, which is written down in the header and in the table
+above rather than gated.
+
+`OWNERSHIP` and `CALLABLE_CLASS` name no new symbol, because neither decision
+added one - shared ownership is entirely in the header templates, and
+construct-without-`new` only widened `ClassSetConstructor`. They are there so
+the areas are listed and skippable like every other.
+
+Decisions 26 and 27 add no row either, and for the opposite reason: the two
+symbols decision 26 brought - `Platform::BackendVersion` and
+`detail::BackendBuildId` - are **not** optional. Every backend defines them,
+including one with no code cache, because `Script::Compile` keys a script
+whether a blob is ever asked for or not. An area only earns a row when a
+backend is allowed to define nothing at all.

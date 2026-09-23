@@ -1,0 +1,163 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "toolset": "ClangCL",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "UNIBIND_VCPKG_ROOT": "$env{VCPKG_ROOT}"
+      }
+    },
+    {
+      "name": "x86",
+      "hidden": true,
+      "inherits": "base",
+      "architecture": "Win32",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x86-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "x64",
+      "hidden": true,
+      "inherits": "base",
+      "architecture": "x64",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "v8",
+      "inherits": "x86",
+      "displayName": "V8 backend (x86, ClangCL)",
+      "cacheVariables": {
+        "UNIBIND_BACKEND": "v8"
+      }
+    },
+    {
+      "name": "spidermonkey",
+      "inherits": "x86",
+      "displayName": "SpiderMonkey backend (x86, ClangCL)",
+      "cacheVariables": {
+        "UNIBIND_BACKEND": "spidermonkey"
+      }
+    },
+    {
+      "name": "v8-x64",
+      "inherits": "x64",
+      "displayName": "V8 backend (x64, ClangCL)",
+      "cacheVariables": {
+        "UNIBIND_BACKEND": "v8"
+      }
+    },
+    {
+      "name": "spidermonkey-x64",
+      "inherits": "x64",
+      "displayName": "SpiderMonkey backend (x64, ClangCL)",
+      "cacheVariables": {
+        "UNIBIND_BACKEND": "spidermonkey"
+      }
+    },
+    {
+      "name": "tidy-base",
+      "hidden": true,
+      "description": "Not a build. The Visual Studio generator writes no compile_commands.json, so clang-tidy has nothing to drive; this emits one with the same ClangCL toolchain over Ninja. See docs/testing.md.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "UNIBIND_VCPKG_ROOT": "$env{VCPKG_ROOT}",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "tidy-v8",
+      "inherits": "tidy-base",
+      "displayName": "compile database for clang-tidy (V8)",
+      "cacheVariables": {
+        "UNIBIND_BACKEND": "v8"
+      }
+    },
+    {
+      "name": "tidy-spidermonkey",
+      "inherits": "tidy-base",
+      "displayName": "compile database for clang-tidy (SpiderMonkey)",
+      "cacheVariables": {
+        "UNIBIND_BACKEND": "spidermonkey"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "v8",
+      "configurePreset": "v8",
+      "configuration": "Release",
+      "jobs": 1
+    },
+    {
+      "name": "spidermonkey",
+      "configurePreset": "spidermonkey",
+      "configuration": "Release",
+      "jobs": 1
+    },
+    {
+      "name": "v8-x64",
+      "configurePreset": "v8-x64",
+      "configuration": "Release",
+      "jobs": 1
+    },
+    {
+      "name": "spidermonkey-x64",
+      "configurePreset": "spidermonkey-x64",
+      "configuration": "Release",
+      "jobs": 1
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "v8",
+      "configurePreset": "v8",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "spidermonkey",
+      "configurePreset": "spidermonkey",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "v8-x64",
+      "configurePreset": "v8-x64",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "spidermonkey-x64",
+      "configurePreset": "spidermonkey-x64",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

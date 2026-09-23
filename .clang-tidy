@@ -1,0 +1,246 @@
+# What this tree is linted with.
+#
+# The set is curated rather than `*`: a wall of findings gets half-disabled on
+# the first day and tells nobody anything afterwards. These eight families are
+# what this library can hold clean, and tightening from here is a decision
+# somebody makes on purpose.
+#
+# **Every disable below says why.** A disable with no reason is indistinguishable
+# from an oversight, and the next person cannot tell whether it was considered.
+#
+# Several of them are wrong *for this codebase* rather than wrong in general.
+# This library's whole job is to sit between an embedder and two C engines, so a
+# raw pointer into an engine, a cast at that boundary and a namespace-scope
+# engine descriptor struct are the domain, not a defect. Where a finding was a
+# real one it was fixed; where it was deliberate it carries a NOLINT naming the
+# check and the reason, which is narrower than anything here.
+#
+# Running it: a Visual Studio build tree has no compile database, so configure
+# the `tidy-v8` / `tidy-spidermonkey` presets - Ninja, the same ClangCL
+# toolchain - and drive LLVM's own `run-clang-tidy` from one. docs/testing.md
+# has the three commands.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -cert-err33-c,
+  -cert-err58-cpp,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-no-malloc,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-pro-type-const-cast,
+  -cppcoreguidelines-pro-type-member-init,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -modernize-avoid-c-arrays,
+  -modernize-use-designated-initializers,
+  -modernize-use-nodiscard,
+  -modernize-use-std-print,
+  -modernize-use-trailing-return-type,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-use-anyofallof
+
+# ---------------------------------------------------------------------------
+# Why each of those is off
+#
+# bugprone-easily-swappable-parameters
+#   Reports any two adjacent parameters of the same type. The shapes it fires on
+#   - `(const Context&, Slot, Slot)`, `(Isolate&, SlotIndex, SlotIndex)` - are
+#   what the engines' own calls take, and the answer it wants is a wrapper
+#   struct per pair across a hundred entry points.
+#
+# bugprone-exception-escape
+#   Two shapes, seven findings, and in both the `noexcept` is the decision
+#   rather than an oversight. `Isolate::RequestInterrupt` and `Isolate::PostJob`
+#   are declared `noexcept` in `unibind/isolate.h`: they are callable from any
+#   thread and return nothing, so there is no way to report an allocation
+#   failure and terminating is what the header promises. `BackendBuildId` is the
+#   same, over one short string built once. The other two are `main`, where an
+#   escaping exception is a broken run and the runtime saying so unhandled beats
+#   a `catch` that swallows it.
+#
+# cert-err33-c
+#   Its checked-function list is the C standard library catalogue, printf family
+#   included. The only places it fires are a benchmark's diagnostics on stderr,
+#   on a path that is already returning failure. `bugprone-unused-return-value`
+#   stays on for the cases that matter, with `AllowCastToVoid` below.
+#
+# cert-err58-cpp
+#   Fires on the engines' namespace-scope descriptor structs - `JSClass`, the
+#   proxy handler - which SpiderMonkey requires to outlive every isolate, and
+#   which are constant-initialized from literals and pointers. There is nowhere
+#   else to put them and nothing in them that throws.
+#
+# clang-analyzer-optin.core.EnumCastOutOfRange
+#   Assumes an enum's valid values are its enumerators. `PropertyAttribute` and
+#   V8's `PropertyFilter` are bitmask enums, where an OR of two enumerators is
+#   the normal value and is exactly what the cast is for.
+#
+# cppcoreguidelines-avoid-c-arrays, modernize-avoid-c-arrays
+#   Every finding is *raw storage* rather than an array of objects: the bytes a
+#   `HandleScope`, a `TryCatch` and a `ContextScope` reserve on the caller's
+#   stack for the backend to placement-new its frame into, plus the frame's own
+#   fixed run of slots. `std::array` is layout-identical and would change
+#   nothing but the spelling - at the price of `<array>` in `detail/slot.h`,
+#   which today includes `<cstdint>` and nothing else, and a `.data()` at every
+#   use of a buffer whose whole point is that it is untyped bytes.
+#
+# cppcoreguidelines-avoid-magic-numbers, readability-magic-numbers
+#   The literals it finds are a UTF-8 decoder's masks (0xC0, 0x80, 0x3F, and the
+#   shifts beside them) and a test's expected answer. Both are clearer as the
+#   number than as a name standing in front of it.
+#
+# cppcoreguidelines-avoid-non-const-global-variables
+#   Both engines are process-wide singletons with process-wide state - the
+#   platform, this thread's isolate, the suite's allocation counters. That state
+#   is what the variables are; making them const would make them wrong.
+#
+# cppcoreguidelines-macro-usage
+#   Answers "consider a constexpr function" to macros that could not be one: a
+#   token paste, a stringify, and the suite's `UNIBIND_TEST_CASE`, whose job is
+#   to *declare* a test case under a name built from its arguments.
+#
+# cppcoreguidelines-no-malloc
+#   `tests/support/allocations.cpp` replaces the global allocation operators.
+#   `malloc` and `free` are the only things it *can* call: a container or a
+#   smart pointer there is unbounded recursion.
+#
+# cppcoreguidelines-owning-memory
+#   Off because its answer is `gsl::owner<>` and this library depends on nothing
+#   but the standard library and one engine - but every site was read first,
+#   because ownership is where this tree's defects have been. Three kinds:
+#
+#     * The opaque-handle boundary, which is all but a few of them. `ContextRec`,
+#       `ScriptRec`, `GlobalNode` and `NativeBox` are declared as raw pointers in
+#       `detail/backend.h` *so that no engine type appears in a public header*:
+#       one entry point makes each with `new` and the matching `Release`/`delete`
+#       ends it. A `unique_ptr` cannot cross that boundary without putting the
+#       deleter - and so the backend - in the header the boundary exists to keep
+#       clean. Deliberate, documented, and covered by docs/lifetimes.md.
+#     * Placement-new the check misreads as a heap allocation: `OpenFrame`
+#       constructs a frame in storage the caller already owns and returns a
+#       reference. Nothing is allocated and nothing is freed.
+#     * `tests/support/allocations.cpp`, which *is* the allocator.
+#
+#   There was one genuine owning raw pointer - the V8 frame's lazily-allocated
+#   `overflow` and `deferred` vectors, `new`ed in `Push`/`Escape` and `delete`d
+#   by hand in `~Frame`. Those are `std::unique_ptr` now: same size, so the
+#   frame's storage budget is unchanged, and two hand-written deletes gone.
+#
+# cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+# cppcoreguidelines-pro-bounds-constant-array-index,
+# cppcoreguidelines-pro-bounds-pointer-arithmetic
+#   The same GSL answer to the same question, and again every site was read
+#   rather than waved through. They are: walking `argv`, which the language
+#   hands over as `char**`; the offset in a `memcpy` that writes a header and
+#   then a payload; a UTF-8 validator indexing the bytes of a `string_view`; and
+#   one lookup into a five-element `constexpr std::array` by a length that the
+#   branch above it has already pinned to 2, 3 or 4. None of them is an
+#   ownership or a lifetime question, and a `span` would move the same index
+#   rather than remove it.
+#
+# cppcoreguidelines-pro-type-const-cast, cppcoreguidelines-pro-type-reinterpret-cast
+#   This is the boundary those rules exist to keep out of ordinary code, and
+#   having one place for it is the point of the library. A handle is an opaque
+#   pointer that has to become a `JS::Value*` or a `v8::Local<v8::Value>`, and
+#   SpiderMonkey's C API takes non-const pointers to things it does not write.
+#
+# cppcoreguidelines-pro-type-member-init
+#   Three findings, all the same one: a constructor that deliberately leaves a
+#   raw storage buffer alone because the next thing to touch it is a
+#   placement-new. Zeroing it first would cost the memset and prove nothing.
+#
+# cppcoreguidelines-pro-type-vararg
+#   The variadic calls are the engines' own C entry points and the C runtime's
+#   `printf`. Neither is ours to re-declare.
+#
+# modernize-use-designated-initializers
+#   Fires on the engines' C aggregates - `JSClass`, `JSClassOps`, the proxy
+#   handler - whose members are positional today and named by the engine, not by
+#   us. Designating them means transcribing the engine's field names into this
+#   tree and re-checking them on every engine bump, in exchange for nothing the
+#   trailing comment beside each `nullptr` does not already say.
+#
+# modernize-use-nodiscard
+#   All 24 findings are one fluent builder - `Class<T>`'s `Construct`, `Method`,
+#   `Accessor`, `SetHandler` - whose methods return `*this` so they can be
+#   chained. The standalone call `cls.Method("bump", &Bump);` is the ordinary
+#   one, and `[[nodiscard]]` would make it a warning.
+#
+# modernize-use-std-print
+#   Eight `printf`s in a benchmark's progress output. `<print>` is a large
+#   include to add to a binary that already links a gigabyte of engine, for
+#   lines going to stderr.
+#
+# modernize-use-trailing-return-type
+#   493 findings, every one of them "write this declaration the other way
+#   round". The tree writes leading return types throughout and its
+#   `.clang-format` is settled; this is a whole-tree restyle nobody asked for.
+#
+# readability-function-cognitive-complexity
+#   What it finds is a backend's dispatch over the engine's type space: a flat
+#   switch with one arm per kind, which is long because the space is, and which
+#   splitting would only scatter.
+#
+# readability-identifier-length
+#   `cx` is what every line of SpiderMonkey's own documentation calls a
+#   `JSContext*`, and a loop over slots indexes with `i`. Renaming to satisfy a
+#   minimum would make the backend read less like the engine it wraps.
+#
+# readability-use-anyofallof
+#   An opinion about loops, not a defect: it rewrites a plain early-return loop
+#   into `std::ranges::any_of` with a lambda, which is longer here and no
+#   clearer.
+# ---------------------------------------------------------------------------
+
+CheckOptions:
+  # A deliberately ignored result is spelled `(void)`; that is what the cast is
+  # for, and the check should read it as the statement it is.
+  bugprone-unused-return-value.AllowCastToVoid: true
+
+  # An allocation failure is a state this suite *observes* rather than an error
+  # it handles: it arms a failing allocator, lets the throw pass through, and
+  # then asks what the ownership rules say. The catch is empty because there is
+  # nothing to do in it, which is the finding. Any other exception type still
+  # reports.
+  bugprone-empty-catch.AllowEmptyCatchForExceptions: 'std::bad_alloc'
+
+  # Keep the half of this check that finds a redundant boolean literal, drop the
+  # half that rewrites `!(a && b)` into `!a || !b`. The predicates it fires on
+  # here say "not a negative zero", and they read worse turned inside out.
+  readability-simplify-boolean-expr.SimplifyDeMorgan: false
+
+  # The analyzer cannot see across a translation unit, so every `Slot` that
+  # comes back from a backend entry point - declared in a header, defined in the
+  # backend - is an opaque struct it assumes is uninitialized, and passing one
+  # to the next entry point is a hundred reports of the same non-fact. `Slot`
+  # has a default member initializer on every field. The rest of CallAndMessage
+  # - a call through a null function pointer, a method on a null object - still
+  # reports.
+  clang-analyzer-core.CallAndMessage:ArgInitializedness: false
+
+# Our own headers, and only ours: an engine's headers and vcpkg's are not this
+# tree's to fix, and the V8 and SpiderMonkey trees are large enough that leaving
+# them in buries everything else.
+HeaderFilterRegex: '.*[/\\]unibind[/\\](include|src|tests|tools)[/\\].*'
+ExcludeHeaderFilterRegex: '.*[/\\](dependencies|vcpkg_installed|build|out)[/\\].*'
+
+FormatStyle: file

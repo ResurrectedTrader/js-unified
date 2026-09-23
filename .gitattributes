@@ -1,0 +1,12 @@
+# Every tracked file here is LF today, and this is developed on Windows, where
+# a contributor's autocrlf setting otherwise decides what lands in a commit.
+# Pinning it is what stops a one-line edit arriving as a whole-file diff.
+#
+# LF in the working tree as well as in the index: MSVC, clang-cl, CMake and
+# every editor in use read LF perfectly well, and a mixed checkout is how the
+# phantom diffs start.
+* text=auto eol=lf
+
+*.lib binary
+*.zip binary
+*.png binary

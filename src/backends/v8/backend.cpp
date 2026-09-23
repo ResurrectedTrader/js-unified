@@ -1,0 +1,3234 @@
+// The V8 backend.
+//
+// Everything V8-specific in the library lives behind this file: it defines the
+// types the public headers only declare (`detail::Frame`, `ContextRec`, ...)
+// and the functions the public headers only declare. Nothing above it includes
+// a V8 header, which is what `unibind_headers_only` proves.
+//
+// SCOPE: this is the vertical slice - isolates, contexts, frames, values,
+// objects, functions, scripts, exceptions and globals. Templates, classes,
+// interceptors and symbols are declared in the public headers and NOT defined
+// here yet; they are the next agent's work. An unimplemented operation is a
+// link error at the call site, which is the diagnosis we want.
+
+#include <libplatform/libplatform.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+// V8 deletes HandleScope::operator new, which hides the global placement new,
+// so every in-place construction here spells `::new`.
+// v8-template.h names std::span<const v8::CFunction> while v8.h only forward
+// declares CFunction; this header is what completes it.
+#include <v8-fast-api-calls.h>
+#include <v8.h>
+
+#include "unibind/class.h"
+#include "unibind/context.h"
+#include "unibind/exception.h"
+#include "unibind/function.h"
+#include "unibind/handle.h"
+#include "unibind/isolate.h"
+#include "unibind/script.h"
+#include "unibind/value.h"
+
+namespace ub {
+namespace {
+
+/// Slot 0 of a v8::Isolate's embedder data holds the owning ub::Isolate, and
+/// slot 0 of a v8::Context's holds its ContextRec. Both are set at creation.
+constexpr uint32_t ISOLATE_SLOT = 0;
+constexpr int CONTEXT_SLOT = 0;
+
+/// Internal field 0 of a class instance holds its NativeBox, which is why a
+/// class's instance template asks for one internal field.
+constexpr int NATIVE_FIELD = 0;
+constexpr int NATIVE_FIELD_COUNT = NATIVE_FIELD + 1;
+
+/// What `PlatformOptions` installed, for the life of the process.
+///
+/// Not settable afterwards, which is what lets these be read with no lock from
+/// whatever thread faults - see the field's comment in unibind/isolate.h. A
+/// `Platform` is the scope of the whole program's use of the engine, so
+/// "written once before V8 comes up, read until it goes down" is the whole
+/// lifecycle.
+EngineFaultCallback g_faultHandler = nullptr;  // NOLINT(*-avoid-non-const-global-variables)
+CallbackData g_faultData;                      // NOLINT(*-avoid-non-const-global-variables)
+
+/// The one isolate this thread is allowed to have alive, if it has one.
+///
+/// V8 is happy with any number per thread; SpiderMonkey keeps the running
+/// context in a single thread-local slot and cannot have two. So the contract
+/// is one per thread (unibind/isolate.h) and this backend holds itself to it,
+/// because an embedder finding out by porting is exactly the failure this
+/// library exists to prevent.
+///
+/// It is also how a fault that names no heap - V8's process-wide check, which
+/// is handed a file and a line and nothing else - still arrives with an
+/// isolate in the report: one per thread means the thread names it.
+thread_local Isolate* g_threadIsolate = nullptr;  // NOLINT(*-avoid-non-const-global-variables)
+
+/// Hand a fault to whatever the embedder installed, if anything.
+///
+/// **Nothing here allocates**, and that is the contract rather than an
+/// implementation note: the commonest caller is out of memory. The report is a
+/// stack aggregate of views into strings the engine or this file already owns.
+void ReportEngineFault(EngineFault fault, Isolate* isolate, const char* location, const char* message) noexcept {
+    if (g_faultHandler == nullptr) {
+        return;
+    }
+    const EngineFaultReport report{.fault = fault,
+                                   .isolate = isolate,
+                                   .location = location == nullptr ? std::string_view{} : std::string_view(location),
+                                   .message = message == nullptr ? std::string_view{} : std::string_view(message)};
+    g_faultHandler(report, g_faultData);
+}
+
+}  // namespace
+
+namespace detail {
+// Backend-only records the isolate owns. The ones the public headers name are
+// forward declared in unibind/fwd.h; these exist for no other layer, so they are
+// declared here and defined below.
+struct AccessorRecord;
+struct InstanceRecord;
+}  // namespace detail
+
+// ---------------------------------------------------------------------------
+// The types the public headers declare and never define
+// ---------------------------------------------------------------------------
+
+struct Isolate::Impl {
+    v8::Isolate* isolate = nullptr;
+    std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
+    detail::Frame* current = nullptr;
+    uint32_t nextEpoch = 1;
+    CallbackData embedder;
+    Isolate* self = nullptr;
+    /// Stable homes for the (callback, data) pairs a native function needs,
+    /// because V8 hands a callback one pointer and we need two.
+    ///
+    /// Keyed by the record's own address so that one can be given back when
+    /// the *value* it belongs to is collected. A function made by
+    /// `Function::New` and an external are ordinary values - they are
+    /// collected like any other, and a record that outlived them would make
+    /// every such value cost its isolate a permanent allocation. A record a
+    /// template or a class owns stays until the isolate goes, which is what
+    /// decision 13 says those are.
+    std::unordered_map<detail::CallbackRecord*, std::unique_ptr<detail::CallbackRecord>> callbacks;
+    /// Templates and accessor pairs are isolate-lifetime by design, so the
+    /// handles callers hold are raw pointers into these and there is no
+    /// refcount anywhere. See the header comment in unibind/template.h.
+    std::vector<std::unique_ptr<detail::TemplateRec>> templates;
+    std::vector<std::unique_ptr<detail::AccessorRecord>> accessors;
+    std::vector<std::unique_ptr<detail::ClassRec>> classes;
+    /// An interceptor's hooks live as long as the template that carries them,
+    /// which is as long as the isolate.
+    std::vector<std::unique_ptr<NamedPropertyHandler>> namedHandlers;
+    std::vector<std::unique_ptr<IndexedPropertyHandler>> indexedHandlers;
+    /// Every instance that still carries a native. V8 does not promise to run
+    /// a weak callback before an isolate goes away, so the survivors are
+    /// destroyed in ~Isolate - which is what makes "the finalizer runs exactly
+    /// once" a rule a test can hold both backends to.
+    std::unordered_map<detail::InstanceRecord*, std::unique_ptr<detail::InstanceRecord>> liveNatives;
+    /// Work posted from another thread, and interrupt callbacks waiting to
+    /// fire. Both queues are ours rather than V8's, so that ordering and what
+    /// happens to leftovers is the same on every backend rather than whatever
+    /// each engine's own list does. One mutex: neither queue is contended and
+    /// two locks would be two chances to get the order wrong.
+    /// A stop, from the moment it is requested until it is cancelled. V8 has no
+    /// "requested" bit of its own - IsExecutionTerminating only answers while
+    /// the termination exception is actually pending, which is never while a
+    /// native is running - so the sticky part is ours, exactly as it has to be
+    /// on SpiderMonkey. See unibind/isolate.h.
+    std::atomic<bool> terminating{false};
+    std::mutex work;
+    std::deque<std::pair<JobCallback, CallbackData>> jobs;
+    std::deque<std::pair<InterruptCallback, CallbackData>> interrupts;
+    /// Contexts, scripts and `Global<T>` roots the embedder is still holding.
+    ///
+    /// These three are `new`ed on demand and `delete`d by the call that gives
+    /// them back, which is the embedder's to make - so unlike everything else
+    /// here they are not in a container this isolate can empty. One still alive
+    /// in `~Isolate` leaks its own memory *and* leaves a later `Reset` writing
+    /// to a disposed isolate, so `unibind/isolate.h` makes it a rule and this
+    /// counter is what diagnoses breaking it, in a checked build, where it
+    /// happens.
+    std::int32_t embedderRefs = 0;
+    /// What `SetHeapLimitCallback` installed. V8 hands its near-heap-limit
+    /// callback one pointer and we need three things, so the pair lives here
+    /// and the pointer is the isolate. `heapLimitArmed` is whether V8 is
+    /// currently holding our trampoline, which it has to be told to stop
+    /// doing by name.
+    HeapLimitCallback heapLimitCallback = nullptr;
+    CallbackData heapLimitData;
+    bool heapLimitArmed = false;
+};
+
+namespace detail {
+
+/// What a native function was declared with.
+///
+/// Lives as long as the isolate when a template or a class owns it, and as
+/// long as the *value* when `Function::New` or `External::New` made it -
+/// `keeper` is that second case: a weak root over the value, whose collection
+/// is what gives the record back.
+struct CallbackRecord {
+    Isolate* owner = nullptr;
+    FunctionCallback callback = nullptr;
+    CallbackData data;
+    v8::Global<v8::Value> keeper;
+};
+
+/// A handle frame: a V8 handle scope plus the slot array `Local` indexes into.
+///
+/// Slots `[0, argCount)` are *borrowed* from the call this frame belongs to -
+/// V8 has already rooted those, so reading one copies nothing. Slots above
+/// that are the frame's own, inline up to UNIBIND_FRAME_INLINE_SLOTS and on the
+/// heap after that. See docs/lifetimes.md section 8.
+///
+/// The V8 scope is constructed in place rather than held as a member, because
+/// escaping needs it destroyed before the deferred escapes are written into
+/// the parent - see EscapeSlot.
+struct Frame {
+    Frame(Isolate& owner, Frame* parent, const v8::FunctionCallbackInfo<v8::Value>* args, bool escapable)
+        : owner(&owner),
+          parent(parent),
+          epoch(owner.impl().nextEpoch++),
+          args(args),
+          argCount(args == nullptr ? 0U : static_cast<uint32_t>(args->Length())),
+          escapable(escapable) {
+        v8::Isolate* isolate = owner.impl().isolate;
+        if (escapable) {
+            ::new (static_cast<void*>(scopeStorage)) v8::EscapableHandleScope(isolate);
+        } else {
+            ::new (static_cast<void*>(scopeStorage)) v8::HandleScope(isolate);
+        }
+    }
+
+    ~Frame() {
+        CloseV8Scope();
+        ApplyDeferredEscapes();
+    }
+
+    Frame(const Frame&) = delete;
+    Frame& operator=(const Frame&) = delete;
+    Frame(Frame&&) = delete;
+    Frame& operator=(Frame&&) = delete;
+
+    /// `NO_SLOT` when the frame could not grow. The caller turns that into an
+    /// empty handle - never into a slot that reads as a value. The overflow
+    /// vector is the only thing here that can fail, and it fails by throwing,
+    /// so the throw is caught and answered rather than escaping a noexcept
+    /// boundary into the engine (which would be std::terminate, i.e. "fatal"
+    /// chosen by accident instead of by decision).
+    static constexpr SlotIndex NO_SLOT = ~SlotIndex{0};
+
+    [[nodiscard]] SlotIndex Push(v8::Local<v8::Value> value) noexcept {
+        if (count < UNIBIND_FRAME_INLINE_SLOTS) {
+            inlineSlots[count] = value;  // NOLINT(*-constant-array-index)
+            return argCount + count++;
+        }
+        try {
+            if (overflow == nullptr) {
+                overflow = std::make_unique<std::vector<v8::Local<v8::Value>>>();
+            }
+            overflow->push_back(value);
+        } catch (const std::bad_alloc&) {
+            return NO_SLOT;
+        }
+        return argCount + count++;
+    }
+
+    [[nodiscard]] v8::Local<v8::Value> At(SlotIndex index) const {
+        if (index < argCount) {
+            return (*args)[static_cast<int>(index)];
+        }
+        const SlotIndex own = index - argCount;
+        assert(own < count);
+        if (own < UNIBIND_FRAME_INLINE_SLOTS) {
+            return inlineSlots[own];  // NOLINT(*-constant-array-index)
+        }
+        return (*overflow)[own - UNIBIND_FRAME_INLINE_SLOTS];
+    }
+
+    void SetAt(SlotIndex index, v8::Local<v8::Value> value) {
+        assert(index >= argCount);
+        const SlotIndex own = index - argCount;
+        if (own < UNIBIND_FRAME_INLINE_SLOTS) {
+            inlineSlots[own] = value;  // NOLINT(*-constant-array-index)
+        } else {
+            (*overflow)[own - UNIBIND_FRAME_INLINE_SLOTS] = value;
+        }
+    }
+
+    [[nodiscard]] v8::EscapableHandleScope& EscapableScope() noexcept {
+        return *reinterpret_cast<v8::EscapableHandleScope*>(scopeStorage);
+    }
+
+    void CloseV8Scope() noexcept {
+        if (!scopeAlive) {
+            return;
+        }
+        scopeAlive = false;
+        if (escapable) {
+            EscapableScope().~EscapableHandleScope();
+        } else {
+            reinterpret_cast<v8::HandleScope*>(scopeStorage)->~HandleScope();
+        }
+    }
+
+    /// Runs after this frame's V8 scope has closed, so the parent's is current
+    /// again and a handle made here belongs to the parent.
+    // it writes the parent's slots and empties `deferred`; const is reachable only because both are behind pointers,
+    // and would say the opposite of what this does. NOLINTNEXTLINE(readability-make-member-function-const)
+    void ApplyDeferredEscapes() {
+        if (deferred == nullptr) {
+            return;
+        }
+        v8::Isolate* isolate = owner->impl().isolate;
+        for (auto& entry : *deferred) {
+            parent->SetAt(entry.first, entry.second.Get(isolate));
+            entry.second.Reset();
+        }
+    }
+
+    Isolate* owner;
+    Frame* parent;
+    uint32_t epoch;
+    const v8::FunctionCallbackInfo<v8::Value>* args;
+    uint32_t argCount;
+    bool escapable;
+    bool escapeUsed = false;
+    bool scopeAlive = true;
+    uint32_t count = 0;
+    // Owned: the frame allocates each one lazily and it goes with the frame.
+    std::unique_ptr<std::vector<v8::Local<v8::Value>>> overflow;
+    std::unique_ptr<std::vector<std::pair<SlotIndex, v8::Global<v8::Value>>>> deferred;
+    // The frame's own storage, sized by the ABI constants: a fixed run of slots
+    // indexed by ordinal, and the bytes the V8 scope is constructed in.
+    v8::Local<v8::Value> inlineSlots[UNIBIND_FRAME_INLINE_SLOTS];
+    alignas(alignof(v8::EscapableHandleScope)) unsigned char scopeStorage[sizeof(v8::EscapableHandleScope)];
+};
+static_assert(sizeof(Frame) <= UNIBIND_FRAME_STORAGE_SIZE,
+              "UNIBIND_FRAME_STORAGE_SIZE in CMakeLists.txt is too small for the V8 frame");
+static_assert(alignof(Frame) <= UNIBIND_FRAME_STORAGE_ALIGN, "UNIBIND_FRAME_STORAGE_ALIGN is too small");
+
+struct ContextRec {
+    Isolate* owner = nullptr;
+    v8::Global<v8::Context> handle;
+    int refs = 1;
+};
+
+/// Compiled source, kept *unbound* - not tied to the realm it was compiled in.
+///
+/// `v8::Script` is bound to a context and keeps looking at that context's
+/// globals whatever you pass to `Run`, which would make `Script::Run`'s context
+/// parameter a lie the moment a second realm exists. `v8::UnboundScript` is the
+/// facility for exactly this: compile once, bind per run.
+struct ScriptRec {
+    Isolate* owner = nullptr;
+    v8::Global<v8::UnboundScript> handle;
+    /// Whether a blob handed to CompileScriptWithCache was accepted. False for
+    /// a plain compile and false for a rejected blob - to a caller those are
+    /// the same thing, which is that this compile paid full price.
+    bool usedCache = false;
+};
+
+struct GlobalNode {
+    Isolate* owner = nullptr;
+    v8::Global<v8::Value> handle;
+};
+
+/// A native getter and setter pair, and the property name they answer for.
+///
+/// The pair is installed as a real ECMAScript accessor property backed by two
+/// function templates, not as one of V8's native data properties. V8 15.6
+/// hands a native accessor a `PropertyCallbackInfo`, which reports the holder
+/// and never the receiver - so an accessor declared on a prototype, which is
+/// where instance accessors belong, could not find the instance it was read
+/// on, and `Class<T>::Accessor` would have nothing to unwrap. A function call
+/// has a receiver, so this shape has one too.
+struct AccessorRecord {
+    Isolate* owner = nullptr;
+    AccessorGetterCallback getter = nullptr;
+    AccessorSetterCallback setter = nullptr;
+    CallbackData data;
+    v8::Global<v8::Name> name;
+};
+
+/// An object or function template. Isolate-owned and isolate-lifetime, so the
+/// handle a caller holds is a raw pointer and copying one is free.
+struct TemplateRec {
+    enum class Kind : uint8_t { Object, Function };
+
+    Isolate* owner = nullptr;
+    Kind kind = Kind::Object;
+    v8::Global<v8::Template> handle;
+    /// A function template's two child templates, made on first ask so that
+    /// asking twice yields the same record.
+    TemplateRec* prototype = nullptr;
+    TemplateRec* instance = nullptr;
+};
+
+/// A class: a constructor template, its prototype and its instance shape, plus
+/// the callback that makes the native. Isolate-lifetime like a template.
+struct ClassRec {
+    Isolate* owner = nullptr;
+    TypeId nativeType;
+    NativeConstructor constructor = nullptr;
+    /// Whether a plain call is legal, and makes an instance the way `new`
+    /// does. Off by default; `Class<T>::ConstructOrCall` turns it on.
+    bool callable = false;
+    TemplateRec* function = nullptr;
+    TemplateRec* prototype = nullptr;
+    TemplateRec* instance = nullptr;
+};
+
+/// One live instance carrying a native, and the weak handle that says when it
+/// has gone. The isolate keeps these so every *box* is destroyed exactly once:
+/// by the finalizer if V8 gets to it, by ~Isolate if it does not. Destroying a
+/// box gives back one share of the native, which is a different event - see the
+/// two invariants at the top of unibind/class.h.
+struct InstanceRecord {
+    Isolate* owner = nullptr;
+    NativeBox* box = nullptr;
+    v8::Global<v8::Object> handle;
+};
+
+struct TryCatchState {
+    explicit TryCatchState(Isolate& owner) : owner(&owner), tryCatch(owner.impl().isolate) {}
+
+    Isolate* owner;
+    v8::TryCatch tryCatch;
+};
+
+static_assert(sizeof(TryCatchState) <= UNIBIND_TRY_CATCH_STORAGE_SIZE, "UNIBIND_TRY_CATCH_STORAGE_SIZE is too small");
+static_assert(alignof(TryCatchState) <= UNIBIND_TRY_CATCH_STORAGE_ALIGN,
+              "UNIBIND_TRY_CATCH_STORAGE_ALIGN is too small");
+
+struct ContextScopeState {
+    v8::Local<v8::Context> context;
+};
+
+static_assert(sizeof(ContextScopeState) <= UNIBIND_CONTEXT_SCOPE_STORAGE_SIZE,
+              "UNIBIND_CONTEXT_SCOPE_STORAGE_SIZE is too small");
+
+struct CallbackState;
+
+/// Where a callback's result goes, with the engine's type taken off it.
+///
+/// V8 types a return slot by the hook that owns it - `FunctionCallbackInfo<Value>`
+/// for a call, `PropertyCallbackInfo<Value>` for an interceptor getter,
+/// `<Integer>` for a query, `<Boolean>` for a setter or deleter, `<Array>` for
+/// an enumerator - and the setters on each are not the same set: you cannot
+/// hand a `double` to a `ReturnValue<Integer>` and it will not compile. So the
+/// six `SetReturn*` entry points, which are one set for every hook, cannot
+/// name one V8 type.
+///
+/// This is the erasure: a table of six function pointers, one static instance
+/// per hook shape, picked where the `CallbackState` is built - which is the
+/// one place that statically knows the shape. Each entry is a one-line
+/// instantiation over the info type, so it inlines straight back to V8's own
+/// typed setter; the cost is one indirect call per result written, once per
+/// call rather than once per value.
+///
+/// Nothing public names this type. `CallbackState` is the backend's own, so a
+/// second engine erases its return slot however it likes - SpiderMonkey's
+/// `JS::MutableHandleValue` out-parameter would not need a table at all. What
+/// the two backends must share is the behaviour, not the mechanism: see the
+/// contract at the top of unibind/function.h.
+struct ReturnSink {
+    void (*handle)(const CallbackState& state, Slot value) noexcept;
+    void (*undefinedValue)(const CallbackState& state) noexcept;
+    void (*nullValue)(const CallbackState& state) noexcept;
+    void (*boolean)(const CallbackState& state, bool value) noexcept;
+    void (*number)(const CallbackState& state, double value) noexcept;
+    void (*integer)(const CallbackState& state, int32_t value) noexcept;
+};
+
+/// One per-call state for every shape of callback: a call, a construction, an
+/// accessor, an interceptor hook. `call` is the argument list and is null for
+/// anything that has none; `info` is whatever V8 handed the hook, erased, and
+/// is understood only by `returns`.
+struct CallbackState {
+    Isolate* owner = nullptr;
+    Frame* frame = nullptr;
+    Context context;
+    CallbackData data;
+    v8::Local<v8::Object> receiver;
+    v8::Local<v8::Object> holder;
+    const v8::FunctionCallbackInfo<v8::Value>* call = nullptr;
+    const void* info = nullptr;
+    const ReturnSink* returns = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Slot plumbing
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] Slot MakeSlot(Frame& frame, SlotIndex index) noexcept {
+#if UNIBIND_HANDLE_CHECKS
+    return Slot{.frame = &frame, .index = index, .epoch = frame.epoch};
+#else
+    return Slot{.frame = &frame, .index = index};
+#endif
+}
+
+[[nodiscard]] v8::Local<v8::Value> Resolve(Slot slot) noexcept {
+    assert(slot.frame != nullptr && "handle used while empty");
+#if UNIBIND_HANDLE_CHECKS
+    assert(slot.epoch == slot.frame->epoch && "handle used after its HandleScope closed");
+#endif
+    return slot.frame->At(slot.index);
+}
+
+[[nodiscard]] Isolate& IsolateFor(Slot slot) noexcept {
+    return *slot.frame->owner;
+}
+
+[[nodiscard]] v8::Isolate* Raw(Isolate& isolate) noexcept {
+    return isolate.impl().isolate;
+}
+
+/// An empty handle, plus the condition reported where script will see it. The
+/// message is a literal, so saying so costs no allocation of ours - which
+/// matters, because the reason we are here is that an allocation failed.
+///
+/// The embedder hears about it too, as `EngineFault::OutOfMemory`. This engine
+/// has its own hook for its own heap and nothing that covers ours, so raising
+/// it here is what makes running out of memory reach an embedder the same way
+/// on both backends - the other one routes this path through the engine's own
+/// out-of-memory report and gets it for free. Reporting comes first because
+/// the throw below builds an Error object, on a heap that may be no better off
+/// than the allocator that just failed.
+[[nodiscard]] Slot NoSlot(Isolate& isolate) noexcept {
+    ReportEngineFault(EngineFault::OutOfMemory, &isolate, "HandleScope", "a handle scope could not grow");
+    Raw(isolate)->ThrowError("out of memory: a handle scope could not grow");
+    return Slot{};
+}
+
+[[nodiscard]] Slot Push(Isolate& isolate, v8::Local<v8::Value> value) noexcept {
+    Frame* frame = isolate.impl().current;
+    assert(frame != nullptr && "a value was created with no HandleScope open");
+    const SlotIndex index = frame->Push(value);
+    if (index == Frame::NO_SLOT) {
+        return NoSlot(isolate);
+    }
+    return MakeSlot(*frame, index);
+}
+
+/// The `std::optional<Slot>` form: a frame that could not grow is an empty answer,
+/// exactly as a call that threw is.
+[[nodiscard]] std::optional<Slot> PushOrNothing(Isolate& isolate, v8::Local<v8::Value> value) noexcept {
+    const Slot slot = Push(isolate, value);
+    if (slot.IsEmpty()) {
+        return std::nullopt;
+    }
+    return slot;
+}
+
+[[nodiscard]] std::optional<Slot> PushMaybe(Isolate& isolate, v8::MaybeLocal<v8::Value> value) noexcept {
+    v8::Local<v8::Value> local;
+    if (!value.ToLocal(&local)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(isolate, local);
+}
+
+[[nodiscard]] ContextRec* RecOf(const Context& context) noexcept {
+    return context.rec();
+}
+
+[[nodiscard]] v8::Local<v8::Context> Raw(const Context& context) noexcept {
+    ContextRec* rec = RecOf(context);
+    return rec->handle.Get(Raw(*rec->owner));
+}
+
+[[nodiscard]] Isolate& OwnerOf(const Context& context) noexcept {
+    return *RecOf(context)->owner;
+}
+
+/// Whether these bytes are UTF-8 - strictly, which is the only useful kind.
+///
+/// V8 does not ask: `NewFromUtf8` replaces whatever it does not understand
+/// with U+FFFD and reports success, so `String::New`'s promise ("empty if the
+/// bytes are not valid UTF-8") is this library's to keep. Silence there is the
+/// failure the whole API is written against - the caller is told it handed
+/// over text, and what arrived is a row of replacement characters.
+///
+/// Rejected, because each of them is a way for two encoders to disagree about
+/// the same bytes: a continuation byte where a lead byte belongs, a sequence
+/// cut short, an overlong form, an encoded surrogate, and anything above
+/// U+10FFFF.
+[[nodiscard]] bool IsUtf8(std::string_view text) noexcept {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text.data());
+    const size_t size = text.size();
+    for (size_t i = 0; i < size;) {
+        const unsigned char lead = bytes[i];
+        size_t length = 0;
+        uint32_t point = 0;
+        if (lead < 0x80) {
+            ++i;
+            continue;
+        }
+        if ((lead & 0xE0) == 0xC0) {
+            length = 2;
+            point = lead & 0x1FU;
+        } else if ((lead & 0xF0) == 0xE0) {
+            length = 3;
+            point = lead & 0x0FU;
+        } else if ((lead & 0xF8) == 0xF0) {
+            length = 4;
+            point = lead & 0x07U;
+        } else {
+            return false;  // a continuation byte, or a five-byte lead
+        }
+        if (size - i < length) {
+            return false;  // cut short
+        }
+        for (size_t k = 1; k < length; ++k) {
+            const unsigned char next = bytes[i + k];
+            if ((next & 0xC0) != 0x80) {
+                return false;
+            }
+            point = (point << 6) | (next & 0x3FU);
+        }
+        static constexpr std::array<uint32_t, 5> SMALLEST{0, 0, 0x80, 0x800, 0x10000};
+        if (point < SMALLEST[length]) {
+            return false;  // an overlong form of something shorter
+        }
+        if (point > 0x10FFFF || (point >= 0xD800 && point <= 0xDFFF)) {
+            return false;  // out of range, or half of a surrogate pair
+        }
+        i += length;
+    }
+    return true;
+}
+
+/// Every string this backend makes goes through here, for two reasons.
+///
+/// V8's length is an `int` and a **negative** one means "read until the NUL":
+/// a view longer than `kMaxLength` would be read past its end - a
+/// `string_view` need not be terminated at all - rather than refused. And
+/// `NewFromUtf8` accepts bytes that are not UTF-8, which the header says it
+/// does not.
+[[nodiscard]] v8::MaybeLocal<v8::String> NewString(Isolate& isolate, std::string_view text) noexcept {
+    if (text.size() > static_cast<size_t>(v8::String::kMaxLength) || !IsUtf8(text)) {
+        return {};
+    }
+    return v8::String::NewFromUtf8(Raw(isolate), text.data(), v8::NewStringType::kNormal,
+                                   static_cast<int>(text.size()));
+}
+
+[[nodiscard]] v8::Local<v8::String> RawString(Isolate& isolate, std::string_view text) noexcept {
+    return NewString(isolate, text).ToLocalChecked();
+}
+
+[[nodiscard]] std::optional<bool> FromV8(v8::Maybe<bool> value) noexcept {
+    if (value.IsNothing()) {
+        return std::nullopt;
+    }
+    return value.FromJust();
+}
+
+/// The sink for a hook whose result the engine reads as a value: a call, and
+/// an interceptor getter. `Info` is `FunctionCallbackInfo<Value>` or
+/// `PropertyCallbackInfo<Value>`; both carry a `ReturnValue<Value>`, which is
+/// the only one of V8's return slots that takes every kind of result.
+template <class Info>
+struct ValueReturn {
+    [[nodiscard]] static const Info& Of(const CallbackState& state) noexcept {
+        return *static_cast<const Info*>(state.info);
+    }
+
+    static void SetHandle(const CallbackState& state, Slot value) noexcept {
+        Of(state).GetReturnValue().Set(Resolve(value));
+    }
+    static void SetUndefined(const CallbackState& state) noexcept { Of(state).GetReturnValue().SetUndefined(); }
+    static void SetNull(const CallbackState& state) noexcept { Of(state).GetReturnValue().SetNull(); }
+    static void SetBoolean(const CallbackState& state, bool value) noexcept { Of(state).GetReturnValue().Set(value); }
+    static void SetNumber(const CallbackState& state, double value) noexcept { Of(state).GetReturnValue().Set(value); }
+    static void SetInteger(const CallbackState& state, int32_t value) noexcept {
+        Of(state).GetReturnValue().Set(value);
+    }
+
+    static constexpr ReturnSink SINK{.handle = &SetHandle,
+                                     .undefinedValue = &SetUndefined,
+                                     .nullValue = &SetNull,
+                                     .boolean = &SetBoolean,
+                                     .number = &SetNumber,
+                                     .integer = &SetInteger};
+};
+
+/// The sink for a hook whose answer is its C++ return value - an interceptor
+/// query, deleter, setter or enumerator. V8's return slot on those carries the
+/// hook's protocol (the attributes, the delete result, the key array), so a
+/// callback writing its own value there would corrupt it. The contract in
+/// unibind/function.h says such a write does nothing; this is that nothing, and it
+/// is a deliberate no-op rather than an unimplemented operation.
+struct DiscardReturn {
+    static void SetHandle(const CallbackState& /*state*/, Slot /*value*/) noexcept {}
+    static void SetUndefined(const CallbackState& /*state*/) noexcept {}
+    static void SetNull(const CallbackState& /*state*/) noexcept {}
+    static void SetBoolean(const CallbackState& /*state*/, bool /*value*/) noexcept {}
+    static void SetNumber(const CallbackState& /*state*/, double /*value*/) noexcept {}
+    static void SetInteger(const CallbackState& /*state*/, int32_t /*value*/) noexcept {}
+
+    static constexpr ReturnSink SINK{.handle = &SetHandle,
+                                     .undefinedValue = &SetUndefined,
+                                     .nullValue = &SetNull,
+                                     .boolean = &SetBoolean,
+                                     .number = &SetNumber,
+                                     .integer = &SetInteger};
+};
+
+using CallReturn = ValueReturn<v8::FunctionCallbackInfo<v8::Value>>;
+using PropertyValueReturn = ValueReturn<v8::PropertyCallbackInfo<v8::Value>>;
+
+/// The realm a callback is running in, as its record. Every context this
+/// library makes carries one in embedder slot 0.
+[[nodiscard]] ContextRec* CurrentContextRec(v8::Isolate* isolate) noexcept {
+    v8::Local<v8::Context> raw = isolate->GetCurrentContext();
+    assert(!raw.IsEmpty() && "a callback ran with no current context");
+    return static_cast<ContextRec*>(
+        raw->GetAlignedPointerFromEmbedderData(CONTEXT_SLOT, v8::kEmbedderDataTypeTagDefault));
+}
+
+[[nodiscard]] Isolate& OwnerOf(v8::Isolate* isolate) noexcept {
+    return *static_cast<Isolate*>(isolate->GetData(ISOLATE_SLOT));
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Frames
+// ---------------------------------------------------------------------------
+
+Frame& OpenFrame(Isolate& isolate, FrameStorage& storage, bool escapable) noexcept {
+    auto* frame = ::new (static_cast<void*>(storage.bytes)) Frame(isolate, isolate.impl().current, nullptr, escapable);
+    isolate.impl().current = frame;
+    return *frame;
+}
+
+void CloseFrame(Frame& frame) noexcept {
+    Isolate& owner = *frame.owner;
+    assert(owner.impl().current == &frame && "handle scopes must close in reverse order of opening");
+    // The parent must be current before ~Frame writes the deferred escapes
+    // into it, because a handle made then belongs to whatever scope is open.
+    owner.impl().current = frame.parent;
+    frame.~Frame();
+}
+
+// V8 handles are pointers into the innermost open scope's block, so copying a
+// Local into the parent's slot array would copy a pointer into storage that is
+// about to be released. The value has to be handed over the boundary, and V8
+// offers exactly one cheap way to do that per scope: EscapableHandleScope,
+// which reserves a slot in the parent when it is constructed.
+//
+// So the first escape is free. Any further one parks the value in a global
+// root, reserves an empty parent slot now, and fills it in once this frame's
+// V8 scope has closed - see Frame::ApplyDeferredEscapes. That costs one global
+// handle per escape beyond the first, which is the honest price of V8's
+// one-escape rule; see docs/lifetimes.md section 6.
+Slot EscapeSlot(Frame& closing, Slot value) noexcept {
+    Frame* parent = closing.parent;
+    assert(parent != nullptr && "nothing to escape into: no enclosing HandleScope");
+    assert(closing.escapable && "this frame was not opened as escapable");
+
+    v8::Local<v8::Value> local = Resolve(value);
+    Isolate& owner = *closing.owner;
+
+    if (!closing.escapeUsed) {
+        closing.escapeUsed = true;
+        const SlotIndex index = parent->Push(closing.EscapableScope().Escape(local));
+        return index == Frame::NO_SLOT ? NoSlot(owner) : MakeSlot(*parent, index);
+    }
+
+    const SlotIndex index = parent->Push(v8::Local<v8::Value>());
+    if (index == Frame::NO_SLOT) {
+        return NoSlot(owner);
+    }
+    try {
+        if (closing.deferred == nullptr) {
+            closing.deferred = std::make_unique<std::vector<std::pair<SlotIndex, v8::Global<v8::Value>>>>();
+        }
+        closing.deferred->emplace_back(index, v8::Global<v8::Value>(Raw(owner), local));
+    } catch (const std::bad_alloc&) {
+        // The parent slot is reserved and empty, and nothing will ever fill
+        // it, so the handle naming it would read as an empty local rather than
+        // as the escaped value. Say so instead.
+        return NoSlot(owner);
+    }
+    return MakeSlot(*parent, index);
+}
+Isolate& IsolateOf(Frame& frame) noexcept {
+    return *frame.owner;
+}
+
+Frame* CurrentFrame(Isolate& isolate) noexcept {
+    return isolate.impl().current;
+}
+
+// ---------------------------------------------------------------------------
+// Inspection
+// ---------------------------------------------------------------------------
+
+ValueKind KindOf(Slot value) noexcept {
+    v8::Local<v8::Value> raw = Resolve(value);
+    if (raw.IsEmpty() || raw->IsUndefined()) {
+        return ValueKind::Undefined;
+    }
+    if (raw->IsNull()) {
+        return ValueKind::Null;
+    }
+    if (raw->IsBoolean()) {
+        return ValueKind::Boolean;
+    }
+    if (raw->IsNumber()) {
+        return ValueKind::Number;
+    }
+    if (raw->IsString()) {
+        return ValueKind::String;
+    }
+    if (raw->IsSymbol()) {
+        return ValueKind::Symbol;
+    }
+    if (raw->IsBigInt()) {
+        return ValueKind::BigInt;
+    }
+    if (raw->IsExternal()) {
+        return ValueKind::External;
+    }
+    if (raw->IsFunction()) {
+        return ValueKind::Function;
+    }
+    if (raw->IsArray()) {
+        return ValueKind::Array;
+    }
+    if (raw->IsObject()) {
+        return ValueKind::Object;
+    }
+    return ValueKind::Other;
+}
+
+bool IsType(Slot value, TypeCode type) noexcept {
+    v8::Local<v8::Value> raw = Resolve(value);
+    switch (type) {
+        case TypeCode::Value:
+            return true;
+        case TypeCode::Primitive:
+            return !raw->IsObject();
+        case TypeCode::Boolean:
+            return raw->IsBoolean();
+        case TypeCode::Number:
+            return raw->IsNumber();
+        case TypeCode::Integer:
+            return raw->IsInt32();
+        case TypeCode::Name:
+            return raw->IsName();
+        case TypeCode::String:
+            return raw->IsString();
+        case TypeCode::Symbol:
+            return raw->IsSymbol();
+        case TypeCode::BigInt:
+            return raw->IsBigInt();
+        case TypeCode::Object:
+            return raw->IsObject();
+        case TypeCode::Array:
+            return raw->IsArray();
+        case TypeCode::Function:
+            return raw->IsFunction();
+        case TypeCode::ArrayBuffer:
+            return raw->IsArrayBuffer();
+        case TypeCode::TypedArray:
+            return raw->IsTypedArray();
+        case TypeCode::Promise:
+            return raw->IsPromise();
+        case TypeCode::External:
+            return raw->IsExternal();
+    }
+    return false;
+}
+
+bool StrictEquals(Slot lhs, Slot rhs) noexcept {
+    return Resolve(lhs)->StrictEquals(Resolve(rhs));
+}
+
+bool SameValue(Slot lhs, Slot rhs) noexcept {
+    return Resolve(lhs)->SameValue(Resolve(rhs));
+}
+
+std::optional<bool> LooseEquals(const Context& context, Slot lhs, Slot rhs) {
+    return FromV8(Resolve(lhs)->Equals(Raw(context), Resolve(rhs)));
+}
+
+// ---------------------------------------------------------------------------
+// Reading primitives
+// ---------------------------------------------------------------------------
+
+bool BooleanValue(Slot value) noexcept {
+    return Resolve(value)->BooleanValue(Raw(IsolateFor(value)));
+}
+
+double NumberValue(Slot value) noexcept {
+    return Resolve(value).As<v8::Number>()->Value();
+}
+
+int32_t Int32Value(Slot value) noexcept {
+    return Resolve(value).As<v8::Int32>()->Value();
+}
+
+size_t Utf8Length(Slot string) noexcept {
+    return Resolve(string).As<v8::String>()->Utf8Length(Raw(IsolateFor(string)));
+}
+
+size_t WriteUtf8(Slot string, std::span<char> out) noexcept {
+    if (out.empty()) {
+        return 0;
+    }
+    // `kReplaceInvalidUtf8` because this hands back UTF-8 and a JavaScript
+    // string is UTF-16: script can hold half a surrogate pair, whose naive
+    // encoding (ED A0 80) is not UTF-8 at all and is not something this API
+    // can hand an embedder that asked for UTF-8. U+FFFD is three bytes, the
+    // same as the sequence it replaces, so nothing about the length moves.
+    return Resolve(string).As<v8::String>()->WriteUtf8(Raw(IsolateFor(string)), out.data(), out.size(),
+                                                       v8::String::WriteFlags::kReplaceInvalidUtf8);
+}
+
+std::string ToStdString(Slot string) {
+    v8::Isolate* isolate = Raw(IsolateFor(string));
+    v8::Local<v8::String> raw = Resolve(string).As<v8::String>();
+    std::string result(raw->Utf8Length(isolate), '\0');
+    const size_t written =
+        raw->WriteUtf8(isolate, result.data(), result.size(), v8::String::WriteFlags::kReplaceInvalidUtf8);
+    result.resize(written);
+    return result;
+}
+
+std::optional<std::string> SymbolDescription(Slot symbol) {
+    v8::Isolate* isolate = Raw(IsolateFor(symbol));
+    v8::Local<v8::Value> description = Resolve(symbol).As<v8::Symbol>()->Description(isolate);
+    if (description.IsEmpty() || description->IsUndefined()) {
+        return std::nullopt;
+    }
+    const v8::String::Utf8Value text(isolate, description);
+    if (*text == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(*text, static_cast<size_t>(text.length()));
+}
+
+// ---------------------------------------------------------------------------
+// Conversion
+// ---------------------------------------------------------------------------
+
+std::optional<bool> ToBoolean(const Context& context, Slot value) {
+    (void)context;
+    return Resolve(value)->BooleanValue(Raw(IsolateFor(value)));
+}
+
+std::optional<double> ToNumber(const Context& context, Slot value) {
+    v8::Maybe<double> number = Resolve(value)->NumberValue(Raw(context));
+    if (number.IsNothing()) {
+        return std::nullopt;
+    }
+    return number.FromJust();
+}
+
+std::optional<int32_t> ToInt32(const Context& context, Slot value) {
+    v8::Maybe<int32_t> number = Resolve(value)->Int32Value(Raw(context));
+    if (number.IsNothing()) {
+        return std::nullopt;
+    }
+    return number.FromJust();
+}
+
+std::optional<uint32_t> ToUint32(const Context& context, Slot value) {
+    v8::Maybe<uint32_t> number = Resolve(value)->Uint32Value(Raw(context));
+    if (number.IsNothing()) {
+        return std::nullopt;
+    }
+    return number.FromJust();
+}
+
+std::optional<Slot> ToJsString(const Context& context, Slot value) {
+    v8::Local<v8::String> string;
+    if (!Resolve(value)->ToString(Raw(context)).ToLocal(&string)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), string);
+}
+
+std::optional<Slot> ToJsObject(const Context& context, Slot value) {
+    v8::Local<v8::Object> object;
+    if (!Resolve(value)->ToObject(Raw(context)).ToLocal(&object)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), object);
+}
+
+// ---------------------------------------------------------------------------
+// Making values
+// ---------------------------------------------------------------------------
+
+Slot MakeUndefined(Isolate& isolate) noexcept {
+    return Push(isolate, v8::Undefined(Raw(isolate)));
+}
+Slot MakeNull(Isolate& isolate) noexcept {
+    return Push(isolate, v8::Null(Raw(isolate)));
+}
+Slot MakeBoolean(Isolate& isolate, bool value) noexcept {
+    return Push(isolate, v8::Boolean::New(Raw(isolate), value));
+}
+Slot MakeNumber(Isolate& isolate, double value) noexcept {
+    return Push(isolate, v8::Number::New(Raw(isolate), value));
+}
+Slot MakeInteger(Isolate& isolate, int32_t value) noexcept {
+    return Push(isolate, v8::Integer::New(Raw(isolate), value));
+}
+Slot MakeUnsigned(Isolate& isolate, uint32_t value) noexcept {
+    return Push(isolate, v8::Integer::NewFromUnsigned(Raw(isolate), value));
+}
+
+std::optional<Slot> MakeString(Isolate& isolate, std::string_view utf8) {
+    v8::Local<v8::String> string;
+    if (!NewString(isolate, utf8).ToLocal(&string)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(isolate, string);
+}
+
+std::optional<Slot> MakeSymbol(Isolate& isolate, std::optional<std::string_view> description) {
+    v8::Local<v8::String> text;
+    if (description && !NewString(isolate, *description).ToLocal(&text)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(isolate, v8::Symbol::New(Raw(isolate), text));
+}
+
+std::optional<Slot> MakeSymbolFor(Isolate& isolate, std::string_view key) {
+    v8::Local<v8::String> text;
+    if (!NewString(isolate, key).ToLocal(&text)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(isolate, v8::Symbol::For(Raw(isolate), text));
+}
+
+namespace {
+
+[[nodiscard]] v8::Local<v8::Symbol> RawWellKnownSymbol(Isolate& isolate, WellKnownSymbol which) noexcept {
+    v8::Isolate* raw = Raw(isolate);
+    switch (which) {
+        case WellKnownSymbol::Iterator:
+            return v8::Symbol::GetIterator(raw);
+        case WellKnownSymbol::AsyncIterator:
+            return v8::Symbol::GetAsyncIterator(raw);
+        case WellKnownSymbol::HasInstance:
+            return v8::Symbol::GetHasInstance(raw);
+        case WellKnownSymbol::ToPrimitive:
+            return v8::Symbol::GetToPrimitive(raw);
+        case WellKnownSymbol::ToStringTag:
+            return v8::Symbol::GetToStringTag(raw);
+    }
+    return {};
+}
+
+}  // namespace
+
+std::optional<Slot> GetWellKnownSymbol(Isolate& isolate, WellKnownSymbol which) {
+    v8::Local<v8::Symbol> symbol = RawWellKnownSymbol(isolate, which);
+    if (symbol.IsEmpty()) {
+        return std::nullopt;
+    }
+    return PushOrNothing(isolate, symbol);
+}
+
+std::optional<Slot> MakeObject(const Context& context) {
+    return PushOrNothing(OwnerOf(context), v8::Object::New(Raw(OwnerOf(context))));
+}
+
+std::optional<Slot> MakeArray(const Context& context, uint32_t length) {
+    // V8's length is an `int` and a negative one means *zero*, not an error, so
+    // a length above INT_MAX would come back as an empty array reporting
+    // success. Refusing is the only answer that is not a wrong one.
+    if (length > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), v8::Array::New(Raw(OwnerOf(context)), static_cast<int>(length)));
+}
+
+std::optional<Slot> MakeError(const Context& context, ErrorKind kind, std::string_view message) {
+    Isolate& owner = OwnerOf(context);
+    v8::Local<v8::String> text = RawString(owner, message);
+    v8::Local<v8::Value> error;
+    switch (kind) {
+        case ErrorKind::TypeError:
+            error = v8::Exception::TypeError(text);
+            break;
+        case ErrorKind::RangeError:
+            error = v8::Exception::RangeError(text);
+            break;
+        case ErrorKind::ReferenceError:
+            error = v8::Exception::ReferenceError(text);
+            break;
+        case ErrorKind::SyntaxError:
+            error = v8::Exception::SyntaxError(text);
+            break;
+        case ErrorKind::Error:
+            error = v8::Exception::Error(text);
+            break;
+    }
+    return PushOrNothing(owner, error);
+}
+
+// ---------------------------------------------------------------------------
+// Objects
+// ---------------------------------------------------------------------------
+
+std::optional<Slot> GetProperty(const Context& context, Slot object, Slot key) {
+    return PushMaybe(OwnerOf(context), Resolve(object).As<v8::Object>()->Get(Raw(context), Resolve(key)));
+}
+
+std::optional<Slot> GetIndex(const Context& context, Slot object, uint32_t index) {
+    return PushMaybe(OwnerOf(context), Resolve(object).As<v8::Object>()->Get(Raw(context), index));
+}
+
+std::optional<bool> SetProperty(const Context& context, Slot object, Slot key, Slot value) {
+    return FromV8(Resolve(object).As<v8::Object>()->Set(Raw(context), Resolve(key), Resolve(value)));
+}
+
+std::optional<bool> SetIndex(const Context& context, Slot object, uint32_t index, Slot value) {
+    return FromV8(Resolve(object).As<v8::Object>()->Set(Raw(context), index, Resolve(value)));
+}
+
+std::optional<bool> DefineProperty(const Context& context, Slot object, Slot key, Slot value,
+                                   PropertyAttribute attributes) {
+    return FromV8(Resolve(object).As<v8::Object>()->DefineOwnProperty(
+        Raw(context), Resolve(key).As<v8::Name>(), Resolve(value),
+        static_cast<v8::PropertyAttribute>(static_cast<uint8_t>(attributes))));
+}
+
+std::optional<bool> HasProperty(const Context& context, Slot object, Slot key) {
+    return FromV8(Resolve(object).As<v8::Object>()->Has(Raw(context), Resolve(key)));
+}
+
+std::optional<bool> HasOwnProperty(const Context& context, Slot object, Slot key) {
+    return FromV8(Resolve(object).As<v8::Object>()->HasOwnProperty(Raw(context), Resolve(key).As<v8::Name>()));
+}
+
+std::optional<bool> DeleteProperty(const Context& context, Slot object, Slot key) {
+    return FromV8(Resolve(object).As<v8::Object>()->Delete(Raw(context), Resolve(key)));
+}
+
+// V8 reports `None` for a property that is not there at all, which would be a
+// lie: `None` is what a plain writable/enumerable/configurable property has.
+// Asking whether it exists first is one extra lookup on a cold path, and it is
+// the only way an absent property can answer "no attributes" rather than "the
+// default ones".
+std::optional<PropertyAttribute> GetPropertyAttributes(const Context& context, Slot object, Slot key) {
+    v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
+    v8::Local<v8::Value> name = Resolve(key);
+    v8::Maybe<bool> present = target->Has(Raw(context), name);
+    if (present.IsNothing() || !present.FromJust()) {
+        return std::nullopt;
+    }
+    v8::Maybe<v8::PropertyAttribute> attributes = target->GetPropertyAttributes(Raw(context), name);
+    if (attributes.IsNothing()) {
+        return std::nullopt;
+    }
+    return static_cast<PropertyAttribute>(static_cast<uint8_t>(attributes.FromJust()));
+}
+
+std::optional<Slot> GetOwnPropertyNames(const Context& context, Slot object, KeyFilter filter) {
+    int propertyFilter = filter.includeNonEnumerable ? v8::ALL_PROPERTIES : v8::ONLY_ENUMERABLE;
+    if (!filter.includeSymbols) {
+        propertyFilter |= v8::SKIP_SYMBOLS;
+    }
+    v8::Local<v8::Array> names;
+    if (!Resolve(object)
+             .As<v8::Object>()
+             ->GetOwnPropertyNames(Raw(context), static_cast<v8::PropertyFilter>(propertyFilter),
+                                   v8::KeyConversionMode::kKeepNumbers)
+             .ToLocal(&names)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), names);
+}
+
+std::optional<Slot> GetPrototype(const Context& context, Slot object) {
+    return PushOrNothing(OwnerOf(context), Resolve(object).As<v8::Object>()->GetPrototype());
+}
+
+std::optional<bool> SetPrototype(const Context& context, Slot object, Slot prototype) {
+    return FromV8(Resolve(object).As<v8::Object>()->SetPrototype(Raw(context), Resolve(prototype)));
+}
+uint32_t ArrayLength(Slot array) noexcept {
+    return Resolve(array).As<v8::Array>()->Length();
+}
+
+// ---------------------------------------------------------------------------
+// Binary data
+//
+// Copied in, copied out. unibind/value.h argues why there is no borrowing
+// alternative; here it just means every path below ends in a memcpy against a
+// backing store this isolate owns.
+// ---------------------------------------------------------------------------
+
+std::optional<Slot> MakeArrayBuffer(const Context& context, std::span<const std::byte> bytes, size_t byteLength) {
+    assert(bytes.size() <= byteLength && "an array buffer was asked to hold more than it is long");
+    Isolate& owner = OwnerOf(context);
+    v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(Raw(owner), byteLength);
+    if (buffer.IsEmpty()) {
+        return std::nullopt;
+    }
+    if (!bytes.empty()) {
+        std::memcpy(buffer->Data(), bytes.data(), bytes.size());
+    }
+    return PushOrNothing(owner, buffer);
+}
+
+size_t ArrayBufferByteLength(Slot buffer) noexcept {
+    return Resolve(buffer).As<v8::ArrayBuffer>()->ByteLength();
+}
+
+size_t ArrayBufferCopyOut(Slot buffer, std::span<std::byte> out) noexcept {
+    v8::Local<v8::ArrayBuffer> raw = Resolve(buffer).As<v8::ArrayBuffer>();
+    const size_t count = std::min(raw->ByteLength(), out.size());
+    if (count != 0) {
+        std::memcpy(out.data(), raw->Data(), count);
+    }
+    return count;
+}
+
+namespace {
+
+/// Every typed-array constructor, in one place, because the only thing that
+/// differs between them is the V8 type.
+template <class View>
+[[nodiscard]] v8::Local<v8::TypedArray> NewView(v8::Local<v8::ArrayBuffer> buffer, size_t byteOffset, size_t length) {
+    return View::New(buffer, byteOffset, length);
+}
+
+[[nodiscard]] v8::Local<v8::TypedArray> NewTypedArray(ElementType type, v8::Local<v8::ArrayBuffer> buffer,
+                                                      size_t byteOffset, size_t length) {
+    switch (type) {
+        case ElementType::Int8:
+            return NewView<v8::Int8Array>(buffer, byteOffset, length);
+        case ElementType::Uint8:
+            return NewView<v8::Uint8Array>(buffer, byteOffset, length);
+        case ElementType::Uint8Clamped:
+            return NewView<v8::Uint8ClampedArray>(buffer, byteOffset, length);
+        case ElementType::Int16:
+            return NewView<v8::Int16Array>(buffer, byteOffset, length);
+        case ElementType::Uint16:
+            return NewView<v8::Uint16Array>(buffer, byteOffset, length);
+        case ElementType::Int32:
+            return NewView<v8::Int32Array>(buffer, byteOffset, length);
+        case ElementType::Uint32:
+            return NewView<v8::Uint32Array>(buffer, byteOffset, length);
+        case ElementType::Float32:
+            return NewView<v8::Float32Array>(buffer, byteOffset, length);
+        case ElementType::Float64:
+            return NewView<v8::Float64Array>(buffer, byteOffset, length);
+    }
+    return {};
+}
+
+}  // namespace
+
+std::optional<Slot> MakeTypedArray(const Context& context, ElementType type, Slot buffer, size_t byteOffset,
+                                   size_t length) {
+    Isolate& owner = OwnerOf(context);
+    v8::Local<v8::ArrayBuffer> raw = Resolve(buffer).As<v8::ArrayBuffer>();
+    // V8 checks this too, but by aborting rather than by failing, so the check
+    // has to be made here and made in a form that cannot wrap: a length whose
+    // byte count overflows would otherwise pass a `byteOffset + wanted >
+    // byteLength` test and reach V8 with a length it aborts on.
+    const size_t elementSize = ElementSize(type);
+    const size_t byteLength = raw->ByteLength();
+    if (elementSize == 0 || length > static_cast<size_t>(-1) / elementSize) {
+        return std::nullopt;
+    }
+    const size_t wanted = length * elementSize;
+    if (byteOffset > byteLength || wanted > byteLength - byteOffset) {
+        return std::nullopt;
+    }
+    v8::Local<v8::TypedArray> view = NewTypedArray(type, raw, byteOffset, length);
+    if (view.IsEmpty()) {
+        return std::nullopt;
+    }
+    return PushOrNothing(owner, view);
+}
+
+ElementType TypedArrayElementType(Slot view) noexcept {
+    v8::Local<v8::Value> raw = Resolve(view);
+    if (raw->IsInt8Array()) {
+        return ElementType::Int8;
+    }
+    if (raw->IsUint8Array()) {
+        return ElementType::Uint8;
+    }
+    if (raw->IsUint8ClampedArray()) {
+        return ElementType::Uint8Clamped;
+    }
+    if (raw->IsInt16Array()) {
+        return ElementType::Int16;
+    }
+    if (raw->IsUint16Array()) {
+        return ElementType::Uint16;
+    }
+    if (raw->IsInt32Array()) {
+        return ElementType::Int32;
+    }
+    if (raw->IsUint32Array()) {
+        return ElementType::Uint32;
+    }
+    if (raw->IsFloat32Array()) {
+        return ElementType::Float32;
+    }
+    return ElementType::Float64;
+}
+
+size_t TypedArrayLength(Slot view) noexcept {
+    return Resolve(view).As<v8::TypedArray>()->Length();
+}
+
+size_t TypedArrayByteOffset(Slot view) noexcept {
+    return Resolve(view).As<v8::TypedArray>()->ByteOffset();
+}
+
+std::optional<Slot> TypedArrayBuffer(const Context& context, Slot view) {
+    return PushOrNothing(OwnerOf(context), Resolve(view).As<v8::TypedArray>()->Buffer());
+}
+
+size_t TypedArrayCopyOut(Slot view, std::span<std::byte> out) noexcept {
+    v8::Local<v8::TypedArray> raw = Resolve(view).As<v8::TypedArray>();
+    return raw->CopyContents(out.data(), out.size());
+}
+
+// ---------------------------------------------------------------------------
+// Promises
+// ---------------------------------------------------------------------------
+
+std::optional<Slot> MakePromise(const Context& context) {
+    v8::Local<v8::Promise::Resolver> resolver;
+    if (!v8::Promise::Resolver::New(Raw(context)).ToLocal(&resolver)) {
+        return std::nullopt;
+    }
+    // The resolver IS the promise on this engine, and SpiderMonkey has no
+    // resolver at all, so the public API hands back the promise and settles it
+    // by casting back. See unibind/value.h.
+    return PushOrNothing(OwnerOf(context), resolver->GetPromise());
+}
+
+std::optional<bool> ResolvePromise(const Context& context, Slot promise, Slot value) {
+    v8::Local<v8::Promise> raw = Resolve(promise).As<v8::Promise>();
+    if (raw->State() != v8::Promise::kPending) {
+        return false;
+    }
+    return FromV8(raw.As<v8::Promise::Resolver>()->Resolve(Raw(context), Resolve(value)));
+}
+
+std::optional<bool> RejectPromise(const Context& context, Slot promise, Slot reason) {
+    v8::Local<v8::Promise> raw = Resolve(promise).As<v8::Promise>();
+    if (raw->State() != v8::Promise::kPending) {
+        return false;
+    }
+    return FromV8(raw.As<v8::Promise::Resolver>()->Reject(Raw(context), Resolve(reason)));
+}
+
+PromiseState PromiseStateOf(Slot promise) noexcept {
+    switch (Resolve(promise).As<v8::Promise>()->State()) {
+        case v8::Promise::kFulfilled:
+            return PromiseState::Fulfilled;
+        case v8::Promise::kRejected:
+            return PromiseState::Rejected;
+        case v8::Promise::kPending:
+            break;
+    }
+    return PromiseState::Pending;
+}
+
+// ---------------------------------------------------------------------------
+// Structured clone
+//
+// The default delegate refuses a host object rather than inventing one, which
+// is the behaviour unibind/value.h specifies: a value that will not clone fails the
+// whole call. `ThrowDataCloneError` is pure virtual, so there has to be a
+// delegate at all; ours throws the ordinary error and lets the TryCatch or the
+// empty optional carry it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class CloneDelegate final : public v8::ValueSerializer::Delegate {
+   public:
+    explicit CloneDelegate(v8::Isolate* isolate) noexcept : isolate_(isolate) {}
+
+    void ThrowDataCloneError(v8::Local<v8::String> message) override {
+        isolate_->ThrowException(v8::Exception::Error(message));
+    }
+
+   private:
+    v8::Isolate* isolate_;
+};
+
+}  // namespace
+
+std::optional<std::vector<uint8_t>> SerializeValue(const Context& context, Slot value) {
+    Isolate& owner = OwnerOf(context);
+    v8::Context::Scope entered(Raw(context));
+    CloneDelegate delegate(Raw(owner));
+    v8::ValueSerializer serializer(Raw(owner), &delegate);
+    serializer.WriteHeader();
+    if (serializer.WriteValue(Raw(context), Resolve(value)).IsNothing()) {
+        return std::nullopt;
+    }
+    std::pair<uint8_t*, size_t> buffer = serializer.Release();
+    std::vector<uint8_t> blob(buffer.first, buffer.first + buffer.second);
+    // Release() hands over memory the serializer allocated with its delegate's
+    // allocator, which here is the default - free, not delete.
+    free(buffer.first);  // NOLINT(cppcoreguidelines-no-malloc)
+    return blob;
+}
+
+std::optional<Slot> DeserializeValue(const Context& context, std::span<const uint8_t> blob) {
+    Isolate& owner = OwnerOf(context);
+    v8::Context::Scope entered(Raw(context));
+    v8::ValueDeserializer deserializer(Raw(owner), blob.data(), blob.size());
+    if (deserializer.ReadHeader(Raw(context)).IsNothing()) {
+        return std::nullopt;
+    }
+    v8::Local<v8::Value> value;
+    if (!deserializer.ReadValue(Raw(context)).ToLocal(&value)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(owner, value);
+}
+
+// ---------------------------------------------------------------------------
+// Calling
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Slots are (frame, index) pairs, so an argument list has to be resolved into
+/// real V8 handles before the call. Small lists stay on the stack.
+class ArgumentBuffer {
+   public:
+    explicit ArgumentBuffer(std::span<const Slot> slots) : values_(slots.size()) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+            values_[i] = Resolve(slots[i]);
+        }
+    }
+
+    [[nodiscard]] v8::Local<v8::Value>* data() noexcept { return values_.data(); }
+    [[nodiscard]] int size() const noexcept { return static_cast<int>(values_.size()); }
+
+   private:
+    std::vector<v8::Local<v8::Value>> values_;
+};
+
+}  // namespace
+
+std::optional<Slot> CallFunction(const Context& context, Slot function, Slot receiver,
+                                 std::span<const Slot> arguments) {
+    ArgumentBuffer buffer(arguments);
+    return PushMaybe(OwnerOf(context), Resolve(function).As<v8::Function>()->Call(Raw(context), Resolve(receiver),
+                                                                                  buffer.size(), buffer.data()));
+}
+
+std::optional<Slot> ConstructObject(const Context& context, Slot function, std::span<const Slot> arguments) {
+    ArgumentBuffer buffer(arguments);
+    v8::Local<v8::Object> result;
+    if (!Resolve(function)
+             .As<v8::Function>()
+             ->NewInstance(Raw(context), buffer.size(), buffer.data())
+             .ToLocal(&result)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), result);
+}
+
+// ---------------------------------------------------------------------------
+// Native functions
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Opens a frame for the duration of a callback, borrowing the argument array.
+class CallFrame {
+   public:
+    /// `args` is null for a callback with no argument list - an accessor read
+    /// through an interceptor, say - which simply means the frame borrows
+    /// nothing and every slot in it is its own.
+    CallFrame(Isolate& isolate, const v8::FunctionCallbackInfo<v8::Value>* args) : isolate_(&isolate) {
+        frame_ = ::new (static_cast<void*>(storage_.bytes)) Frame(isolate, isolate.impl().current, args, false);
+        isolate.impl().current = frame_;
+    }
+    ~CallFrame() {
+        isolate_->impl().current = frame_->parent;
+        frame_->~Frame();
+    }
+
+    CallFrame(const CallFrame&) = delete;
+    CallFrame& operator=(const CallFrame&) = delete;
+    CallFrame(CallFrame&&) = delete;
+    CallFrame& operator=(CallFrame&&) = delete;
+
+    [[nodiscard]] Frame& frame() const noexcept { return *frame_; }
+
+   private:
+    Isolate* isolate_;
+    Frame* frame_ = nullptr;
+    FrameStorage storage_{};
+};
+
+/// The per-call state for anything V8 calls as a function: a native function,
+/// a template method, a class constructor, or one half of an accessor pair.
+[[nodiscard]] CallbackState CallState(Isolate& isolate, Frame& frame, const v8::FunctionCallbackInfo<v8::Value>& info,
+                                      CallbackData data) {
+    return CallbackState{.owner = &isolate,
+                         .frame = &frame,
+                         .context = Context::FromRec(CurrentContextRec(info.GetIsolate())),
+                         .data = data,
+                         // V8 15.6 drops Holder() from a function call, so the
+                         // receiver is all there is to report as either.
+                         .receiver = info.This(),
+                         .holder = info.This(),
+                         .call = &info,
+                         .info = &info,
+                         .returns = &CallReturn::SINK};
+}
+
+/// The pointer inside the External a callback was declared with.
+template <class T>
+[[nodiscard]] T* PointerFrom(v8::Local<v8::Data> data) noexcept {
+    return static_cast<T*>(data.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
+}
+
+/// V8 hands a callback one pointer and every shape here needs at least two, so
+/// the pair gets a stable home in the isolate and the pointer to it is what
+/// goes into the External.
+///
+/// What is made here lives as long as the isolate. A record that belongs to a
+/// *value* is made the same way and then tied to it with `KeepWithValue`.
+[[nodiscard]] CallbackRecord* AdoptCallback(Isolate& isolate, FunctionCallback callback, CallbackData data) {
+    auto record = std::make_unique<CallbackRecord>();
+    record->owner = &isolate;
+    record->callback = callback;
+    record->data = data;
+    CallbackRecord* raw = record.get();
+    isolate.impl().callbacks.emplace(raw, std::move(record));
+    return raw;
+}
+
+void FinalizeCallbackRecordLate(const v8::WeakCallbackInfo<CallbackRecord>& data) {
+    CallbackRecord* record = data.GetParameter();
+    record->owner->impl().callbacks.erase(record);
+}
+
+void FinalizeCallbackRecord(const v8::WeakCallbackInfo<CallbackRecord>& data) {
+    // V8 insists the first pass resets the handle before asking for a second,
+    // and the erase - which destroys the record - belongs in the second.
+    data.GetParameter()->keeper.Reset();
+    data.SetSecondPassCallback(&FinalizeCallbackRecordLate);
+}
+
+/// Tie a record's life to the value that carries it.
+///
+/// A function from `Function::New` and an external are values: script drops
+/// them, the collector takes them, and nothing in the API says they leave
+/// anything behind. Without this the record stays until the isolate goes, so a
+/// program that makes a function per call leaks one small allocation per call
+/// and nothing reports it.
+void KeepWithValue(Isolate& isolate, CallbackRecord* record, v8::Local<v8::Value> value) {
+    record->keeper.Reset(Raw(isolate), value);
+    record->keeper.SetWeak(record, &FinalizeCallbackRecord, v8::WeakCallbackType::kParameter);
+}
+
+template <class T>
+[[nodiscard]] v8::Local<v8::External> Pointer(Isolate& isolate, T* value) noexcept {
+    return v8::External::New(Raw(isolate), value, v8::kExternalPointerTypeTagDefault);
+}
+
+void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* record = PointerFrom<CallbackRecord>(info.DataV2());
+
+    CallFrame frame(isolate, &info);
+    CallbackState state = CallState(isolate, frame.frame(), info, record->data);
+    record->callback(CallbackInfo(state));
+}
+
+}  // namespace
+
+std::optional<Slot> MakeFunction(const Context& context, FunctionCallback callback, CallbackData data) {
+    Isolate& owner = OwnerOf(context);
+    CallbackRecord* record = AdoptCallback(owner, callback, data);
+    v8::Local<v8::Function> function;
+    // Callable, not constructable - the decision documented on Function::New.
+    if (!v8::Function::New(Raw(context), &FunctionTrampoline, Pointer(owner, record), 0,
+                           v8::ConstructorBehavior::kThrow)
+             .ToLocal(&function)) {
+        // Nothing will ever reach the record, so nothing would ever give it
+        // back either.
+        owner.impl().callbacks.erase(record);
+        return std::nullopt;
+    }
+    KeepWithValue(owner, record, function);
+    return PushOrNothing(owner, function);
+}
+
+std::optional<Slot> MakeExternal(Isolate& isolate, CallbackData data) {
+    // An External holds one pointer; CallbackData is two words, so it lives in
+    // the isolate alongside the callback records - and goes when the external
+    // that names it does.
+    CallbackRecord* record = AdoptCallback(isolate, nullptr, data);
+    v8::Local<v8::External> external = Pointer(isolate, record);
+    KeepWithValue(isolate, record, external);
+    return PushOrNothing(isolate, external);
+}
+
+CallbackData ExternalData(Slot external) noexcept {
+    auto* record = PointerFrom<CallbackRecord>(Resolve(external));
+    return record->data;
+}
+
+// --- what a callback can ask -----------------------------------------------
+
+Isolate& CallbackIsolate(const CallbackState& state) noexcept {
+    return *state.owner;
+}
+const Context& CallbackContext(const CallbackState& state) noexcept {
+    return state.context;
+}
+
+uint32_t CallbackArgumentCount(const CallbackState& state) noexcept {
+    // Only a CallbackInfo exposes an argument list, and only a call ever makes
+    // one, so a null `call` here means a PropertyCallbackInfo was asked a
+    // question its public wrapper does not have.
+    assert(state.call != nullptr && "a property callback has no argument list");
+    return state.call == nullptr ? 0U : static_cast<uint32_t>(state.call->Length());
+}
+
+Slot CallbackArgument(const CallbackState& state, uint32_t index) noexcept {
+    if (index >= CallbackArgumentCount(state)) {
+        return Push(*state.owner, v8::Undefined(Raw(*state.owner)));
+    }
+    // Borrowed: the argument is already slot `index` of the call's frame.
+    return MakeSlot(*state.frame, index);
+}
+
+Slot CallbackThis(const CallbackState& state) noexcept {
+    return Push(*state.owner, state.receiver);
+}
+
+Slot CallbackHolder(const CallbackState& state) noexcept {
+    return Push(*state.owner, state.holder);
+}
+
+bool CallbackIsConstruct(const CallbackState& state) noexcept {
+    assert(state.call != nullptr && "a property callback is never a construct call");
+    return state.call != nullptr && state.call->IsConstructCall();
+}
+
+CallbackData CallbackDataOf(const CallbackState& state) noexcept {
+    return state.data;
+}
+
+void SetReturnSlot(const CallbackState& state, Slot value) noexcept {
+    state.returns->handle(state, value);
+}
+void SetReturnUndefined(const CallbackState& state) noexcept {
+    state.returns->undefinedValue(state);
+}
+void SetReturnNull(const CallbackState& state) noexcept {
+    state.returns->nullValue(state);
+}
+void SetReturnBoolean(const CallbackState& state, bool value) noexcept {
+    state.returns->boolean(state, value);
+}
+void SetReturnNumber(const CallbackState& state, double value) noexcept {
+    state.returns->number(state, value);
+}
+void SetReturnInteger(const CallbackState& state, int32_t value) noexcept {
+    state.returns->integer(state, value);
+}
+
+// ---------------------------------------------------------------------------
+// Templates
+//
+// A unibind template maps one-to-one onto a V8 template, which is already exactly
+// this: an isolate-level descriptor instantiated per context. So every
+// TemplateSet* applies to the real thing immediately rather than accumulating
+// a description to replay later.
+//
+// A template is built before any context exists and with no handle scope open,
+// so each of these opens a V8 handle scope of its own and lets nothing escape
+// it except into a Global. The three that DO produce a value - NewInstance,
+// GetFunction, HasInstance - do not, because their result belongs in the
+// caller's frame like any other.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] v8::Local<v8::Template> RawTemplate(TemplateRec* rec) noexcept {
+    return rec->handle.Get(Raw(*rec->owner));
+}
+
+[[nodiscard]] v8::Local<v8::ObjectTemplate> RawObjectTemplate(TemplateRec* rec) noexcept {
+    assert(rec->kind == TemplateRec::Kind::Object && "this operation wants an object template");
+    return RawTemplate(rec).As<v8::ObjectTemplate>();
+}
+
+[[nodiscard]] v8::Local<v8::FunctionTemplate> RawFunctionTemplate(TemplateRec* rec) noexcept {
+    assert(rec->kind == TemplateRec::Kind::Function && "this operation wants a function template");
+    return RawTemplate(rec).As<v8::FunctionTemplate>();
+}
+
+template <class T>
+[[nodiscard]] TemplateRec* AdoptTemplate(Isolate& isolate, TemplateRec::Kind kind, v8::Local<T> value) {
+    auto rec = std::make_unique<TemplateRec>();
+    rec->owner = &isolate;
+    rec->kind = kind;
+    rec->handle.Reset(Raw(isolate), value);
+    TemplateRec* raw = rec.get();
+    isolate.impl().templates.push_back(std::move(rec));
+    return raw;
+}
+
+[[nodiscard]] v8::PropertyAttribute RawAttributes(PropertyAttribute attributes) noexcept {
+    return static_cast<v8::PropertyAttribute>(static_cast<uint8_t>(attributes));
+}
+
+[[nodiscard]] v8::Local<v8::Data> RawConstant(Isolate& isolate, Constant value) noexcept {
+    v8::Isolate* raw = Raw(isolate);
+    switch (value.GetKind()) {
+        case Constant::Kind::Null:
+            return v8::Null(raw);
+        case Constant::Kind::Boolean:
+            return v8::Boolean::New(raw, value.AsBoolean());
+        case Constant::Kind::Number:
+            return v8::Number::New(raw, value.AsNumber());
+        case Constant::Kind::Integer:
+            return v8::Integer::New(raw, value.AsInteger());
+        case Constant::Kind::String:
+            return RawString(isolate, value.AsString());
+        case Constant::Kind::Undefined:
+            break;
+    }
+    return v8::Undefined(raw);
+}
+
+/// A method as V8 wants one: a function template over our trampoline, carrying
+/// the (callback, embedder pointer) pair.
+[[nodiscard]] v8::Local<v8::FunctionTemplate> MethodTemplate(Isolate& isolate, FunctionCallback callback,
+                                                             CallbackData data) {
+    // A method is callable, not constructable; only a FunctionTemplate the
+    // caller asked for, or a Class, makes a constructor. See unibind/value.h.
+    return v8::FunctionTemplate::New(Raw(isolate), &FunctionTrampoline,
+                                     Pointer(isolate, AdoptCallback(isolate, callback, data)),
+                                     v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow);
+}
+
+void AccessorGetTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* record = PointerFrom<AccessorRecord>(info.DataV2());
+
+    CallFrame frame(isolate, &info);
+    CallbackState state = CallState(isolate, frame.frame(), info, record->data);
+    const Slot name = Push(isolate, record->name.Get(Raw(isolate)));
+    record->getter(Local<Name>::FromSlot(name), PropertyCallbackInfo(state));
+}
+
+void AccessorSetTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* record = PointerFrom<AccessorRecord>(info.DataV2());
+
+    CallFrame frame(isolate, &info);
+    CallbackState state = CallState(isolate, frame.frame(), info, record->data);
+    const Slot name = Push(isolate, record->name.Get(Raw(isolate)));
+    // Slot 0 of the frame is the assigned value, borrowed from the call.
+    const Slot value = info.Length() > 0 ? MakeSlot(frame.frame(), 0) : Push(isolate, v8::Undefined(Raw(isolate)));
+    record->setter(Local<Name>::FromSlot(name), Local<Value>::FromSlot(value), PropertyCallbackInfo(state));
+}
+
+}  // namespace
+
+TemplateRec* NewObjectTemplate(Isolate& isolate) {
+    v8::HandleScope scope(Raw(isolate));
+    return AdoptTemplate(isolate, TemplateRec::Kind::Object, v8::ObjectTemplate::New(Raw(isolate)));
+}
+
+TemplateRec* NewFunctionTemplate(Isolate& isolate, FunctionCallback callback, CallbackData data) {
+    v8::HandleScope scope(Raw(isolate));
+    // Not MethodTemplate: this is the facility an embedder reaches for when it
+    // wants a constructor, so unlike a method it keeps kAllow.
+    v8::Local<v8::FunctionTemplate> tpl =
+        callback == nullptr ? v8::FunctionTemplate::New(Raw(isolate))
+                            : v8::FunctionTemplate::New(Raw(isolate), &FunctionTrampoline,
+                                                        Pointer(isolate, AdoptCallback(isolate, callback, data)));
+    return AdoptTemplate(isolate, TemplateRec::Kind::Function, tpl);
+}
+
+void TemplateSetConstant(TemplateRec* tpl, std::string_view name, Constant value, PropertyAttribute attributes) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    RawTemplate(tpl)->Set(RawString(owner, name), RawConstant(owner, value), RawAttributes(attributes));
+}
+
+void TemplateSetMethod(TemplateRec* tpl, std::string_view name, FunctionCallback callback, CallbackData data,
+                       PropertyAttribute attributes) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    RawTemplate(tpl)->Set(RawString(owner, name), MethodTemplate(owner, callback, data), RawAttributes(attributes));
+}
+
+void TemplateSetSymbolMethod(TemplateRec* tpl, WellKnownSymbol key, FunctionCallback callback, CallbackData data) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    RawTemplate(tpl)->Set(RawWellKnownSymbol(owner, key), MethodTemplate(owner, callback, data), v8::DontEnum);
+}
+
+void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetterCallback getter,
+                         AccessorSetterCallback setter, CallbackData data, PropertyAttribute attributes) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    v8::Local<v8::String> key = RawString(owner, name);
+
+    auto owned = std::make_unique<AccessorRecord>();
+    owned->owner = &owner;
+    owned->getter = getter;
+    owned->setter = setter;
+    owned->data = data;
+    owned->name.Reset(Raw(owner), key);
+    AccessorRecord* record = owned.get();
+    owner.impl().accessors.push_back(std::move(owned));
+
+    v8::Local<v8::FunctionTemplate> read;
+    v8::Local<v8::FunctionTemplate> write;
+    if (getter != nullptr) {
+        read = v8::FunctionTemplate::New(Raw(owner), &AccessorGetTrampoline, Pointer(owner, record),
+                                         v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow);
+    }
+    if (setter != nullptr) {
+        write = v8::FunctionTemplate::New(Raw(owner), &AccessorSetTrampoline, Pointer(owner, record),
+                                          v8::Local<v8::Signature>(), 1, v8::ConstructorBehavior::kThrow);
+    }
+
+    // An accessor property has no [[Writable]]: a getter with no setter IS the
+    // read-only form, so ReadOnly here would be a contradiction rather than a
+    // restriction. Drop it instead of handing V8 a nonsensical descriptor.
+    const auto usable = static_cast<PropertyAttribute>(static_cast<uint8_t>(attributes) &
+                                                       ~static_cast<uint8_t>(PropertyAttribute::ReadOnly));
+    RawTemplate(tpl)->SetAccessorProperty(key, read, write, RawAttributes(usable));
+}
+
+void TemplateSetTemplate(TemplateRec* tpl, std::string_view name, TemplateRec* value, PropertyAttribute attributes) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    RawTemplate(tpl)->Set(RawString(owner, name), RawTemplate(value), RawAttributes(attributes));
+}
+
+void TemplateSetClassName(TemplateRec* tpl, std::string_view name) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    RawFunctionTemplate(tpl)->SetClassName(RawString(owner, name));
+}
+
+void TemplateInherit(TemplateRec* child, TemplateRec* parent) {
+    Isolate& owner = *child->owner;
+    v8::HandleScope scope(Raw(owner));
+    RawFunctionTemplate(child)->Inherit(RawFunctionTemplate(parent));
+}
+
+TemplateRec* TemplatePrototype(TemplateRec* tpl) {
+    if (tpl->prototype == nullptr) {
+        Isolate& owner = *tpl->owner;
+        v8::HandleScope scope(Raw(owner));
+        tpl->prototype = AdoptTemplate(owner, TemplateRec::Kind::Object, RawFunctionTemplate(tpl)->PrototypeTemplate());
+    }
+    return tpl->prototype;
+}
+
+TemplateRec* TemplateInstance(TemplateRec* tpl) {
+    if (tpl->instance == nullptr) {
+        Isolate& owner = *tpl->owner;
+        v8::HandleScope scope(Raw(owner));
+        tpl->instance = AdoptTemplate(owner, TemplateRec::Kind::Object, RawFunctionTemplate(tpl)->InstanceTemplate());
+    }
+    return tpl->instance;
+}
+
+std::optional<Slot> TemplateNewInstance(const Context& context, TemplateRec* tpl) {
+    v8::Local<v8::Object> instance;
+    if (!RawObjectTemplate(tpl)->NewInstance(Raw(context)).ToLocal(&instance)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), instance);
+}
+
+std::optional<Slot> TemplateGetFunction(const Context& context, TemplateRec* tpl) {
+    v8::Local<v8::Function> function;
+    if (!RawFunctionTemplate(tpl)->GetFunction(Raw(context)).ToLocal(&function)) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), function);
+}
+
+std::optional<bool> TemplateHasInstance(const Context& context, TemplateRec* tpl, Slot value) {
+    (void)context;
+    return RawFunctionTemplate(tpl)->HasInstance(Resolve(value));
+}
+
+// ---------------------------------------------------------------------------
+// Interceptors
+//
+// A unibind hook answers with its C++ return value - Intercepted for a get or a
+// set, an optional for a query, a delete or an enumeration - and V8 answers
+// partly by return value and partly through a typed return slot. These
+// trampolines are the translation, and they are the only place that knows
+// which half is which; the hook itself only ever sees a PropertyCallbackInfo.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The per-call state for a property hook. It has no argument list, so the
+/// frame borrows nothing, and V8 15.6 tells it the holder and never the
+/// receiver - which is why the two are the same object here. See the contract
+/// at the top of unibind/function.h.
+template <class Info>
+[[nodiscard]] CallbackState PropertyState(Isolate& isolate, Frame& frame, const Info& info, CallbackData data,
+                                          const ReturnSink& returns) {
+    return CallbackState{.owner = &isolate,
+                         .frame = &frame,
+                         .context = Context::FromRec(CurrentContextRec(info.GetIsolate())),
+                         .data = data,
+                         .receiver = info.Holder(),
+                         .holder = info.Holder(),
+                         .call = nullptr,
+                         .info = &info,
+                         .returns = &returns};
+}
+
+/// What the hook said, unless it threw.
+///
+/// A hook that leaves an exception pending has intercepted the access
+/// whatever it returned (unibind/template.h): declining says "carry on with the
+/// ordinary lookup", and V8 must not re-enter that lookup with an exception
+/// pending. Answering `kYes` stops it there and lets the throw propagate,
+/// which is what the embedder asked for by throwing.
+[[nodiscard]] v8::Intercepted RawIntercepted(Isolate& isolate, Intercepted answer) noexcept {
+    if (Raw(isolate)->HasPendingException()) {
+        return v8::Intercepted::kYes;
+    }
+    return answer == Intercepted::Yes ? v8::Intercepted::kYes : v8::Intercepted::kNo;
+}
+
+/// An enumerator has no way to decline on V8, so an empty answer is an empty
+/// key list - which is the same observable result, and is what unibind/template.h
+/// promises.
+template <class Info>
+void WriteKeys(Isolate& isolate, const Info& info, const std::optional<Local<Array>>& keys) {
+    // An optional holding an EMPTY handle is not the same as an empty
+    // optional, and it is what a hook hands back when its array could not be
+    // made: resolving it would read through a null frame. Both answer "no own
+    // keys", which is the only thing V8's enumerator can say anyway.
+    if (!keys || keys->IsEmpty()) {
+        info.GetReturnValue().Set(v8::Array::New(Raw(isolate), 0));
+        return;
+    }
+    info.GetReturnValue().Set(Resolve(keys->slot()).As<v8::Array>());
+}
+
+v8::Intercepted NamedGetter(v8::Local<v8::Name> property, const v8::PropertyCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, PropertyValueReturn::SINK);
+    const Slot name = Push(isolate, property);
+    return RawIntercepted(isolate, handler->getter(Local<Name>::FromSlot(name), PropertyCallbackInfo(state)));
+}
+
+v8::Intercepted NamedSetter(v8::Local<v8::Name> property, v8::Local<v8::Value> value,
+                            const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    const Slot name = Push(isolate, property);
+    const Slot assigned = Push(isolate, value);
+    return RawIntercepted(isolate, handler->setter(Local<Name>::FromSlot(name), Local<Value>::FromSlot(assigned),
+                                                   PropertyCallbackInfo(state)));
+}
+
+v8::Intercepted NamedQuery(v8::Local<v8::Name> property, const v8::PropertyCallbackInfo<v8::Integer>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    const Slot name = Push(isolate, property);
+    std::optional<PropertyAttribute> attributes =
+        handler->query(Local<Name>::FromSlot(name), PropertyCallbackInfo(state));
+    if (!attributes) {
+        return RawIntercepted(isolate, Intercepted::No);
+    }
+    info.GetReturnValue().Set(static_cast<int32_t>(static_cast<uint8_t>(*attributes)));
+    return v8::Intercepted::kYes;
+}
+
+v8::Intercepted NamedDeleter(v8::Local<v8::Name> property, const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    const Slot name = Push(isolate, property);
+    std::optional<bool> deleted = handler->deleter(Local<Name>::FromSlot(name), PropertyCallbackInfo(state));
+    if (!deleted) {
+        return RawIntercepted(isolate, Intercepted::No);
+    }
+    info.GetReturnValue().Set(*deleted);
+    return v8::Intercepted::kYes;
+}
+
+void NamedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    WriteKeys(isolate, info, handler->enumerator(PropertyCallbackInfo(state)));
+}
+
+v8::Intercepted IndexedGetter(uint32_t index, const v8::PropertyCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, PropertyValueReturn::SINK);
+    return RawIntercepted(isolate, handler->getter(index, PropertyCallbackInfo(state)));
+}
+
+v8::Intercepted IndexedSetter(uint32_t index, v8::Local<v8::Value> value,
+                              const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    const Slot assigned = Push(isolate, value);
+    return RawIntercepted(isolate,
+                          handler->setter(index, Local<Value>::FromSlot(assigned), PropertyCallbackInfo(state)));
+}
+
+v8::Intercepted IndexedQuery(uint32_t index, const v8::PropertyCallbackInfo<v8::Integer>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    std::optional<PropertyAttribute> attributes = handler->query(index, PropertyCallbackInfo(state));
+    if (!attributes) {
+        return RawIntercepted(isolate, Intercepted::No);
+    }
+    info.GetReturnValue().Set(static_cast<int32_t>(static_cast<uint8_t>(*attributes)));
+    return v8::Intercepted::kYes;
+}
+
+v8::Intercepted IndexedDeleter(uint32_t index, const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    std::optional<bool> deleted = handler->deleter(index, PropertyCallbackInfo(state));
+    if (!deleted) {
+        return RawIntercepted(isolate, Intercepted::No);
+    }
+    info.GetReturnValue().Set(*deleted);
+    return v8::Intercepted::kYes;
+}
+
+void IndexedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
+    CallFrame frame(isolate, nullptr);
+    CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
+    WriteKeys(isolate, info, handler->enumerator(PropertyCallbackInfo(state)));
+}
+
+}  // namespace
+
+void TemplateSetNamedHandler(TemplateRec* tpl, const NamedPropertyHandler& handler) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+
+    auto owned = std::make_unique<NamedPropertyHandler>(handler);
+    NamedPropertyHandler* record = owned.get();
+    owner.impl().namedHandlers.push_back(std::move(owned));
+
+    // A hook the caller did not supply is left null, so V8 falls through to the
+    // ordinary lookup rather than calling a trampoline with nothing to call.
+    RawObjectTemplate(tpl)->SetHandler(v8::NamedPropertyHandlerConfiguration(
+        handler.getter != nullptr ? &NamedGetter : nullptr, handler.setter != nullptr ? &NamedSetter : nullptr,
+        handler.query != nullptr ? &NamedQuery : nullptr, handler.deleter != nullptr ? &NamedDeleter : nullptr,
+        handler.enumerator != nullptr ? &NamedEnumerator : nullptr, Pointer(owner, record)));
+}
+
+void TemplateSetIndexedHandler(TemplateRec* tpl, const IndexedPropertyHandler& handler) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+
+    auto owned = std::make_unique<IndexedPropertyHandler>(handler);
+    IndexedPropertyHandler* record = owned.get();
+    owner.impl().indexedHandlers.push_back(std::move(owned));
+
+    RawObjectTemplate(tpl)->SetHandler(v8::IndexedPropertyHandlerConfiguration(
+        handler.getter != nullptr ? &IndexedGetter : nullptr, handler.setter != nullptr ? &IndexedSetter : nullptr,
+        handler.query != nullptr ? &IndexedQuery : nullptr, handler.deleter != nullptr ? &IndexedDeleter : nullptr,
+        handler.enumerator != nullptr ? &IndexedEnumerator : nullptr, Pointer(owner, record)));
+}
+
+// ---------------------------------------------------------------------------
+// Classes and the natives their instances carry
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void DestroyBox(NativeBox* box) noexcept {
+    if (box != nullptr && box->destroy != nullptr) {
+        box->destroy(box);
+    }
+}
+
+void DestroyNative(InstanceRecord& record) noexcept {
+    DestroyBox(std::exchange(record.box, nullptr));
+}
+
+/// The second pass runs after the collection is over, which is where an
+/// arbitrary embedder destructor is allowed to run; the first pass may not
+/// touch the heap. V8's weak handle is already reset by the time either runs.
+///
+/// Both passes run on the isolate's own thread, which is **required** rather
+/// than convenient: destroying a box drops a `shared_ptr` whose other holders
+/// are the embedder's, so anywhere else would race them. V8 gives no choice
+/// here; an engine that does must take the foreground one. See `NativeBox` in
+/// unibind/detail/backend.h.
+void FinalizeNativeLate(const v8::WeakCallbackInfo<InstanceRecord>& data) {
+    InstanceRecord* record = data.GetParameter();
+    Isolate& owner = *record->owner;
+    DestroyNative(*record);
+    owner.impl().liveNatives.erase(record);
+}
+
+void FinalizeNative(const v8::WeakCallbackInfo<InstanceRecord>& data) {
+    // V8 insists the first pass resets the handle before asking for a second.
+    data.GetParameter()->handle.Reset();
+    data.SetSecondPassCallback(&FinalizeNativeLate);
+}
+
+/// Hand `box` to the engine, or hand nothing over at all.
+///
+/// All-or-nothing on purpose, and it is what lets `ClassInstantiate` say
+/// plainly who owns the box: after a true answer the engine does - the
+/// instance carries it and the isolate has it on the list that finishes the
+/// survivors - and after a false one nothing has been published, so the caller
+/// still does and destroys it.
+///
+/// The internal field is checked rather than assumed. An object that cannot
+/// carry a native must not be given one: writing past the field count is a
+/// V8 `ApiCheck`, which aborts the process, and an instance whose native the
+/// engine could not record would be one nothing ever gives back.
+[[nodiscard]] bool AttachNative(Isolate& isolate, v8::Local<v8::Object> instance, NativeBox* box) noexcept {
+    if (instance->InternalFieldCount() <= NATIVE_FIELD) {
+        return false;
+    }
+    if (box == nullptr) {
+        instance->SetAlignedPointerInInternalField(NATIVE_FIELD, nullptr, v8::kEmbedderDataTypeTagDefault);
+        return true;
+    }
+    InstanceRecord* record = nullptr;
+    try {
+        auto owned = std::make_unique<InstanceRecord>();
+        owned->owner = &isolate;
+        owned->box = box;
+        record = owned.get();
+        // Recorded before it is published, so that a failure here is a failure
+        // that published nothing.
+        isolate.impl().liveNatives.emplace(record, std::move(owned));
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    instance->SetAlignedPointerInInternalField(NATIVE_FIELD, box, v8::kEmbedderDataTypeTagDefault);
+    try {
+        record->handle.Reset(Raw(isolate), instance);
+        record->handle.SetWeak(record, &FinalizeNative, v8::WeakCallbackType::kParameter);
+    } catch (const std::bad_alloc&) {
+        // The engine's own bookkeeping ran out of memory while making the weak
+        // root. The box is already published, so this is still a hand-over
+        // that happened: without the root the collector will not finish it,
+        // and `~Isolate` - which walks the list this record is already on -
+        // will. Exactly once either way, which is the promise.
+    }
+    return true;
+}
+
+void ClassConstructTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    auto* rec = PointerFrom<ClassRec>(info.DataV2());
+
+    const bool constructing = info.IsConstructCall();
+    if (!constructing && !rec->callable) {
+        ThrowError(isolate, ErrorKind::TypeError, "this constructor cannot be invoked without 'new'");
+        return;
+    }
+
+    v8::Local<v8::Object> self;
+    if (constructing) {
+        self = info.This();
+        // The field exists but V8 has not written it, and reading an aligned
+        // pointer out of an unwritten field is undefined - so it gets a value
+        // before anything, including a constructor that unwraps its own `this`,
+        // can ask for one.
+        if (self->InternalFieldCount() > NATIVE_FIELD) {
+            self->SetAlignedPointerInInternalField(NATIVE_FIELD, nullptr, v8::kEmbedderDataTypeTagDefault);
+        }
+    }
+
+    if (rec->constructor == nullptr) {
+        ThrowError(isolate, ErrorKind::TypeError, "this class cannot be constructed from script");
+        return;
+    }
+
+    NativeBox* box = nullptr;
+    {
+        CallFrame frame(isolate, &info);
+        CallbackState state = CallState(isolate, frame.frame(), info, {});
+        box = rec->constructor(CallbackInfo(state));
+    }
+    if (box == nullptr) {
+        return;  // the callback threw, or declined
+    }
+
+    if (constructing) {
+        if (!AttachNative(isolate, self, box)) {
+            DestroyBox(box);
+            ThrowError(isolate, ErrorKind::Error, "this instance could not be given its native state");
+        }
+        return;
+    }
+
+    // A plain call on a ConstructOrCall class makes the instance `new` would
+    // have made: the callback answered the same way either way, so the result
+    // is the same object. See Class<T>::ConstructOrCall.
+    v8::HandleScope scope(Raw(isolate));
+    v8::Local<v8::Object> instance;
+    if (!RawObjectTemplate(rec->instance)->NewInstance(Raw(isolate)->GetCurrentContext()).ToLocal(&instance) ||
+        !AttachNative(isolate, instance, box)) {
+        DestroyBox(box);
+        return;
+    }
+    info.GetReturnValue().Set(instance);
+}
+
+}  // namespace
+
+NativeBox* GetNativeBox(Slot object) noexcept {
+    v8::Local<v8::Value> raw = Resolve(object);
+    if (raw.IsEmpty() || !raw->IsObject()) {
+        return nullptr;
+    }
+    v8::Local<v8::Object> instance = raw.As<v8::Object>();
+    if (instance->InternalFieldCount() <= NATIVE_FIELD) {
+        return nullptr;
+    }
+    return static_cast<NativeBox*>(
+        instance->GetAlignedPointerFromInternalField(NATIVE_FIELD, v8::kEmbedderDataTypeTagDefault));
+}
+
+ClassRec* NewClass(Isolate& isolate, std::string_view name, TypeId nativeType) {
+    v8::HandleScope scope(Raw(isolate));
+
+    auto owned = std::make_unique<ClassRec>();
+    owned->owner = &isolate;
+    owned->nativeType = nativeType;
+    ClassRec* rec = owned.get();
+    isolate.impl().classes.push_back(std::move(owned));
+
+    v8::Local<v8::FunctionTemplate> tpl =
+        v8::FunctionTemplate::New(Raw(isolate), &ClassConstructTrampoline, Pointer(isolate, rec));
+    tpl->SetClassName(RawString(isolate, name));
+    tpl->InstanceTemplate()->SetInternalFieldCount(NATIVE_FIELD_COUNT);
+
+    rec->function = AdoptTemplate(isolate, TemplateRec::Kind::Function, tpl);
+    rec->prototype = TemplatePrototype(rec->function);
+    rec->instance = TemplateInstance(rec->function);
+    return rec;
+}
+
+void ClassSetConstructor(ClassRec* rec, NativeConstructor constructor, bool callableWithoutNew) {
+    rec->constructor = constructor;
+    rec->callable = callableWithoutNew;
+}
+
+TemplateRec* ClassPrototypeTemplate(ClassRec* rec) {
+    return rec->prototype;
+}
+TemplateRec* ClassConstructorTemplate(ClassRec* rec) {
+    return rec->function;
+}
+TemplateRec* ClassInstanceTemplate(ClassRec* rec) {
+    return rec->instance;
+}
+
+std::optional<Slot> ClassGetConstructor(const Context& context, ClassRec* rec) {
+    return TemplateGetFunction(context, rec->function);
+}
+
+std::optional<Slot> ClassInstantiate(const Context& context, ClassRec* rec, NativeBox* native) noexcept {
+    assert((native == nullptr || native->type == rec->nativeType) &&
+           "a class was handed a native of a type it does not wrap");
+    Isolate& owner = OwnerOf(context);
+    v8::Local<v8::Object> instance;
+    try {
+        // Built from the instance template, so it gets the class's prototype
+        // and its internal field without the script constructor running.
+        if (!RawObjectTemplate(rec->instance)->NewInstance(Raw(context)).ToLocal(&instance) ||
+            !AttachNative(owner, instance, native)) {
+            // Ownership transferred at the call, so a hand-over that did not
+            // happen ends here rather than back at the caller.
+            DestroyBox(native);
+            return std::nullopt;
+        }
+    } catch (const std::bad_alloc&) {
+        // The engine allocates here too - through `operator new`, where an
+        // embedder that replaced it can make it fail - and this function is
+        // `noexcept`, so an escaping `bad_alloc` is `std::terminate` rather
+        // than the empty answer the contract promises. (Measured: without this
+        // catch, an injected failure at the fourth allocation inside the call
+        // ends the process.) It must also arrive as a failure that consumed
+        // the box, or the caller is left holding one it was told it had handed
+        // over.
+        DestroyBox(native);
+        return std::nullopt;
+    }
+    // Past this point the *engine* owns the box: the instance carries it and
+    // the isolate has it on the list ~Isolate finishes. The handle below can
+    // still fail to be made, and the box is not this function's to give back
+    // when it does - the finalizer or teardown gives it back exactly once.
+    return PushOrNothing(owner, instance);
+}
+
+std::optional<bool> ClassHasInstance(const Context& context, ClassRec* rec, Slot value) {
+    return TemplateHasInstance(context, rec->function, value);
+}
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+
+GlobalNode* MakeGlobal(Isolate& isolate, Slot value) {
+    auto* node = new GlobalNode();
+    node->owner = &isolate;
+    ++isolate.impl().embedderRefs;
+    node->handle.Reset(Raw(isolate), Resolve(value));
+    return node;
+}
+
+GlobalNode* DuplicateGlobal(GlobalNode* node) {
+    if (node == nullptr) {
+        return nullptr;
+    }
+    v8::Isolate* raw = Raw(*node->owner);
+    // A scope of the backend's own: copying one root into another is not a
+    // handle the caller asked for, and this has to work with nothing open -
+    // `v8::Global::Get` makes a Local, and a Local needs somewhere to live.
+    v8::HandleScope scope(raw);
+    auto* copy = new GlobalNode();
+    copy->owner = node->owner;
+    ++copy->owner->impl().embedderRefs;
+    copy->handle.Reset(raw, node->handle.Get(raw));
+    return copy;
+}
+
+void ReleaseGlobal(GlobalNode* node) noexcept {
+    if (node == nullptr) {
+        return;
+    }
+    --node->owner->impl().embedderRefs;
+    delete node;
+}
+
+Slot GlobalToSlot(Isolate& isolate, GlobalNode* node) noexcept {
+    // A root that names nothing materialises as a handle that names nothing.
+    // `undefined` would be worse here than anywhere else in the API, because
+    // the handle is typed: a `Global<Function>` would answer with a
+    // `Local<Function>` that is neither a function nor empty.
+    if (node == nullptr || node->handle.IsEmpty()) {
+        return Slot{};
+    }
+    return Push(isolate, node->handle.Get(Raw(isolate)));
+}
+
+namespace {
+
+/// Both roots materialised into a scope of the backend's own, so a caller with
+/// no HandleScope open still gets an answer. Two roots over one object is the
+/// normal case, which is why nothing here compares nodes.
+template <class Compare>
+[[nodiscard]] bool CompareGlobals(const GlobalNode* lhs, const GlobalNode* rhs, Compare compare) noexcept {
+    if (lhs == nullptr || rhs == nullptr || lhs->owner != rhs->owner) {
+        return false;
+    }
+    v8::Isolate* raw = Raw(*lhs->owner);
+    v8::HandleScope scope(raw);
+    return compare(lhs->handle.Get(raw), rhs->handle.Get(raw));
+}
+
+template <class Compare>
+[[nodiscard]] bool CompareGlobalToSlot(const GlobalNode* lhs, Slot rhs, Compare compare) noexcept {
+    if (lhs == nullptr || rhs.IsEmpty()) {
+        return false;
+    }
+    v8::Local<v8::Value> other = Resolve(rhs);
+    v8::Isolate* raw = Raw(*lhs->owner);
+    v8::HandleScope scope(raw);
+    return compare(lhs->handle.Get(raw), other);
+}
+
+constexpr auto STRICT_EQUALS = [](v8::Local<v8::Value> a, v8::Local<v8::Value> b) { return a->StrictEquals(b); };
+constexpr auto SAME_VALUE = [](v8::Local<v8::Value> a, v8::Local<v8::Value> b) { return a->SameValue(b); };
+
+}  // namespace
+
+bool GlobalStrictEquals(const GlobalNode* lhs, const GlobalNode* rhs) noexcept {
+    return CompareGlobals(lhs, rhs, STRICT_EQUALS);
+}
+bool GlobalSameValue(const GlobalNode* lhs, const GlobalNode* rhs) noexcept {
+    return CompareGlobals(lhs, rhs, SAME_VALUE);
+}
+bool GlobalStrictEqualsSlot(const GlobalNode* lhs, Slot rhs) noexcept {
+    return CompareGlobalToSlot(lhs, rhs, STRICT_EQUALS);
+}
+bool GlobalSameValueSlot(const GlobalNode* lhs, Slot rhs) noexcept {
+    return CompareGlobalToSlot(lhs, rhs, SAME_VALUE);
+}
+
+// ---------------------------------------------------------------------------
+// Exceptions
+// ---------------------------------------------------------------------------
+
+void ThrowValue(Isolate& isolate, Slot value) {
+    Raw(isolate)->ThrowException(Resolve(value));
+}
+
+void ThrowError(Isolate& isolate, ErrorKind kind, std::string_view message) {
+    v8::Local<v8::String> text = RawString(isolate, message);
+    v8::Local<v8::Value> error;
+    switch (kind) {
+        case ErrorKind::TypeError:
+            error = v8::Exception::TypeError(text);
+            break;
+        case ErrorKind::RangeError:
+            error = v8::Exception::RangeError(text);
+            break;
+        case ErrorKind::ReferenceError:
+            error = v8::Exception::ReferenceError(text);
+            break;
+        case ErrorKind::SyntaxError:
+            error = v8::Exception::SyntaxError(text);
+            break;
+        case ErrorKind::Error:
+            error = v8::Exception::Error(text);
+            break;
+    }
+    Raw(isolate)->ThrowException(error);
+}
+
+bool HasPendingException(Isolate& isolate) noexcept {
+    return Raw(isolate)->HasPendingException();
+}
+
+namespace {
+
+[[nodiscard]] std::string Utf8Of(v8::Isolate* isolate, v8::Local<v8::Value> value) {
+    if (value.IsEmpty()) {
+        return {};
+    }
+    v8::String::Utf8Value text(isolate, value);
+    if (*text == nullptr) {
+        return {};
+    }
+    return {*text, static_cast<size_t>(text.length())};
+}
+
+[[nodiscard]] std::vector<StackFrame> FramesOf(Isolate& owner, v8::Local<v8::StackTrace> trace) {
+    std::vector<StackFrame> frames;
+    if (trace.IsEmpty()) {
+        return frames;
+    }
+    v8::Isolate* raw = Raw(owner);
+    const int count = trace->GetFrameCount();
+    frames.reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        v8::Local<v8::StackFrame> frame = trace->GetFrame(raw, static_cast<uint32_t>(index));
+        frames.push_back(StackFrame{.functionName = Utf8Of(raw, frame->GetFunctionName()),
+                                    .scriptName = Utf8Of(raw, frame->GetScriptName()),
+                                    .lineNumber = frame->GetLineNumber(),
+                                    .columnNumber = frame->GetColumn()});
+    }
+    return frames;
+}
+
+}  // namespace
+
+std::vector<StackFrame> CaptureStack(Isolate& isolate, uint32_t limit) {
+    v8::HandleScope scope(Raw(isolate));
+    return FramesOf(
+        isolate, v8::StackTrace::CurrentStackTrace(Raw(isolate), static_cast<int>(limit), v8::StackTrace::kDetailed));
+}
+
+void TryCatchOpen(Isolate& isolate, TryCatchState& storage) noexcept {
+    ::new (static_cast<void*>(&storage)) TryCatchState(isolate);
+}
+
+void TryCatchClose(TryCatchState& state) noexcept {
+    // A handler consumes what it caught (decision 3) - except a termination,
+    // which is not an exception and must go on unwinding whether or not ReThrow
+    // was called, and whether or not Reset was. Swallowing one would leave the
+    // script it was told to stop running, which is the whole point of the
+    // facility. Re-arming rather than re-throwing is what survives a Reset,
+    // which has already taken V8's own pending termination away.
+    Isolate* owner = state.owner;
+    const bool stopping = owner->impl().terminating.load(std::memory_order_acquire);
+    if (state.tryCatch.HasTerminated()) {
+        state.tryCatch.ReThrow();
+    }
+    state.~TryCatchState();
+    if (stopping) {
+        Raw(*owner)->TerminateExecution();
+    }
+}
+
+bool TryCatchHasCaught(const TryCatchState& state) noexcept {
+    return state.tryCatch.HasCaught();
+}
+
+Slot TryCatchException(const TryCatchState& state, Isolate& isolate) noexcept {
+    // Nothing caught, or a termination - which carries no value at all. Both
+    // answer with an EMPTY handle, which is what unibind/exception.h promises
+    // and the only answer that cannot be mistaken for someone having thrown
+    // `undefined`.
+    v8::Local<v8::Value> exception = state.tryCatch.Exception();
+    if (exception.IsEmpty() || TryCatchHasTerminated(state)) {
+        return Slot{};
+    }
+    return Push(isolate, exception);
+}
+
+std::optional<std::string> TryCatchMessage(const TryCatchState& state, const Context& context) {
+    v8::Local<v8::Message> message = state.tryCatch.Message();
+    if (message.IsEmpty()) {
+        return std::nullopt;
+    }
+    v8::String::Utf8Value text(Raw(OwnerOf(context)), message->Get());
+    if (*text == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(*text, static_cast<size_t>(text.length()));
+}
+
+std::optional<std::string> TryCatchStackTrace(const TryCatchState& state, const Context& context) {
+    // Rendering a stack reads `error.stack`, which is a property like any
+    // other and may be an accessor the script wrote. If it throws, the throw
+    // lands in the innermost open handler - which is the one being asked - and
+    // *replaces* the exception it caught: `HasCaught()` stays true and
+    // `Exception()` and `Message()` describe the getter's error instead. A
+    // handler of our own catches that where it happens, so the caller's keeps
+    // what it caught and this answers empty.
+    v8::Local<v8::Value> stack;
+    {
+        v8::TryCatch rendering(Raw(OwnerOf(context)));
+        if (!state.tryCatch.StackTrace(Raw(context)).ToLocal(&stack)) {
+            return std::nullopt;
+        }
+    }
+    v8::String::Utf8Value text(Raw(OwnerOf(context)), stack);
+    if (*text == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(*text, static_cast<size_t>(text.length()));
+}
+
+std::optional<std::vector<StackFrame>> TryCatchStackFrames(const TryCatchState& state, const Context& context) {
+    Isolate& owner = OwnerOf(context);
+    v8::HandleScope scope(Raw(owner));
+
+    // The Error object's own trace, captured where the error was constructed,
+    // which is the frame an embedder means by "where did this come from".
+    //
+    // Deliberately not the Message's trace as a fallback: V8 will capture one
+    // for any throw if asked to, including `throw 1`, and a stack invented for a
+    // value that never carried one is exactly the plausible wrong answer this
+    // API exists to avoid. A thrown non-Error has no stack, on both engines,
+    // and answers empty.
+    v8::Local<v8::Value> exception = state.tryCatch.Exception();
+    if (exception.IsEmpty()) {
+        return std::nullopt;
+    }
+    v8::Local<v8::StackTrace> trace = v8::Exception::GetStackTrace(exception);
+    if (trace.IsEmpty()) {
+        return std::nullopt;
+    }
+    return FramesOf(owner, trace);
+}
+
+void TryCatchReThrow(TryCatchState& state) noexcept {
+    state.tryCatch.ReThrow();
+}
+
+void TryCatchReset(TryCatchState& state) noexcept {
+    state.tryCatch.Reset();
+    // Reset consumes V8's pending termination along with everything else, and a
+    // stop is not the handler's to consume: put it back at once so the scope
+    // cannot go on to run script it was told to stop.
+    if (state.owner->impl().terminating.load(std::memory_order_acquire)) {
+        Raw(*state.owner)->TerminateExecution();
+    }
+}
+
+bool TryCatchHasTerminated(const TryCatchState& state) noexcept {
+    return state.tryCatch.HasTerminated() || state.owner->impl().terminating.load(std::memory_order_acquire);
+}
+
+// ---------------------------------------------------------------------------
+// Contexts
+// ---------------------------------------------------------------------------
+
+ContextRec* NewContext(Isolate& isolate) {
+    v8::HandleScope scope(Raw(isolate));
+    v8::Local<v8::Context> context = v8::Context::New(Raw(isolate));
+    if (context.IsEmpty()) {
+        return nullptr;
+    }
+    auto* rec = new ContextRec();
+    rec->owner = &isolate;
+    ++isolate.impl().embedderRefs;
+    rec->handle.Reset(Raw(isolate), context);
+    context->SetAlignedPointerInEmbedderData(CONTEXT_SLOT, rec, v8::kEmbedderDataTypeTagDefault);
+    return rec;
+}
+
+void RetainContext(ContextRec* rec) noexcept {
+    if (rec != nullptr) {
+        ++rec->refs;
+    }
+}
+
+void ReleaseContext(ContextRec* rec) noexcept {
+    if (rec != nullptr && --rec->refs == 0) {
+        --rec->owner->impl().embedderRefs;
+        delete rec;
+    }
+}
+
+Isolate& ContextIsolate(const Context& context) noexcept {
+    return *RecOf(context)->owner;
+}
+
+Slot ContextGlobalObject(const Context& context) noexcept {
+    return Push(OwnerOf(context), Raw(context)->Global());
+}
+
+void ContextEnter(const Context& context, ContextScopeState& storage) noexcept {
+    auto* state = ::new (static_cast<void*>(&storage)) ContextScopeState();
+    state->context = Raw(context);
+    state->context->Enter();
+}
+
+void ContextLeave(ContextScopeState& state) noexcept {
+    state.context->Exit();
+    state.~ContextScopeState();
+}
+
+// ---------------------------------------------------------------------------
+// Scripts
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The one compile. `codeCache` empty means an ordinary compile; otherwise the
+/// blob is offered and V8 says on the way out whether it took it.
+[[nodiscard]] ScriptRec* CompileInto(const Context& context, std::string_view source, const ScriptOrigin& origin,
+                                     std::span<const uint8_t> codeCache) {
+    Isolate& owner = OwnerOf(context);
+    v8::Local<v8::String> text;
+    if (!NewString(owner, source).ToLocal(&text)) {
+        return nullptr;
+    }
+    v8::ScriptOrigin scriptOrigin(RawString(owner, origin.resourceName), origin.lineOffset, origin.columnOffset);
+
+    // v8::ScriptCompiler::Source takes ownership of the CachedData object (not
+    // of the buffer, which is the caller's), and `rejected` is only readable
+    // while the Source is alive.
+    auto* cached = codeCache.empty()
+                       ? nullptr
+                       : new v8::ScriptCompiler::CachedData(codeCache.data(), static_cast<int>(codeCache.size()),
+                                                            v8::ScriptCompiler::CachedData::BufferNotOwned);
+    v8::ScriptCompiler::Source compilerSource(text, scriptOrigin, cached);
+
+    // Compiling still happens in a realm - that is where a syntax error is
+    // reported from - but the result is not tied to it.
+    v8::Context::Scope entered(Raw(context));
+    v8::Local<v8::UnboundScript> script;
+    const auto option =
+        cached == nullptr ? v8::ScriptCompiler::kNoCompileOptions : v8::ScriptCompiler::kConsumeCodeCache;
+    if (!v8::ScriptCompiler::CompileUnboundScript(Raw(owner), &compilerSource, option).ToLocal(&script)) {
+        return nullptr;
+    }
+    auto* rec = new ScriptRec();
+    rec->owner = &owner;
+    ++owner.impl().embedderRefs;
+    rec->handle.Reset(Raw(owner), script);
+    rec->usedCache = cached != nullptr && !cached->rejected;
+    return rec;
+}
+
+}  // namespace
+
+ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin) {
+    return CompileInto(context, source, origin, {});
+}
+
+ScriptRec* CompileScriptWithCache(const Context& context, std::string_view source, const ScriptOrigin& origin,
+                                  std::span<const uint8_t> codeCache) {
+    return CompileInto(context, source, origin, codeCache);
+}
+
+bool ScriptUsedCodeCache(const ScriptRec* script) noexcept {
+    return script != nullptr && script->usedCache;
+}
+
+std::optional<std::vector<uint8_t>> ScriptCreateCodeCache(const ScriptRec* script) {
+    if (script == nullptr) {
+        return std::nullopt;
+    }
+    v8::Isolate* raw = Raw(*script->owner);
+    v8::HandleScope scope(raw);
+    std::unique_ptr<v8::ScriptCompiler::CachedData> data(v8::ScriptCompiler::CreateCodeCache(script->handle.Get(raw)));
+    if (!data || data->data == nullptr || data->length <= 0) {
+        return std::nullopt;
+    }
+    return std::vector<uint8_t>(data->data, data->data + data->length);
+}
+
+std::string_view BackendBuildId() noexcept {
+    // V8's own answer to "would this engine refuse a blob from that one": a tag
+    // over the version and the enabled features, which v8-script.h documents as
+    // the thing to store beside cached data and compare when using it. The
+    // version string is in here too, so that a human looking at a rejected blob
+    // can see which build wrote it; the tag is what actually decides.
+    //
+    // Built once. It is a pure function of this binary and of flags, which are
+    // the process's and are fixed before any isolate exists.
+    static const std::string ID = std::string("unibind-v8-") + v8::V8::GetVersion() + "-" +
+                                  std::to_string(v8::ScriptCompiler::CachedDataVersionTag());
+    return ID;
+}
+
+void ReleaseScript(ScriptRec* script) noexcept {
+    if (script == nullptr) {
+        return;
+    }
+    --script->owner->impl().embedderRefs;
+    delete script;
+}
+
+std::optional<Slot> RunScript(const Context& context, ScriptRec* script) {
+    if (script == nullptr) {
+        return std::nullopt;
+    }
+    Isolate& owner = OwnerOf(context);
+    // Bind to the realm being run in, not the one that compiled it, so the code
+    // sees this realm's globals. See unibind/script.h.
+    v8::Context::Scope entered(Raw(context));
+    v8::Local<v8::Script> bound = script->handle.Get(Raw(owner))->BindToCurrentContext();
+    return PushMaybe(owner, bound->Run(Raw(context)));
+}
+
+}  // namespace detail
+
+// ---------------------------------------------------------------------------
+// Platform, Isolate, Context: the public classes the backend implements
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::unique_ptr<v8::Platform> g_platform;  // NOLINT(*-avoid-non-const-global-variables)
+bool g_initialized = false;                // NOLINT(*-avoid-non-const-global-variables)
+
+/// The background-thread count in effect, when we know it. V8 takes any count
+/// it is given, so an explicit request is the figure; with no request V8 sizes
+/// its own pool and there is no way to ask it, which is what an empty answer
+/// means.
+std::optional<uint32_t> g_workerThreads;  // NOLINT(*-avoid-non-const-global-variables)
+
+/// V8 running out of memory, for one isolate. Installed with the owning
+/// `ub::Isolate` as its data, so the report names a heap without having to ask
+/// the thread.
+///
+/// **V8 does not come back from this**, whatever the callback does: the engine
+/// calls it and then ends the process, which is why the header tells an
+/// embedder to write a handler that is correct if the next line never runs.
+void OnIsolateOutOfMemory(const char* location, const v8::OOMDetails& details, void* data) {
+    // A literal either way, so the distinction costs nothing to carry and an
+    // embedder can tell "the JavaScript heap filled up" from "the process
+    // could not get memory at all", which are different problems.
+    const char* what = "the process is out of memory";
+    if (details.detail != nullptr) {
+        what = details.detail;
+    } else if (details.is_heap_oom) {
+        what = "the JavaScript heap is out of memory";
+    }
+    ReportEngineFault(EngineFault::OutOfMemory, static_cast<Isolate*>(data), location, what);
+}
+
+/// An API misuse V8 detected. Per-isolate.
+///
+/// **It ends the process, and that is the point of doing it here.** V8's own
+/// behaviour with no handler installed is to print and abort; its behaviour
+/// *with* one is to call it, mark the isolate as having had a fatal error, and
+/// carry on - so a backend that simply reported and returned would have made
+/// installing a handler change whether the program survives, which is the last
+/// thing a diagnostic hook should do. Reported first, aborted second, and
+/// `EngineFault::Fatal` therefore means one thing rather than two.
+[[noreturn]] void OnIsolateFatalError(const char* location, const char* message) {
+    ReportEngineFault(EngineFault::Fatal, g_threadIsolate, location, message);
+    std::abort();
+}
+
+/// A failed internal check, anywhere in the process. It names a file and a line
+/// rather than an isolate, so the isolate - if there is one - comes from the
+/// thread, which one isolate per thread makes an honest answer.
+///
+/// Aborts afterwards for the same reason as the hook above, and for one more:
+/// whether V8 itself would abort after dispatching this is a detail of how the
+/// hook is wired rather than something the header can promise, and a failed
+/// internal check that *returns* carries on with an engine that has already
+/// said it cannot.
+[[noreturn]] void OnProcessFatalError(const char* file, int line, const char* message) {
+    // Formatted into a stack buffer: this is the fatal path, and an allocation
+    // here is the one thing the fault contract forbids.
+    std::array<char, 256> where{};
+    std::snprintf(where.data(), where.size(), "%s:%d", file == nullptr ? "<unknown>" : file, line);
+    ReportEngineFault(EngineFault::Fatal, g_threadIsolate, where.data(), message);
+    std::abort();
+}
+
+/// What V8 hands its near-heap-limit callback: one pointer, and we need the
+/// isolate, the embedder's callback and the embedder's data.
+size_t OnNearHeapLimit(void* data, size_t currentLimit, size_t initialLimit) {
+    auto* isolate = static_cast<Isolate*>(data);
+    if (isolate == nullptr || isolate->impl().heapLimitCallback == nullptr) {
+        return currentLimit;
+    }
+    const size_t answer =
+        isolate->impl().heapLimitCallback(*isolate, currentLimit, initialLimit, isolate->impl().heapLimitData);
+    // Clamped rather than trusted: a handler that answers with something below
+    // the current ceiling means "leave it", and lowering a heap's limit while
+    // it is already at that limit is not a thing this API offers a way to ask
+    // for by accident.
+    return answer < currentLimit ? currentLimit : answer;
+}
+
+}  // namespace
+
+Platform::Platform(const PlatformOptions& options) {
+    assert(!g_initialized && "a Platform already exists");
+    // First, and before anything that could fail: these are what a failure
+    // during the rest of this constructor would be reported through, and V8's
+    // process-level handler is documented as state to install before the engine
+    // comes up.
+    g_faultHandler = options.onEngineFault;
+    g_faultData = options.engineFaultData;
+    if (g_faultHandler != nullptr) {
+        // Only when there is somewhere to send it. With no handler V8's own
+        // behaviour - a message on stderr and an abort - is what an embedder
+        // asked for by not asking for anything.
+        v8::V8::SetFatalErrorHandler(&OnProcessFatalError);
+    }
+    // The embedder's flags go first: they are the process's command line and
+    // ours are the ones the library needs regardless.
+    if (!options.engineFlags.empty()) {
+        const std::string flags(options.engineFlags);
+        v8::V8::SetFlagsFromString(flags.c_str());
+    }
+    // --expose-gc is what makes Isolate::RequestGarbageCollection mean
+    // anything; lifetime tests need it and it costs nothing otherwise.
+    v8::V8::SetFlagsFromString("--expose-gc");
+    // A code-cache blob is only checksummed on consume when this is on, and it
+    // is off in a release build. unibind/script.h's framing already refuses a blob
+    // that is not one, so this is the engine's own scale of the same check
+    // rather than the whole of it - and it is a hash per consume, which is
+    // nothing beside the compile it is avoiding.
+    v8::V8::SetFlagsFromString("--verify-snapshot-checksum");
+
+    int threads = 0;  // V8's "decide for yourself"
+    if (options.workerThreads) {
+        threads = static_cast<int>(*options.workerThreads);
+        if (threads == 0) {
+            // A pool size of zero on its own only stops the *platform* posting
+            // work; this is what stops V8 wanting to.
+            v8::V8::SetFlagsFromString("--single-threaded");
+        }
+        g_workerThreads = static_cast<uint32_t>(threads);
+    }
+    g_platform = v8::platform::NewDefaultPlatform(threads);
+    if (!g_platform) {
+        return;  // IsInitialized() stays false; see unibind/isolate.h
+    }
+    v8::V8::InitializePlatform(g_platform.get());
+    // Both of these report failure, and a constructor has nowhere to put it, so
+    // the answer is the one the header documents: leave IsInitialized() false
+    // and let every Isolate::New refuse. Unwinding what did come up first, so
+    // that a failed Platform is an object that did nothing rather than one that
+    // did half of it.
+    if (!v8::V8::Initialize()) {
+        v8::V8::DisposePlatform();
+        g_platform.reset();
+        return;
+    }
+    g_initialized = true;
+}
+
+Platform::~Platform() {
+    // A Platform whose bring-up failed already unwound itself, so there is
+    // nothing here to take down and disposing anyway would be disposing what
+    // was never initialised.
+    if (!g_initialized) {
+        g_workerThreads.reset();
+        g_faultHandler = nullptr;
+        g_faultData = CallbackData{};
+        return;
+    }
+    // Both report failure, and the order matters more than the report: a
+    // platform disposed under a V8 that would not go down is a pointer the
+    // engine still holds into something that no longer exists. So a refused
+    // `Dispose` leaves the platform up and owned - deliberately leaked, which
+    // is the smaller of the two wrongs - and only says that this process has
+    // no initialised engine any more.
+    if (!v8::V8::Dispose()) {
+        g_workerThreads.reset();
+        g_initialized = false;
+        (void)g_platform.release();
+        // Left armed on purpose: the engine is still up and can still fault,
+        // and this is the one path where a Platform that has been destroyed
+        // has not taken V8 down with it.
+        return;
+    }
+    v8::V8::DisposePlatform();
+    g_platform.reset();
+    // The thread count described *this* platform. Leaving it behind would have
+    // WorkerThreads() report a figure for a platform that no longer exists,
+    // where the header promises what is actually in effect.
+    g_workerThreads.reset();
+    g_initialized = false;
+    // Last, because everything above could still have faulted. The handler
+    // belongs to this Platform and the next one brings its own.
+    g_faultHandler = nullptr;
+    g_faultData = CallbackData{};
+}
+
+bool Platform::IsInitialized() noexcept {
+    return g_initialized;
+}
+
+std::optional<uint32_t> Platform::WorkerThreads() noexcept {
+    // Belt and braces with the reset in ~Platform: with no platform up there is
+    // no count in effect, whatever was asked for last time.
+    if (!g_initialized) {
+        return std::nullopt;
+    }
+    return g_workerThreads;
+}
+
+std::string_view Platform::BackendName() noexcept {
+    return "v8";
+}
+
+std::string_view Platform::BackendVersion() noexcept {
+    // A literal in V8's own binary, so there is nothing to build or own.
+    return v8::V8::GetVersion();
+}
+
+std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
+    if (!Platform::IsInitialized()) {
+        return nullptr;
+    }
+    if (g_threadIsolate != nullptr) {
+        return nullptr;  // one per thread; see unibind/isolate.h
+    }
+    // Nothrow, because the header promises an empty answer and never a crash
+    // when a heap cannot be made - and running out of memory is one of the ways
+    // it cannot. A `make_unique` here would throw `std::bad_alloc` out of a
+    // function that says it returns empty instead, before V8 is even reached.
+    std::unique_ptr<Impl> impl(new (std::nothrow) Impl());
+    if (!impl) {
+        return nullptr;
+    }
+    impl->allocator.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    if (!impl->allocator) {
+        return nullptr;
+    }
+
+    v8::Isolate::CreateParams params;
+    params.array_buffer_allocator = impl->allocator.get();
+    if (options.heapLimitBytes != 0) {
+        params.constraints.ConfigureDefaultsFromHeapSize(0, options.heapLimitBytes);
+    }
+    impl->isolate = v8::Isolate::New(params);
+    if (impl->isolate == nullptr) {
+        return nullptr;
+    }
+    impl->isolate->Enter();
+    // The engines disagree on when a job queue drains itself - V8's default
+    // policy runs microtasks when a call returns, SpiderMonkey's never does -
+    // and when a promise continuation runs is something a script can see. So
+    // the pump is taken away from both and given to Isolate::PumpJobs.
+    impl->isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+    // What makes v8::Exception::GetStackTrace answer at all: without it an
+    // Error carries its `stack` string and no structured trace, and
+    // TryCatch::StackFrames would have nothing to read. It attaches a trace to
+    // Error objects, not to a thrown primitive, which is exactly the line
+    // unibind/exception.h draws.
+    impl->isolate->SetCaptureStackTraceForUncaughtExceptions(true, 64, v8::StackTrace::kDetailed);
+    if (options.stackLimitBytes != 0) {
+        // V8 wants the address of the lowest usable stack slot, and this thread
+        // is the isolate's thread, so here is as good a datum as exists.
+        const char here = 0;
+        const auto top = reinterpret_cast<uintptr_t>(&here);
+        if (top > options.stackLimitBytes) {
+            impl->isolate->SetStackLimit(top - options.stackLimitBytes);
+        }
+    }
+
+    std::unique_ptr<Isolate> isolate(new (std::nothrow) Isolate(std::move(impl)));
+    // NOLINTBEGIN(bugprone-use-after-move) - on failure the ctor never ran, so the move never happened
+    if (!isolate) {
+        // The constructor never ran, so `impl` still holds the v8::Isolate and
+        // nothing owns it: ~Isolate is what disposes one, and there is no
+        // Isolate. Take it down here or it stays entered on this thread.
+        impl->isolate->Exit();
+        impl->isolate->Dispose();
+        return nullptr;
+    }
+    // NOLINTEND(bugprone-use-after-move)
+    isolate->impl().self = isolate.get();
+    isolate->impl().isolate->SetData(ISOLATE_SLOT, isolate.get());
+    g_threadIsolate = isolate.get();
+    // Here rather than earlier because both want the owning ub::Isolate, which
+    // does not exist until the line above. The cost is that a failure inside
+    // `v8::Isolate::New` itself reports no isolate - which is honest, because
+    // at that point there is not one.
+    if (g_faultHandler != nullptr) {
+        isolate->impl().isolate->SetOOMErrorHandler(&OnIsolateOutOfMemory, isolate.get());
+        isolate->impl().isolate->SetFatalErrorHandler(&OnIsolateFatalError);
+    }
+    return isolate;
+}
+
+Isolate::Isolate(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+Isolate::~Isolate() {
+    if (g_threadIsolate == this) {
+        g_threadIsolate = nullptr;
+    }
+    // V8 does not promise to run a weak callback before an isolate goes away,
+    // so any box whose finalizer never ran is destroyed here. That is what
+    // makes "the engine gives back every share it took, exactly once, by the
+    // time its isolate is gone" a rule rather than a hope, and it is the only
+    // reason a finalizer parity test between two backends can be written. A
+    // native the embedder still co-owns outlives this, on purpose.
+    for (auto& entry : impl_->liveNatives) {
+        detail::DestroyNative(*entry.second);
+    }
+    impl_->liveNatives.clear();
+
+    // Everything the isolate owns that holds a v8::Global has to let go while
+    // the isolate is still alive: resetting one after Dispose is undefined, and
+    // impl_ is destroyed after this body runs.
+    impl_->classes.clear();
+    impl_->templates.clear();
+    impl_->accessors.clear();
+    // Callback records outlive nothing: the isolate is going, so anything that
+    // could still reach them is going too.
+    impl_->callbacks.clear();
+#if UNIBIND_HANDLE_CHECKS
+    // The rule in unibind/isolate.h, diagnosed where it is broken rather than
+    // at the crash it causes later: a Context, a Script or a Global<T> the
+    // *embedder* is still holding is memory this isolate can never give back,
+    // and the release, when it comes, resets an engine handle against an
+    // isolate that has been disposed.
+    //
+    // Here rather than at the top of this function, because everything above
+    // legitimately gives some of these back: a native the isolate destroys may
+    // itself own a realm and a root, and a sandbox does exactly that. What is
+    // left at this line is what nothing but the embedder holds.
+    assert(impl_->embedderRefs == 0 && "a Context, Script or Global outlived its Isolate");
+#endif
+    impl_->isolate->Exit();
+    impl_->isolate->Dispose();
+}
+
+bool Isolate::HasPendingException() const noexcept {
+    return impl_->isolate->HasPendingException();
+}
+
+void Isolate::ThrowError(ErrorKind kind, std::string_view message) {
+    detail::ThrowError(*this, kind, message);
+}
+
+HeapStatistics Isolate::GetHeapStatistics() const noexcept {
+    v8::HeapStatistics stats;
+    impl_->isolate->GetHeapStatistics(&stats);
+    return HeapStatistics{.usedBytes = stats.used_heap_size(),
+                          .totalBytes = stats.total_heap_size(),
+                          .limitBytes = stats.heap_size_limit()};
+}
+
+void Isolate::RequestGarbageCollection() noexcept {
+    impl_->isolate->RequestGarbageCollectionForTesting(v8::Isolate::kFullGarbageCollection);
+}
+
+void Isolate::SetHeapLimitCallback(HeapLimitCallback callback, CallbackData data) noexcept {
+    impl_->heapLimitCallback = callback;
+    impl_->heapLimitData = data;
+    if (callback != nullptr) {
+        if (!impl_->heapLimitArmed) {
+            impl_->isolate->AddNearHeapLimitCallback(&OnNearHeapLimit, this);
+            impl_->heapLimitArmed = true;
+        }
+        return;
+    }
+    if (impl_->heapLimitArmed) {
+        // Zero, so that whatever ceiling a handler raised the heap to stays
+        // where it is. V8 reads the second argument as "and put the limit back
+        // to this", and putting it back below the live set is how removing a
+        // callback turns into an out-of-memory that nobody asked for.
+        impl_->isolate->RemoveNearHeapLimitCallback(&OnNearHeapLimit, 0);
+        impl_->heapLimitArmed = false;
+    }
+}
+
+void Isolate::TerminateExecution() noexcept {
+    impl_->terminating.store(true, std::memory_order_release);
+    impl_->isolate->TerminateExecution();
+}
+
+bool Isolate::IsExecutionTerminating() const noexcept {
+    return impl_->terminating.load(std::memory_order_acquire) || impl_->isolate->IsExecutionTerminating();
+}
+
+void Isolate::CancelTerminateExecution() noexcept {
+    impl_->terminating.store(false, std::memory_order_release);
+    impl_->isolate->CancelTerminateExecution();
+}
+
+namespace {
+
+/// One request, one callback: V8 dispatches an interrupt per RequestInterrupt,
+/// and its list is FIFO, so taking the front of ours keeps the two in step.
+void InterruptTrampoline(v8::Isolate* raw, void* data) {
+    auto* isolate = static_cast<Isolate*>(data);
+    InterruptCallback callback = nullptr;
+    CallbackData payload;
+    {
+        const std::scoped_lock guard(isolate->impl().work);
+        if (isolate->impl().interrupts.empty()) {
+            return;
+        }
+        std::tie(callback, payload) = isolate->impl().interrupts.front();
+        isolate->impl().interrupts.pop_front();
+    }
+    // V8 has already opened a HandleScope and an external VM state for us, and
+    // the contract in unibind/isolate.h forbids the callback running script - so
+    // there is nothing to set up and nothing to catch.
+    (void)raw;
+    callback(*isolate, payload);
+}
+
+}  // namespace
+
+void Isolate::RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept {
+    if (callback == nullptr) {
+        return;
+    }
+    {
+        const std::scoped_lock guard(impl_->work);
+        impl_->interrupts.emplace_back(callback, data);
+    }
+    impl_->isolate->RequestInterrupt(&InterruptTrampoline, this);
+}
+
+void Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
+    if (callback == nullptr) {
+        return;
+    }
+    const std::scoped_lock guard(impl_->work);
+    impl_->jobs.emplace_back(callback, data);
+}
+
+void Isolate::PumpJobs() {
+    // Engine jobs, then posted work, then round again - so a job that settles a
+    // promise sees its continuations in the same pump. A termination stops the
+    // whole thing without emptying either queue: cancel it and pump again.
+    while (!IsExecutionTerminating()) {
+        impl_->isolate->PerformMicrotaskCheckpoint();
+
+        JobCallback callback = nullptr;
+        CallbackData payload;
+        {
+            const std::scoped_lock guard(impl_->work);
+            if (impl_->jobs.empty()) {
+                return;
+            }
+            std::tie(callback, payload) = impl_->jobs.front();
+            impl_->jobs.pop_front();
+        }
+        // A pump is not a call and has nowhere to put an exception, so anything
+        // a job leaves pending stops here rather than surfacing in whatever the
+        // script thread does next.
+        TryCatch caught(*this);
+        callback(*this, payload);
+    }
+}
+
+void Isolate::StoreEmbedderData(CallbackData data) noexcept {
+    impl_->embedder = data;
+}
+
+CallbackData Isolate::LoadEmbedderData() const noexcept {
+    return impl_->embedder;
+}
+
+std::optional<Context> Context::New(Isolate& isolate) {
+    detail::ContextRec* rec = detail::NewContext(isolate);
+    if (rec == nullptr) {
+        return std::nullopt;
+    }
+    return Context(rec);
+}
+
+}  // namespace ub

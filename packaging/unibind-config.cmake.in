@@ -1,0 +1,109 @@
+# find_package(unibind)
+#
+# Gives you three things:
+#
+#   unibind::headers          the public headers and the generated config.h.
+#                             Backend-neutral: the same set whichever engine you
+#                             end up linking.
+#   unibind::backend_<name>   one engine, as a link input. One per backend this
+#                             prefix holds.
+#   unibind::unibind          the headers plus one backend, which is what a
+#                             program that links one engine wants.
+#
+# A prefix may hold more than one backend, so this file picks the one
+# `unibind::unibind` means:
+#
+#   find_package(unibind)                          # the only one installed, or v8
+#   find_package(unibind COMPONENTS spidermonkey)  # by name
+#   set(UNIBIND_BACKEND spidermonkey)              # or by variable, before the find
+#
+# **Asking for more than one is allowed**, and it is what the single-compile
+# promise is for: the headers carry no engine identity, so a consumer compiles
+# their objects once and links them once per backend.
+#
+#   find_package(unibind REQUIRED COMPONENTS v8 spidermonkey)
+#   add_library(app_objects OBJECT app.cpp)
+#   target_link_libraries(app_objects PRIVATE unibind::headers)
+#   add_executable(app_v8 $<TARGET_OBJECTS:app_objects>)
+#   target_link_libraries(app_v8 PRIVATE unibind::backend_v8)
+#
+# One *program* still links one engine: two of them in one executable is two
+# copies of every engine symbol. `unibind::unibind` is the first component
+# asked for, so a consumer who wants only one need never say any of this.
+#
+# This file is written by the install and is identical whichever build tree
+# wrote it; the per-backend half is unibind-backend-<name>.cmake beside it.
+
+file(GLOB _unibind_backend_files "${CMAKE_CURRENT_LIST_DIR}/unibind-backend-*.cmake")
+set(_unibind_available "")
+foreach(_unibind_file IN LISTS _unibind_backend_files)
+    get_filename_component(_unibind_name "${_unibind_file}" NAME_WE)
+    string(REPLACE "unibind-backend-" "" _unibind_name "${_unibind_name}")
+    list(APPEND _unibind_available "${_unibind_name}")
+endforeach()
+
+if(NOT _unibind_available)
+    set(unibind_FOUND FALSE)
+    set(unibind_NOT_FOUND_MESSAGE "unibind: no backend is installed in ${CMAKE_CURRENT_LIST_DIR}")
+    return()
+endif()
+
+set(_unibind_wanted "")
+if(unibind_FIND_COMPONENTS)
+    set(_unibind_wanted "${unibind_FIND_COMPONENTS}")
+elseif(DEFINED UNIBIND_BACKEND)
+    set(_unibind_wanted "${UNIBIND_BACKEND}")
+elseif("v8" IN_LIST _unibind_available)
+    set(_unibind_wanted "v8")
+else()
+    list(GET _unibind_available 0 _unibind_wanted)
+endif()
+
+foreach(_unibind_one IN LISTS _unibind_wanted)
+    if(NOT "${_unibind_one}" IN_LIST _unibind_available)
+        set(unibind_FOUND FALSE)
+        set(unibind_NOT_FOUND_MESSAGE
+            "unibind: this prefix holds the backend(s) '${_unibind_available}', not '${_unibind_one}'")
+        return()
+    endif()
+endforeach()
+
+# The headers, once. They describe the architecture and the handle layout and
+# nothing about an engine, so there is one copy in the prefix and one target
+# here however many backends are installed beside it.
+if(NOT TARGET unibind::headers)
+    set(_unibind_prefix "${CMAKE_CURRENT_LIST_DIR}/../../..")
+    get_filename_component(_unibind_prefix "${_unibind_prefix}" ABSOLUTE)
+    add_library(unibind::headers INTERFACE IMPORTED)
+    set_target_properties(unibind::headers PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${_unibind_prefix}/@UNIBIND_INSTALL_INCLUDE_DIR@"
+        INTERFACE_COMPILE_FEATURES "cxx_std_23")
+    unset(_unibind_prefix)
+endif()
+
+foreach(_unibind_one IN LISTS _unibind_wanted)
+    if(NOT TARGET unibind::backend_${_unibind_one})
+        include("${CMAKE_CURRENT_LIST_DIR}/unibind-backend-${_unibind_one}.cmake")
+    endif()
+endforeach()
+
+# `unibind::unibind` is the first backend asked for, and it is bound once: a
+# later find_package in the same scope adds targets but does not re-point this
+# one, because something may already be linking it. `UNIBIND_BACKEND` names
+# whichever one it is.
+if(NOT TARGET unibind::unibind)
+    list(GET _unibind_wanted 0 UNIBIND_BACKEND)
+    add_library(unibind::unibind INTERFACE IMPORTED)
+    set_target_properties(unibind::unibind PROPERTIES
+        INTERFACE_LINK_LIBRARIES "unibind::backend_${UNIBIND_BACKEND}")
+endif()
+
+set(UNIBIND_AVAILABLE_BACKENDS "${_unibind_available}")
+set(unibind_FOUND TRUE)
+
+unset(_unibind_available)
+unset(_unibind_backend_files)
+unset(_unibind_file)
+unset(_unibind_name)
+unset(_unibind_one)
+unset(_unibind_wanted)

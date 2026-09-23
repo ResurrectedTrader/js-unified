@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A consumer of unibind, as a plain MSBuild C++ project.
+
+  Everything unibind needs is the one <Import> in the PropertySheets group below.
+  The rest of this file is what any ClangCL project would say anyway: the
+  static CRT and a recent enough language standard.
+
+      msbuild examples\embed\embed.vcxproj /p:Configuration=Release /p:Platform=Win32
+              /p:UnibindPrefix=C:\path\to\unibind-prefix\ /m:1
+
+  UnibindPrefix must end in a backslash. UnibindBackend picks the backend when the
+  prefix holds more than one; it defaults to whatever that prefix was installed
+  from. The Platform must be the one the prefix was installed for - Win32 for
+  an x86 prefix, x64 for an x64 one - and unibind.props says so if it is not.
+-->
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6E1B4C9D-4A5F-4F1E-9E2C-6B0D5C7A1E42}</ProjectGuid>
+    <RootNamespace>embed</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <!--
+      64-bit host tools, and this is load-bearing rather than a preference. An
+      x86 project defaults to the 32-bit LLVM in VC\Tools\Llvm\bin, and a
+      32-bit lld-link cannot get through the engine's archive - V8's monolith
+      alone is 1.2 GB. It does not say so: it reports every engine symbol as
+      undefined, as though the library had not been passed at all. unibind.props
+      checks this, but it can only check it - the property has to be set here,
+      before Microsoft.Cpp.props picks the toolchain. An x64 project would get
+      the 64-bit tools anyway; it is set unconditionally because the value that
+      is wrong is the one nobody wrote down.
+    -->
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+    <!-- Where unibind was installed. Override on the command line. -->
+    <UnibindPrefix Condition="'$(UnibindPrefix)' == ''">$(MSBuildThisFileDirectory)..\..\build\install\</UnibindPrefix>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>ClangCL</PlatformToolset>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)' != 'Debug'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)' != 'Debug'">false</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="PropertySheets">
+    <!-- This is the whole of consuming unibind. -->
+    <Import Project="$(UnibindPrefix)msbuild\unibind.props" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <!-- Under the repository's build/ tree, which is where build output belongs. -->
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\example-msbuild\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\example-msbuild\obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <!-- The prebuilt engines link the static CRT, so this project must too. -->
+      <RuntimeLibrary Condition="'$(Configuration)' == 'Debug'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)' != 'Debug'">MultiThreaded</RuntimeLibrary>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level3</WarningLevel>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

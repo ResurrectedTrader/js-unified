@@ -1,0 +1,22 @@
+# The suite's own set: the root one, minus the check doctest defeats.
+InheritParentConfig: true
+
+Checks: >
+  -bugprone-unchecked-optional-access
+
+# bugprone-unchecked-optional-access
+#   230 findings, all of one shape:
+#
+#       auto object = ub::Object::New(fixture.context);
+#       REQUIRE(object.has_value());
+#       ... object->Set(...)
+#
+#   `REQUIRE` aborts the case when it fails, so the access below it is checked -
+#   but the check models `std::optional` and not doctest, sees a macro it cannot
+#   reason about, and reports every dereference in the suite. The alternative is
+#   rewriting several hundred assertions into a form that satisfies a dataflow
+#   analysis rather than a reader, which is a worse suite.
+#
+#   Off for `tests/` alone. The same check over the library's own sources - where
+#   every one of these operations returns an optional and an unchecked one really
+#   would be a bug - stays on.

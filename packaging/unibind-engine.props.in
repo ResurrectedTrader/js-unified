@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Where the @UNIBIND_BACKEND@ engine was when this prefix was built.
+
+  One fragment per backend, imported by a wildcard from unibind.props, for the
+  same reason find_package globs unibind-backend-*.cmake: a prefix may hold
+  more than one backend, each installed by a build tree that knows only its own
+  engine's path. A single file written by whichever tree installed last would
+  carry that one and blank the other.
+
+  A consumer who sets the property themselves keeps it - this is a default.
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="unibind engine default (@UNIBIND_BACKEND@)">
+    <@UNIBIND_MSBUILD_ENGINE_DIR_PROP@ Condition="'$(@UNIBIND_MSBUILD_ENGINE_DIR_PROP@)' == ''">@UNIBIND_ENGINE_DIR@</@UNIBIND_MSBUILD_ENGINE_DIR_PROP@>
+  </PropertyGroup>
+</Project>

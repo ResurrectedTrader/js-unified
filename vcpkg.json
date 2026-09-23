@@ -1,0 +1,8 @@
+{
+  "name": "unibind",
+  "version-string": "0.1.0",
+  "description": "One embedding API over several JavaScript engines",
+  "dependencies": [
+    "doctest"
+  ]
+}

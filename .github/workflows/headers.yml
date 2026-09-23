@@ -1,0 +1,50 @@
+# The one rule the whole design rests on, checked on every push.
+#
+# The other two workflows fetch an engine and run the suite against it; this one
+# deliberately has no engine anywhere. `tools/headers_only` builds every header
+# under include/unibind on its own, with no engine include directory on the command
+# line, and instantiates the template surface that a bare #include would barely
+# parse. A public header that reaches an engine header - directly or
+# transitively - fails here, in a job that needs nothing but a compiler and
+# finishes in a minute, rather than in one that has downloaded a quarter of a
+# gigabyte first.
+#
+# It compiles the headers twice, with UNIBIND_HANDLE_CHECKS on and off, because that
+# macro changes the layout of Local<T> and is the only thing in the public
+# headers that is conditional at all.
+#
+# ClangCL rather than the default toolset: the tree is built with clang-cl, and
+# MSVC's own cl.exe does not accept these headers today - it instantiates
+# std::optional<Local<T>> while Local<T> is still being defined and reports
+# C7637. That is a real limit of the library, not of this workflow, so the
+# workflow pins the toolchain the library supports rather than hiding it.
+#
+# The image and the generator are pinned for the reason the engine jobs give at
+# length: `windows-latest` is Visual Studio 2026 now, and a toolchain that moves
+# on its own is a toolchain nobody decided on. The canary in v8.yml is what
+# reports that the ground has moved.
+
+name: headers
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  headers-only:
+    name: public headers compile with no engine in sight
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S tools/headers_only -B build/headers
+          -G "Visual Studio 17 2022" -T ClangCL
+
+      - name: Compile every public header, alone, both ways
+        run: cmake --build build/headers --config Release

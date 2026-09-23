@@ -1,0 +1,16 @@
+# Checked with clang-format 19.1.5. Run it, do not hand-format.
+#
+# AccessModifierOffset is -1 rather than Google's -3 because IndentWidth is 4
+# here and Google's is 2: the intent is "an access label sits one level left of
+# the members it introduces", which is -1 of a 4-wide indent and was -3 of a
+# 2-wide one. The tree was already written this way; -3 was the number copied
+# across without the indent width that gave it meaning, and clang-format 19
+# stopped agreeing with it.
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -1
+AllowShortFunctionsOnASingleLine: Inline
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: CaseSensitive

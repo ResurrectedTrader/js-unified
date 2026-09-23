@@ -1,0 +1,43 @@
+# Engine builds. Multi-gigabyte prebuilt artifacts, unpacked or pointed at
+# locally: SpiderMonkey's spidermonkey.lib alone is 629 MB and V8's monolith is
+# larger. Nothing under dependencies/ is ever committed except the prose that
+# says where to get them, and the rule is written as "ignore the directory" so
+# that a third engine is covered the day it appears.
+/dependencies/*
+!/dependencies/README.md
+
+# Build output
+/build/
+/out/
+[Dd]ebug/
+[Rr]elease/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.tlog
+
+# Downloaded archives (an engine release, usually)
+*.zip
+*.7z
+*.tar.gz
+*.tar.xz
+
+# vcpkg
+/vcpkg_installed/
+
+# Editors and IDEs
+/.vs/
+/.idea/
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+
+# CMake user presets: where the paths that name one machine belong
+CMakeUserPresets.json

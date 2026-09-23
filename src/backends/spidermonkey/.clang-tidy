@@ -1,0 +1,24 @@
+# This backend's set: the root one, minus two path-sensitive analyzer checkers.
+InheritParentConfig: true
+
+Checks: >
+  -clang-analyzer-core.NullDereference,
+  -clang-analyzer-cplusplus.NewDelete
+
+# Both fire *inside SpiderMonkey's own headers*, on paths that only start here.
+#
+#   * `core.NullDereference` reports `MOZ_REALLY_CRASH`, which is a deliberate
+#     write through a null pointer - Mozilla's idiom for crashing on a failed
+#     `MOZ_RELEASE_ASSERT`. The analyzer explores the branch where an assertion
+#     in `BufferList::WriteBytes` fails and then reports the crash macro as the
+#     bug.
+#   * `cplusplus.NewDelete` reports `mozilla/cxxalloc.h`, the engine's own
+#     allocation shim.
+#
+# Neither is ours, and neither can be answered where it is reported. The engine
+# include directory is marked SYSTEM so nothing in it is linted, but a
+# *path-sensitive* report is anchored wherever the path ends: clang-tidy keeps
+# the whole report because earlier steps of it are in this file, and no header
+# filter or `NOLINT` can reach the line it points at. Turning the two checkers
+# off here is the narrowest thing that works - the V8 backend, the suite and the
+# public headers all keep them.

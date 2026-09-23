@@ -1,0 +1,740 @@
+# Testing, and where the engines differ
+
+How the suite is built and run is in [`tests/README.md`](../tests/README.md).
+This file is the other half: the places where the two engines do not agree, and
+what the suite asserts instead.
+
+One rule governs the whole of it: **where the engines genuinely differ, the test
+asserts the shape and the difference is written down here.** A test that
+branches on `Platform::BackendName()` would be a bug, so none does - a
+difference either becomes a portable assertion, or it becomes an entry below.
+Nothing is allowed to be neither. `Platform::BackendVersion()` is under the
+same rule and one step stronger: its *shape* is the engine's own and is not
+promised at all, so the suite asserts only that there is one and prints what it
+says.
+
+## Running clang-tidy
+
+Reading the tree takes about a minute; the awkward part is that there is nothing
+to read it *with* until you make one.
+
+**The Visual Studio generator writes no `compile_commands.json`**, so clang-tidy
+has no idea what defines, include paths and standard a file is compiled with -
+and an engine header without its defines does not even parse. The `tidy-v8` and
+`tidy-spidermonkey` presets exist for that and nothing else: Ninja, the same
+ClangCL toolchain, the same flags, and nothing linked. They are x64, because
+Ninja has no `-A` and clang-cl targets the host; nothing clang-tidy reports
+depends on the architecture.
+
+```powershell
+$env:VCPKG_ROOT = '<your vcpkg>'
+cmake --preset tidy-v8
+# The suite includes a header the build generates by asking the backend library
+# what it defines, so that header has to exist before any test file will parse.
+cmake --build build/tidy-v8 --target tests/generated/unibind_test_capabilities.h
+python "<VS>\VC\Tools\Llvm\x64\bin\run-clang-tidy" -p build/tidy-v8 -quiet
+```
+
+`run-clang-tidy` is LLVM's own parallel driver and lives beside `clang-tidy.exe`
+in the ClangCL toolset. It uses every core by default, which is what takes the
+whole tree - both backends, the public headers, the suite, the benchmark and
+the headers-only tool - from a single-threaded afternoon to about a minute.
+
+Two things to get right, both of which fail quietly rather than loudly:
+
+- **Run it from the repository root.** clang-tidy decides whether a diagnostic
+  is in one of *our* headers by matching `HeaderFilterRegex` against a path it
+  resolves relative to the working directory. Started somewhere else it still
+  exits zero, having reported a fraction of what it should.
+- **Do not lint the engines.** Both backends mark the engine include directory
+  `SYSTEM`, and `.clang-tidy` excludes `dependencies/`. Without both, a run
+  walks into V8 and SpiderMonkey through every `#include`.
+
+Which checks are on, and why each disabled one is disabled, is in `.clang-tidy`
+itself. Two directories narrow it further and say why in the same way:
+`tests/`, because doctest's `REQUIRE` defeats the optional-access check, and
+`src/backends/spidermonkey/`, because two path-sensitive analyzer checks end up
+pointing inside SpiderMonkey's own crash macro.
+
+## What the suite covers
+
+| area | file | notes |
+|---|---|---|
+| handle lifetimes | `cases/handles_test.cpp` | `docs/lifetimes.md` section 5, one case per rule: LIFO nesting, copying and storing within a frame, escaping once, sixteen times, and through two frames, `Global` across frames, and frame spill past the inline slots |
+| frame exhaustion | `cases/handles_test.cpp` | rule 9: a frame that cannot grow yields an *empty* handle and reports out of memory - see below for where it can be provoked |
+| roots given back | `cases/handles_test.cpp` | frames and globals, measured through replaced `operator new` |
+| values | `cases/values_test.cpp` | kinds, the narrowing lattice, strict / same-value / loose equality, every coercion, UTF-8 round-trip and truncation, externals |
+| objects | `cases/objects_test.cpp` | get / set / delete / has / hasOwn, own-key filters, prototypes, attributes, arrays |
+| functions | `cases/functions_test.cpp` | arguments, receiver, every `ReturnValue` setter, typed callback data, calling and constructing both directions, reentrancy |
+| exceptions | `cases/exceptions_test.cpp` | throwing values and errors, every `ErrorKind`, nesting, re-throw, reset, a handler that does nothing consuming what it caught, stack shape |
+| scripts | `cases/scripts_test.cpp` | compile once run many, a script outliving its scope, origins in diagnostics |
+| realms | `cases/realms_test.cpp` | separate globals, values crossing, `instanceof` not crossing, nesting, refcounting. A value *works* in any realm of its isolate and that is asserted; its *identity* seen from a foreign realm is not guaranteed, because an engine that wraps hands out a distinct object, so nothing there compares objects across a realm boundary |
+| symbols | `cases/symbols_test.cpp` | identity, description, the registry, the well-known five, symbols as keys |
+| the isolate | `cases/isolate_test.cpp` | the typed embedder pointer, throwing from outside a callback, heap figures, collection requests, one isolate after another, and a second one at once being refused rather than made |
+| templates | `cases/templates_test.cpp` | constants, methods, accessors, nesting, inheritance, `HasInstance`, instantiation into several realms, and the call/construct grid: a template given a callback answers to both and tells them apart, while a method and both halves of an accessor answer to neither `new` |
+| interceptors | `cases/interceptors_test.cpp` | all five named and all five indexed hooks, driven through `in`, `Object.keys`, `getOwnPropertyDescriptor` and `delete` |
+| classes | `cases/classes_test.cpp` | construction, statics, accessors, `Wrap`, checked unwrapping, and finalizers |
+| ownership and destruction | `cases/ownership_test.cpp` | who owns a native and when it is destroyed: exactly once per native and never twice, a native still whole after a collection that spared it, two wrappers over one native, co-ownership with the embedder in both directions, the last reference winning whichever one it is, the no-op-deleter escape hatch, the failure paths that must not leak, an allocation failure walked through *every* step of the hand-over (which is where the double free lived), what a function and an external cost their isolate once they are collected, and that finalizing one instance costs the same however many the isolate has made |
+| a sandbox | `cases/sandbox_test.cpp` | the one composition: a second realm, an interceptor over every property, a `Global` held across calls, and a prototype method that has to survive the interceptor |
+| termination | `cases/termination_test.cpp` | stopping a running script from another thread, telling a stop from a throw, script not being able to catch one, a remembered stop, repeatability, and a blocking native running to completion |
+| stacks | `cases/stacks_test.cpp` | frames off a caught exception and off the running stack, the origin's line offset reaching a diagnostic, and the empty answers |
+| compiled-code caching | `cases/codecache_test.cpp` | a blob accepted, and - the half that matters - a damaged, truncated, foreign or empty one producing an ordinary compile with identical behaviour |
+| binary data and serialization | `cases/binary_test.cpp` | a span in and the same bytes at the same width out, views over part of a buffer, and a value moved to another isolate with equal contents and an identity of its own |
+| roots that name one value | `cases/handles_test.cpp` | `Global` identity: two roots over one object, a duplicate, a root against a `Local`, an empty root equal to nothing including another empty one, and the registry lookup the comparison exists for. The clause that needs **no scope open at all** runs in a process of its own - see below |
+| work that is not a call | `cases/jobs_test.cpp` | promise continuations waiting for `PumpJobs` and for nothing else, `async`/`await`, a chain draining in one pump, posted work ordered and never coalesced, work dropped when the isolate goes, a job's throw stopping at the pump, an interrupt reaching a running script while the job it announced waits for the drain, an interrupt callback making a handle, and a promise the embedder makes, settles, and has settled from a job |
+| the engine in trouble | `cases/faults_test.cpp` | decision 28: running out of memory reaching the embedder's handler with the right kind, the right isolate and its typed data; nothing reported while nothing is wrong (a script's own `throw` included); and, where the engine has the hook, a heap about to hit its ceiling being raised and the script that filled it stopped. See below for the kind that cannot be reached at all |
+| the harness itself | `cases/harness_test.cpp` | that a skipped area is visible rather than absent |
+
+## What it does not cover
+
+- **Threads.** An isolate is single-threaded by contract and nothing tests what
+  happens if that is violated; there is no portable way to observe it. Two heaps
+  at once is two threads (decision 11), so that is untested for the same reason.
+- **A plain call to a template given no callback.** Deliberately unspecified -
+  there is nothing to run - so nothing asserts it either way.
+- **A real heap exhaustion, and `EngineFault::Fatal`.** Both are covered under
+  "What decision 28 can and cannot be asked" below. `heapLimitBytes` is
+  exercised now, but only on the backend that can be asked about it first.
+- **A bring-up that fails.** `Platform::IsInitialized()` is the failure channel
+  and the suite pins that it is *read*, but neither engine can be made to fail
+  bring-up from a test - one segfaults, one dies, and on one the injector never
+  fires at all. Measured, with the numbers, under "A bring-up that fails" below.
+- **Making a `BigInt`.** The tag and the `TypeCode` exist and are asserted
+  against one script made, but no factory does, so native cannot make one.
+- **Stack trace contents beyond frame names.** Format is the engine's; see below.
+- **A `Local` used after its frame closed**, in Release. It is undefined
+  behaviour, so it cannot be a test case among others. A checked (Debug) build
+  diagnoses it, and there is a CTest test expecting exactly that death; Release
+  compiles the assertion out and the test is not registered.
+- **A `Context`, `Script` or `Global<T>` outliving its isolate**, in Release,
+  for the same reason and with the same shape of test in a checked build. See
+  decision 27.
+- **A refcounted third backend.** `docs/lifetimes.md` section 12 describes one;
+  nothing here is written against it, though nothing assumes a tracing collector
+  either except the finalizer timing case, which already reports rather than
+  asserts.
+- **A template cache that stored one half of a pair.** SpiderMonkey materialises
+  a template into a realm as a constructor and a prototype, cached together; if
+  the second store failed the first would still hit, and every later instance in
+  that realm would come out with a null prototype while everything reported
+  success. The fix - a lookup that finds one half and not the other is a cache
+  that cannot be trusted - rests on review, because the store that would have to
+  fail is a `JS_SetProperty` through the *engine's* allocator, which the suite's
+  injector does not reach, and the cache lives in a hidden slot script cannot
+  touch.
+- **An engine that refuses to shut down.** `v8::V8::Dispose()` returns a `bool`
+  that is now checked; nothing can make it answer false from a test.
+- **A native call whose exception could not be taken or wrapped.** Two failures
+  inside SpiderMonkey's `FinishNativeCall`, both fixed and neither reachable:
+  `JS_WrapValue` failing (which used to install the *unwrapped*
+  cross-compartment value as the pending exception, where the catching realm
+  cannot name it) and `StealPendingExceptionStack` failing (which used to
+  return false with nothing pending - this engine's *uncatchable* idiom, the
+  one termination uses, so an ordinary throw became an unwind no `try`/`catch`
+  could see and `HasTerminated()` could not explain). Both fail only by running
+  out of memory inside the engine's own allocator, which the suite's injector
+  does not reach.
+- **An interceptor hook that throws *and* declines**, on the enforcement side.
+  `unibind/template.h` makes it normative that the throw wins, and both
+  backends now answer intercepted when a hook leaves an exception pending -
+  but the case that pins it (`interceptors: a hook that throws has intercepted
+  the access whatever it returned`) passed before that change as well as after,
+  because each engine's own dispatch already stops at the pending exception.
+  The rule is written down and asserted for the backend that does not yet
+  exist; the code that enforces it is belt and braces on the two that do.
+- **An instance that cannot carry a native.** Both backends check that the
+  object a native is about to be attached to has somewhere to put it, and fail
+  the construction rather than writing past the field count (which on V8 is an
+  `ApiCheck`, i.e. an abort). The false branch is unreachable from script: every
+  way script can reach a class constructor - `new Foo()`, `class Sub extends
+  Foo`, `Reflect.construct(Foo, [], Array)` - was measured, and the receiver
+  carries the field in all of them. The check stays because the cost of being
+  wrong about that is the process.
+
+## Where the engines differ
+
+### Error message wording
+
+Both engines put the embedder's own text in the message and wrap it in their
+own decoration. The suite asserts that the text survives
+(`message->find("expected one argument")`), never the whole string.
+
+Where the *kind* of an error matters, the portable question is asked in script -
+`e instanceof TypeError`, `err.constructor.name` - rather than by parsing a
+message.
+
+### Stack trace format
+
+`TryCatch::StackTrace` returns the engine's own format, and the two are not the
+same text. What both do is name the functions on the stack and the script's
+resource name, so `cases/exceptions_test.cpp` asserts that `innerMost`,
+`outerMost` and `trace-test.js` appear in it, and nothing about the layout.
+
+### `This()` and `Holder()` on a property hook
+
+V8 15.6 hands an interceptor only the holder, so on that backend `This()` and
+`Holder()` are the same object inside an interceptor. `unibind/function.h` makes
+that the contract: where an engine offers only one of the pair, the two name the
+same object. The suite asserts the holder is the object carrying the handler,
+and only that the receiver is an object.
+
+An *accessor* is different and is specified: it is installed as a real
+ECMAScript accessor property precisely so that it has a receiver, and
+`templates: an accessor sees the instance as its receiver` asserts that a
+prototype accessor read through an instance finds the instance.
+
+### Finalizer timing
+
+Neither engine promises to collect on request, and they do not collect the same
+things at the same time. What is portable, and what the backends were built to
+guarantee, is the invariant across the whole lifetime:
+
+> the engine gives back every share it took, exactly once, by the time its
+> isolate is gone.
+
+That is deliberately about **shares**, not about natives, and the distinction is
+the point rather than pedantry. Decision 14 separated the wrapper's cell from
+the native it holds a share of, so the guarantee splits in two:
+
+1. Every cell is destroyed exactly once, and all of them by teardown - the half
+   a backend works for, and why an isolate keeps a list of live instances and
+   finishes the survivors as it goes away.
+2. Every native is destroyed exactly once **when its last share goes**, which
+   may be *after* the isolate, because the last share may be the embedder's.
+
+The older single sentence - every native destroyed by the time the isolate is
+gone - forbade in plain terms the case shared ownership exists for, which is why
+the case that used to carry it as a name is now
+`classes: the engine gives back every share it took by the time the isolate is
+gone`. It asserts (1), with half the instances deliberately still rooted at
+teardown; the number destroyed *before* teardown is reported as a message, not
+asserted, because that is the collector's business. `ownership: a native the
+embedder co-owns outlives its wrapper` asserts (2).
+
+### Where frame exhaustion can be provoked from a test
+
+`docs/lifetimes.md` rule 9 - a frame that cannot grow yields an empty handle and
+reports out of memory, never a slot that reads as `undefined` - is asserted by
+`handles: a frame that cannot grow yields an empty handle, not undefined`. The
+suite provokes it by replacing global `operator new` and making exactly one
+allocation fail (`tests/support/allocations.cpp`).
+
+That lever reaches a backend whose frame overflow is an ordinary C++ container
+and does not reach one whose frame grows through the *engine's* allocator. The
+case therefore checks whether an injected failure actually fired: if none did,
+the frame never touched the C++ heap, the case has proved nothing, and it
+reports a skip rather than asserting something it did not observe.
+
+So the rule is asserted where it can be, and the gap is visible where it cannot
+be, instead of the suite quietly claiming coverage it does not have. Closing the
+gap needs a lever the engine's own allocator honours - which is a backend's to
+offer, not a test's to invent.
+
+**On x64 V8 the lever has to be taken rather than asked for.** That monolith
+carries PartitionAlloc's allocator shim, which defines twelve of the twenty
+allocation operators in an object every link pulls in, so the suite's own
+definitions are a duplicate symbol. `tests/cmake/EngineAllocator.cmake` reads
+the archive's symbol index, and where the operators are in it the suite links
+with `/FORCE:MULTIPLE` - its objects are on the command line and the monolith is
+an archive scanned after them, so its definitions win. Nothing is assumed about
+whether that worked: the fired/not-fired check above is exactly the check for
+it, so a configuration where the engine's operators won instead reports skips
+rather than passing quietly.
+
+### Heap statistics
+
+`HeapStatistics` measures different things on the two engines and only
+`usedBytes` is comparable, and only as a trend. Nothing asserts a figure; the
+leak tests count C++ allocations instead, which is a question both engines
+answer the same way because neither of them is the one answering it.
+
+## What the new areas assert, and what they cannot
+
+### Ownership: the questions a passing count would hide
+
+A wrapper owns a *share* of its native (`unibind/class.h`), so a native can be
+named by two wrappers, or by a wrapper and the embedder at once. The failure
+that model makes possible is a use-after-free, and the thing about a
+use-after-free is that a suite counting destructions will happily agree that
+the total came out right - one destroyed twice and one leaked adds up the same
+way. So `tests/support/ownership.h` keeps a registry keyed by an id each native
+carries, and every case asks **per native**: `Deaths(id)`, never just a total.
+
+The cases are deterministic where the collector's are not, and the reason is
+worth copying: the embedder holds a share of its own, so "has the engine given
+its share back yet" is a `use_count()` the test can read rather than a
+destructor it has to wait for. Where a case does depend on the collector - has
+the unreachable wrapper been taken? - it **reports** rather than asserts, and
+says in its message that it proved the weaker thing.
+
+**Which thread a destructor runs on is asserted, not assumed.** Foreground
+finalization is a requirement rather than tidiness: a box's `destroy` drops a
+`std::shared_ptr` whose other holders are the embedder's, so an engine
+finalizing on a helper thread would race them - and a race in a finalizer is
+exactly the failure that does not reproduce, so counting destructions would
+never see it. `ownership: a native is destroyed on the thread that owned its
+isolate` makes the isolate on a thread of its own and records where each
+destructor ran, which is what makes the question sharp: a death on the main
+thread is then as visibly wrong as a death on an engine's helper thread.
+
+What is still not assertable: that the engine releases a share *promptly*.
+Neither engine promises to collect, so "destroyed after both wrappers are gone"
+is asserted as "not destroyed while one remains, and destroyed exactly once by
+the time the isolate is" - which is the strongest portable form of it.
+
+### Termination
+
+The contract these hold the backends to is in `unibind/isolate.h`. Two things about
+it are worth writing down here.
+
+**Only one engine has a terminating state of its own.** On the other, the
+promise that "everything that would run script fails until the termination is
+cancelled" is the *backend's* bookkeeping over an engine whose context is live
+again the moment the unwind finishes. Nothing in that engine objects if the
+bookkeeping drifts, so `termination: a handler does not swallow a stop the way
+it swallows an exception` is what enforces it - and it asserts the half that
+both accounts of the feature agree on: while the handler is open, the isolate is
+still terminating and runs nothing. Whether *closing* the handler also ends the
+stop is the open question listed at the end of this file, so that case reports
+it rather than asserting it, and every other case cancels (a no-op when nothing
+is armed) before carrying on. A decision either way touches one case.
+
+**A native that does not re-enter the engine cannot be interrupted**, on either
+engine: a stop takes effect where the *engine* checks for one, so the spinning
+native finishes. That half is portable and is asserted. *Where* the next check
+is, is not: one engine unwinds at the next statement, and V8 has no check
+between two top-level calls, so the script runs to the end and the stop stays
+armed for whatever runs next. The case reports which happened and asserts only
+that the isolate is usable afterwards.
+
+Not covered: what a stop does to a native callback that is *itself* several
+frames into script when it lands, beyond `IsExecutionTerminating()` being
+readable from one.
+
+### Stacks
+
+Both engines name functions, scripts and lines; nothing else about a stack is
+portable. So the cases assert the frames they *caused* - `innerMost`,
+`outerMost`, the resource name, a line number above zero - and report the rest,
+including how many frames there were and what the outermost one is called.
+`TryCatch::StackTrace` is the engine's own text and is only ever searched for a
+substring.
+
+A thrown value that carries no stack (a string, on both engines) has to answer
+empty rather than hand back a plausible stack belonging to somewhere else; the
+case accepts either an empty optional or an empty vector and reports which,
+because the two are the same thing to a caller.
+
+### Compiled-code caching
+
+Nothing here looks inside a blob, and no blob crosses a backend: a blob is
+opaque bytes belonging to one engine build. What is asserted is the pair of
+outcomes - accepted, or an ordinary compile - and that `UsedCodeCache()` tells
+them apart. The damaged / truncated / foreign / empty cases all assert
+*identical script behaviour*, because that is the failure an embedder never
+sees: blobs silently stop being accepted after an upgrade and the only symptom
+is a slower start.
+
+An engine that declines to produce a blob for the test source reports a skip
+rather than asserting something it did not observe.
+
+### Serialization
+
+A round trip is asserted **within** one backend only, never across, and no case
+compares blob bytes: `unibind/value.h` makes a blob opaque and build-specific, so a
+test that compared two engines' bytes would be asserting something the API
+explicitly does not promise. What crosses backends is the *behaviour*: equal
+contents, distinct identity, refusal for a value that cannot be cloned, and
+refusal for a damaged blob rather than a misreading.
+
+The cross-isolate case is the only place in the suite that makes a second
+isolate, and it does so on a second thread because one isolate per thread is a
+rule (decision 11). The worker thread asserts nothing; it collects plain values
+that the main thread checks after the join, so doctest is never used from two
+threads at once.
+
+### `IsolateOptions`
+
+`stackLimitBytes` is asserted twice over: that runaway recursion becomes a
+`RangeError` rather than a dead process, and - the part that makes it an option
+rather than a comment - that a smaller limit reaches a smaller depth. No
+particular depth is asserted; that is engine tuning.
+
+`heapLimitBytes` used to be unexercised, and the reason was the right one at the
+time: what an engine does at its ceiling is not comparable, and both are allowed
+to abort rather than report - which is not something a case can survive. What
+changed is decision 28, not the argument. `Isolate::SetHeapLimitCallback` gives
+one of the two engines an answer other than aborting, so on that backend the
+option is now asserted for real - a 32 MiB ceiling, a script that fills it, and
+a callback that raises the ceiling and stops the script - and the case ends with
+the isolate evaluating `1 + 1`, which is the assertion that the process is still
+here. On the other backend there is no hook, the case does not link, and it
+reports a skip. Nothing about the ceiling itself is asserted on either: the
+figure the callback is handed is checked only for being non-zero, because V8
+rounds a request of 32 MiB to 26 MiB and that is engine tuning.
+
+### What decision 28 can and cannot be asked
+
+**Out of memory is asserted, and not faked.** The lever is the one rule 9
+already uses - a replaced `operator new` that fails exactly once, at the moment
+a handle frame has to grow - so what the case reports is a real allocation
+failure reaching the backend, not a call to something that pretends. Both
+backends raise `EngineFault::OutOfMemory` there and the report names the right
+isolate, which is why this is a parity row rather than a V8 row. It skips
+wherever that lever does not reach, exactly as the rule 9 case does and for the
+same reason; see "Where frame exhaustion can be provoked from a test" above.
+
+Getting there by two different routes is worth recording, because it is the
+reason the two agree without either backend being bent to it. SpiderMonkey's
+`JS::SetOutOfMemoryCallback` sits under every internal out-of-memory the engine
+has, and the backend was already reporting frame exhaustion through
+`JS_ReportOutOfMemory`, so the fault arrives without the frame code knowing
+anything about faults. V8 has a hook for its *own* heap and nothing that covers
+ours, so that backend raises this one by hand where it already throws. Neither
+is a workaround: each is the natural place in that engine, and the observable
+behaviour is identical.
+
+**A genuine heap exhaustion is still out of reach** and the suite does not
+pretend otherwise. Filling a real heap takes as long as it takes, the result
+differs by engine, and on V8 with no heap-limit callback installed it ends the
+process. What is asserted instead is the thing an embedder can actually do about
+it, which is the ceiling case above.
+
+**`EngineFault::Fatal` has no case at all, and cannot have one.** Reaching it
+means making V8 fail an internal check or detect an API misuse, and every route
+to that from this API is undefined behaviour - the suite would not be provoking
+a fault, it would be corrupting the process and hoping the fault came first. It
+could not be gated into the suite either: the kind ends the process by design
+(see decision 28 for why the backend makes sure of that rather than letting it
+vary), so the case would take every case after it down and the parity matrix
+with them, and unlike the two checked-build deaths there is nothing to *expect*
+except the abort itself. **That `Fatal` is delivered at all rests on review, not
+on a test, and should be read that way** - like the interrupt hook and the
+allocation failure in `Isolate::New` in the section below. What *is* pinned is
+the other half, and it is the half that would bite: `faults: nothing is reported
+while nothing is going wrong` fails if either backend's fatal wiring fired on
+ordinary work, and a script's own `throw` is in that case on purpose, because a
+JavaScript exception arriving on this channel would be the easiest mistake to
+make and the hardest to notice.
+
+**The handler's own rules are held by construction rather than by assertion.**
+It may not allocate, and `ub_test::RecordEngineFault` does not - fixed buffer,
+atomic counter, no `std::string` anywhere near it - which is why the
+out-of-memory case can arm an allocation failure and record the report it
+provokes in the same breath. A handler that allocated would not fail an
+assertion here; it would fail somewhere else, later, which is exactly why the
+rule is written into the header rather than left to be discovered.
+
+## What the undecided areas need before they can be asserted
+
+Written down here rather than left in a commit message, because each one is a
+requirement on the API rather than a test that has not been written yet.
+
+- **`Context` has no control over cross-realm access.** The sandbox works
+  around V8's access check on a foreign global by entering the inner realm in
+  every hook, which is fine - but an embedder who wants two realms to be
+  *mutually* readable (V8's shared security token) cannot ask for it, and an
+  embedder who wants a realm walled off from another cannot ask for that either.
+  Whichever way it is decided, it is currently unexpressible rather than
+  decided, and the workaround only looks like a style choice.
+
+Two entries that used to be here are now answered, and are recorded because the
+answers are what the cases are written against:
+
+- **`workerThreads` is observable.** `Platform::WorkerThreads()` reports the
+  count in effect, so `isolate: what the engine did with the worker-thread hint
+  can be read back` asserts the shape - readable, self-consistent, unchanged by
+  running script - and never a number. Empty means the engine would not say,
+  which is not zero.
+- **A stopped isolate stays stopped.** The two accounts of termination are
+  reconciled: the sticky bit is the *library's*, on both engines, because
+  neither has one that survives the unwind. `termination: a handler does not
+  swallow a stop the way it swallows an exception` now asserts it rather than
+  reporting it, through `Reset`, through the handler closing, and up to
+  `CancelTerminateExecution` - which makes that case the only thing holding
+  either backend to the promise.
+
+### Four things that cannot be cases among others
+
+Two of them would take the process down rather than fail. The other two are
+about the *process* itself: the suite runs under a `Platform` that is already
+up, a second one is a precondition violation rather than a failure, and every
+interesting question about bring-up is about a process that has no platform yet
+or has finished with the one it had. Each gets a process of its own and CTest
+carries it.
+
+| test | what it is | expected |
+|---|---|---|
+| `<backend>.checked.using-a-handle-after-its-scope-closed-is-diagnosed` | a stale handle, deliberately: diagnosing it means dying. Debug only. | **fail** |
+| `<backend>.global-identity-without-a-scope` | decision 16's load-bearing clause - comparing two `Global`s with **no `HandleScope` open at all**. A backend that gets it wrong makes a handle with no frame to make it in, and the engine ends the process, which is why it cannot sit in the suite: it would take every case after it down and the parity matrix with them. | pass |
+| `<backend>.platform-is-the-gate-on-an-isolate` | the whole platform lifecycle - before one exists, while one does, and after it has gone - holding `IsInitialized()`, `Isolate::New` and `WorkerThreads()` to the same story at each point. | pass |
+| `<backend>.worker-threads-belong-to-one-platform` | the same lifecycle with a worker-thread count actually asked for, which is what makes the cache observable. | pass |
+
+The in-suite case next to the second asserts as much as can safely be asserted
+there - every frame that ever held the value closed, and a collection through
+since. The last two are the subject of the next section.
+
+## A bring-up that fails: what can be asked, and what cannot
+
+Four bugs of one shape were fixed in the backends at once - **an engine call
+that reported failure, whose result was discarded, so the library reported
+success and handed out something unusable**. V8's `Initialize` and a null
+`NewDefaultPlatform`; SpiderMonkey's `JS_Init`, checked with an `assert` that
+compiles out of exactly the build where the failure matters;
+`JS_AddInterruptCallback`, which returns `bool` and was ignored; and a cached
+helper-thread count that outlived the `JS_Init` it belonged to. None was found
+by a failing test. So the reachable half is pinned now, and the unreachable half
+is written down here rather than assumed.
+
+The behaviour they were fixed to, which is what the cases are written against: a
+failed bring-up **unwinds what came up**, leaving an object that exists and did
+*nothing* rather than one that did half; `IsInitialized()` is false; the
+destructor does not shut down what was never started; and a *second* `Platform`
+while one is alive stays a precondition violation - an assert - deliberately not
+conflated with a failure.
+
+### What is pinned
+
+**That the flag is read.** `unibind/isolate.h` says `IsInitialized()` is the failure
+channel and that `Isolate::New` refuses when it is false, and that is the half of
+items 1 and 2 a test can reach even where bring-up cannot be made to fail:
+`platform-is-the-gate-on-an-isolate` asks before any `Platform` exists (nothing
+up, so `Isolate::New` answers empty), while one does (an isolate, and script
+running in it), and after it has gone (empty again). A backend that set the flag
+unconditionally, or a destructor that left it set, fails the first or the last.
+
+**That a figure does not outlive the platform it came from.** That is item 4, and
+it is the cheapest real coverage of the set because it needs no injection at all.
+`Platform::WorkerThreads()` is cached on both backends, and the same case asserts
+the cache is empty on either side of a platform's life. SpiderMonkey reports 4
+while up and nothing either side, so the assertion has something to bite on
+there; V8 with no explicit request reports nothing throughout, so it pins the
+shape rather than a value.
+
+### Where the backends disagree, and what is reported instead
+
+`worker-threads-belong-to-one-platform` asks for a count, which is what makes the
+cache visible, and asserts only what both engines promise - no figure before
+there is a platform, and the same answer twice while there is one. What happens
+to an explicitly requested figure *after* the platform has gone is **reported**,
+because the two do not agree:
+
+- SpiderMonkey clears it in `~Platform` (that is the fix for item 4) and answers
+  empty. It also ignores the request itself - it asks for 1 and reports 4 -
+  which is the documented hint behaviour, not a failure.
+- V8 keeps the figure. It is the number that was *asked for* rather than one read
+  out of the engine, and nothing clears it, so after the platform is gone
+  `WorkerThreads()` still reports it. That is a figure about a platform that no
+  longer exists, and the header says the answer is the count "actually in
+  effect".
+
+So the case prints both and asserts neither. Asserting the SpiderMonkey answer
+would leave the suite red on V8 for a backend bug rather than a promise, which
+is the one thing a case may not be weakened into; asserting the V8 answer would
+be writing the bug down as the contract.
+
+### What is not pinned, and why
+
+**Making a bring-up actually fail.** The suite's one lever is
+`FailNextAllocations` in `tests/support/allocations.cpp`, and pointed at
+`Platform` construction or `Isolate::New` it does not produce a refusal on either
+engine. Measured rather than assumed, because the trap below makes a quiet pass
+worthless:
+
+- **V8, `Platform` construction:** one injected failure segfaults, at every count
+  tried. V8's bring-up is not written to survive an allocation failure from
+  outside its own allocator.
+- **V8, `Isolate::New`:** the injector fires exactly once and `std::bad_alloc`
+  comes back out of `Isolate::New`, which is *not* the documented empty answer -
+  though the thread is not poisoned by it and a later `Isolate::New` succeeds.
+  The failure lands on the library's own `make_unique`, before the engine is
+  reached at all, so it says nothing about what V8 would do.
+- **SpiderMonkey, `Platform` construction:** the injector fires **zero** times.
+  That is the `mozilla/cxxalloc.h` trap in `docs/gotchas.md` doing exactly what
+  it does: a replaced `operator new` is not the program's `operator new` in any
+  translation unit that has seen a SpiderMonkey header, so nothing was injected
+  and a pass here would have meant nothing. The fired count is what says so.
+- **SpiderMonkey, `Isolate::New`:** the process dies with
+  `STATUS_STACK_BUFFER_OVERRUN`, which is how an infallible allocation or a
+  `std::bad_alloc` crossing a frame built without exceptions ends up. Not a
+  refusal, and fatal, so it cannot be a case: it would take the rest of the run
+  with it.
+
+Two of the four outcomes are fatal and one is a silent non-event, so there is no
+shape of this that could be gated into the suite. Closing it needs a lever the
+*engines'* own allocators honour, which is a backend's to offer rather than a
+test's to invent - the same conclusion frame exhaustion reached, and for the same
+reason.
+
+**A second `Platform` after the first has gone.** Item 4's literal scenario - a
+second platform with a different pool reading the first one's figure back - is
+unreachable, and not for the reason one would guess. SpiderMonkey survives it
+perfectly well: `JS_Init` after `JS_ShutDown` comes back up, reports its pool and
+makes an isolate. **V8 does not**: `V8::Initialize` after `DisposePlatform` is a
+fatal V8 check (`current_state != V8StartupState::kPlatformDisposed`) and ends
+the process. A case that made one would be green on one backend and dead on the
+other, and choosing by backend is the thing a case may not do. What is asserted
+instead is the same property one step earlier - the figure is gone when the
+platform is - which is what makes the second platform's figure *its own*
+whenever an engine allows a second one at all.
+
+**The interrupt hook.** Item 3 is the most valuable of the four and the only one
+with no test at all. `JS_AddInterruptCallback` appends into a vector with two
+inline slots, allocated through `js_malloc` inside a translation unit where
+`operator new` is already `moz_xmalloc` - so it is out of reach of the injector
+three times over, and V8 has no equivalent registration to fail (its interrupt is
+per-request and `RequestInterrupt` returns nothing). **That `Isolate::New` comes
+back empty rather than handing out an isolate that cannot be terminated rests on
+review, not on a test, and should be read that way.**
+
+What *is* covered is the consequence, which is worth knowing because it is the
+symptom an embedder would actually meet: on SpiderMonkey `TerminateExecution` is
+`JS_RequestInterruptCallback` and nothing else, so an isolate that lost the hook
+is an isolate whose runaway scripts never stop - and `termination: a script that
+will not return is stopped from another thread` asserts that they do. A hook
+that silently failed to install would fail that case. What would not be caught is
+the isolate being handed out in the first place.
+
+**An allocation failure in `Isolate::New` itself.** A fifth of the same shape,
+found by reading rather than by a test and fixed the same way. SpiderMonkey's
+`Isolate::New` built its `Impl` with `make_unique` and its `Isolate` with a
+throwing `new`, so two things were wrong at once: `std::bad_alloc` escaped a
+function whose header promises an *empty* answer, and if it escaped from the
+second of them the `JSContext` was already made and owned by nothing -
+`~Isolate` is what destroys one and there was no `Isolate` - so an entire
+JavaScript heap leaked on the way out. V8's already used `new (std::nothrow)` and
+unwound by hand; SpiderMonkey's now matches, and the
+sequencing it relies on is standard (the allocation function runs before the
+new-initializer, so a null result leaves the half-built `Impl` untouched and
+ours to unwind).
+
+**It rests on review**, exactly like the interrupt hook above and for the same
+reason: the allocations that would have to fail go through `moz_xmalloc`, so
+the suite's `FailNextAllocations` lever does not reach them - the
+`mozilla/cxxalloc.h` trap in `docs/gotchas.md`, again. The measurements under
+"Making a bring-up actually fail" are what say so: pointed at SpiderMonkey's
+`Isolate::New` the injector does not produce a refusal, it produces
+`STATUS_STACK_BUFFER_OVERRUN` and takes the run with it.
+
+**A `Context`, `Script` or `Global<T>` outliving its isolate** is the other
+lifetime finding of that pass, and it is *not* in this list: decision 27 made
+it a rule and a checked build counts and diagnoses it, with a CTest test in a
+process of its own expecting exactly that death. Like the use-after-scope check
+it exists only where it can hold - `CONFIGURATIONS Debug`, and only with
+`UNIBIND_HANDLE_CHECKS` - so a Release run neither checks it nor tolerates it.
+
+## A Debug build is not green, and what that does and does not mean
+
+CI runs Release on both engines and both architectures, which is what the
+engine archives are built for. A local Debug tree (`UNIBIND_ENGINE_FLAVOR=debug`
+against a debug engine) is worth building for the checked-build tests, and when
+you do, three things fail that are not the library being wrong. They are
+written down here so that the next person does not spend the afternoon that
+finding them costs.
+
+- **Two cases trip a V8 `DCHECK`**, which a release engine does not compile in.
+  `ownership: a hand-over that runs out of memory gives the native back exactly
+  once` leaves V8's own handle-scope level one deeper than its API check expects
+  after an injected allocation failure (`api.cc: scope_level_ == ...
+  handle_scope_data()->level`), and `termination: a handler does not swallow a
+  stop the way it swallows an exception` compiles a script while the isolate is
+  still terminating, which is precisely what decision 15 says a stopped isolate
+  may be asked to do and what `DCHECK(!i_isolate->is_execution_terminating())`
+  says it may not. Both are arguments with a debug engine about behaviour the
+  release engine implements; `whole-suite-in-one-process` then fails for the
+  first of them, and `parity` for both.
+- **The use-after-scope check does not fire.** Its provocation, not the check.
+  The epoch only mismatches if the new frame lands on the *same* storage the
+  closed one had, and where the compiler gives the two scopes different stack
+  addresses - a `/RTC1` Debug build, with guard bytes between them, does - the
+  stale handle resolves through the dead frame's own memory, which still reads
+  its old epoch. The read then returns the value the reused V8 handle block now
+  holds, the process exits cleanly, and CTest reports the `WILL_FAIL` test as a
+  failure. The diagnosis is sound and the way the test reaches it is not
+  portable.
+
+The decision-27 check has no such problem: nothing about it depends on storage
+being reused, and it is counted rather than inferred.
+
+## What building the sandbox found
+
+The composition was written because each piece of it passed on its own and
+nobody had put them together. Four things came out of doing so, and none of
+them would have been found by another single-operation case.
+
+### A foreign realm's global object is access-checked
+
+**The finding, and the one that changes how a sandbox has to be written.** The
+obvious sandbox holds the inner realm's global object and reads properties of
+it from the interceptor - and on V8 that throws `TypeError: no access` before
+any embedder code runs, because a global proxy belonging to another realm is
+access-checked. An embedder using V8 directly answers this by giving the two
+contexts the same security token; `ub::Context` has no such control, and
+adding one would be a decision, not a fix.
+
+The portable answer, and what `cases/sandbox_test.cpp` does, is that **every
+hook enters the realm that owns the object before touching it**. That is one
+line per hook and it costs nothing on the engine that did not need it.
+
+The same check bounds decision 4 in a way the decision does not say: a value
+made in one realm *is* a value in the other, but the inner realm's
+`globalThis`, handed out, is an object the outer realm's script cannot read
+through. An ordinary object made inside is fine. The suite asserts that the
+global crosses as a value and deliberately asserts nothing about reading it.
+
+### An error thrown inside a sandbox is caught by name, not by `instanceof`
+
+The error object is built by the inner realm, so its constructor is the inner
+realm's `SyntaxError`, and `e instanceof SyntaxError` in the outer realm is
+false. `realms: instanceof does not cross a realm` already said this; what the
+sandbox adds is that it is the *normal* case for a host that runs untrusted
+source, not an exotic one. The portable question is
+`e.constructor.name === 'SyntaxError'`, and that is what the case asks.
+
+### Keys and identity agreed
+
+The two things the proxy-backed interceptor was most likely to show through on -
+object identity across repeated reads, and the set of keys an enumeration
+produces - agree on both backends. `Object.keys(sandbox)` reports the same three
+entries either way, so the case asserts containment (what the test put in is
+there, and the prototype's `evaluate` is not) and reports the count, which is
+what it would have to do anyway for a realm global whose built-ins are the
+engine's business.
+
+### Runaway recursion is not the same error
+
+`isolate: runaway recursion is a RangeError, not a dead process` asks in script
+what it caught: V8 says `RangeError`, SpiderMonkey says `InternalError`. The
+portable property - and the one an embedder needs - is that script catches it at
+all rather than the process dying, so that is asserted and the name is reported.
+
+Also worth knowing, because it is a way to make a test crash rather than fail:
+`stackLimitBytes` above the thread's own stack is not a limit. The engine will
+happily recurse past it and the *thread* runs out first, which no engine can
+turn into an exception. The cases measure at 128 KiB and 512 KiB on a 1 MiB
+thread.
+
+## A case that encodes a promise is left red, never weakened
+
+A case written against what a header promises, run against a backend that does
+not yet keep the promise, stays **red rather than weakened**: weakening it turns
+a bug into coverage nobody has, which is the one thing this suite exists to
+prevent. Nothing is in that state today - both backends pass every case - and
+the two that were are worth recording, because the same technique found both and
+neither would have been found by asking the API what it thought had happened.
+
+- **A damaged blob reported as used** (V8). `UsedCodeCache()` came back true for
+  a blob that had been bit-flipped, cut in half, or was never a blob at all. The
+  script itself was fine, so the only thing wrong was the answer to "did this
+  compile pay full price" - exactly the question the accessor exists to answer,
+  and exactly the failure an embedder cannot otherwise see.
+- **A blob for one source accepted for another** (SpiderMonkey). A stencil
+  encoded from source A decoded cleanly when offered for source B, reported
+  success, and **ran A**. The case caught it only because it checked what came
+  out of `Run` rather than what `UsedCodeCache()` said; had it asserted the
+  report alone it would have agreed with the bug.
+
+That is the technique, not just the case: for anything the engine is trusted to
+validate, assert on what *ran*. `code cache: a blob for other source is declined
+rather than believed` and `code cache: a blob is keyed to its origin as well as
+its source` both do, and the second reads the origin back out of a stack.
