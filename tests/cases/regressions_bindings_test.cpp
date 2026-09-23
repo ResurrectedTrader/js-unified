@@ -602,3 +602,24 @@ UNIBIND_TEST_CASE2(TEMPLATES, CLASSES, "regressions: a template's prototype prop
                                                       ".prototype === p; })()"));
     }
 }
+
+UNIBIND_TEST_CASE(CLASSES, "regressions: new on a class with no constructor is a TypeError") {
+    // A class declared without `Construct` is not constructable from script,
+    // and asking a value for something it cannot do is a TypeError - which is
+    // what V8's backend threw. SpiderMonkey's threw a plain Error, so a script
+    // catching the one did not catch the other.
+    ub_test::Fixture fixture;
+    const auto cls = ub::Class<Gadget>::New(fixture.iso(), "Unmade");
+    const auto constructor = cls.GetConstructor(fixture.context);
+    REQUIRE(constructor.has_value());
+    ub_test::Expose(fixture.context, "Unmade", *constructor);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalText(
+              fixture.context,
+              "(() => { try { new Unmade(); return 'made'; } catch (e) { return e.constructor.name; } })()") ==
+          "TypeError");
+    CHECK(
+        ub_test::EvalText(fixture.context,
+                          "(() => { try { Unmade(); return 'made'; } catch (e) { return e.constructor.name; } })()") ==
+        "TypeError");
+}

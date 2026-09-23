@@ -1290,7 +1290,8 @@ bool ConstructInstance(JSContext* cx, JS::CallArgs& args, TemplateRec* tpl, Clas
     const Context context = CurrentContext(cx);
 
     if (owner != nullptr && owner->constructor == nullptr) {
-        JS_ReportErrorASCII(cx, "this class is not constructable from script");
+        // A TypeError, as for anything asked of a value that cannot do it.
+        ThrowError(*isolate, ErrorKind::TypeError, "this class cannot be constructed from script");
         return false;
     }
 
