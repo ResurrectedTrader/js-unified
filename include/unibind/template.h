@@ -199,6 +199,8 @@ class ObjectTemplate {
 
    private:
     friend class FunctionTemplate;
+    template <class>
+    friend class Class;
     explicit constexpr ObjectTemplate(detail::TemplateRec* rec) noexcept : rec_(rec) {}
 
     detail::TemplateRec* rec_;

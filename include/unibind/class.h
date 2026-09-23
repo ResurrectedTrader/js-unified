@@ -395,6 +395,18 @@ class Class {
         return *this;
     }
 
+    /// What every instance is stamped with - V8's
+    /// `FunctionTemplate::InstanceTemplate()`. Members declared here are *own*
+    /// properties of each instance, where `Method` and `Accessor` put them on
+    /// the prototype: `hasOwnProperty`, `Object.keys` and `JSON.stringify` see
+    /// them, as script that copies an object property by property expects. It
+    /// applies to instances made by `new` and by `Wrap` alike.
+    ///
+    /// The cost is per instance: SpiderMonkey defines each member on each
+    /// object as it is made, where the prototype holds it once. Declare here
+    /// only what has to be own.
+    [[nodiscard]] ObjectTemplate InstanceTemplate() const { return ObjectTemplate(detail::ClassInstanceTemplate(rec_)); }
+
     /// Statics take a plain function callback: there is no instance to unwrap.
     const Class& StaticMethod(std::string_view name, FunctionCallback callback, CallbackData data = {}) const {
         detail::TemplateSetMethod(detail::ClassConstructorTemplate(rec_), name, callback, data,

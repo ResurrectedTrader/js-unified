@@ -328,6 +328,60 @@ UNIBIND_TEST_CASE(CLASSES, "classes: statics live on the constructor, methods on
     CHECK(ub_test::EvalTruth(fixture.context, "new Counter(0) instanceof Counter"));
 }
 
+namespace {
+
+void ReadValueOwn(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
+    if (Counter* self = ub::Class<Counter>::Unwrap(info.This())) {
+        info.GetReturnValue().Set(self->value);
+    }
+}
+
+void WriteValueOwn(const ub::Local<ub::Name>& /*property*/, const ub::Local<ub::Value>& value,
+                   const ub::PropertyCallbackInfo& info) {
+    Counter* self = ub::Class<Counter>::Unwrap(info.This());
+    const auto asInt = value.ToInt32(info.GetContext());
+    if (self != nullptr && asInt) {
+        self->value = *asInt;
+    }
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(CLASSES, "classes: an instance-template accessor is an own property of every instance") {
+    // Script that copies an object by `for...in` + `hasOwnProperty`, or with
+    // `Object.keys` / `JSON.stringify`, sees only own properties - an accessor
+    // on the prototype is invisible to it. Instances made by `new` and by
+    // `Wrap` must both carry it.
+    Counter::Reset();
+    ub_test::Fixture fixture;
+
+    const auto cls = ub::Class<Counter>::New(fixture.iso(), "Owned");
+    cls.Construct<&MakeCounter>();
+    cls.InstanceTemplate().SetAccessor("value", &ReadValueOwn, &WriteValueOwn);
+    ub_test::Expose(fixture.context, "Owned", *cls.GetConstructor(fixture.context));
+    const auto wrapped = cls.Wrap(fixture.context, std::make_unique<Counter>(7));
+    REQUIRE(wrapped.has_value());
+    ub_test::Expose(fixture.context, "wrapped", *wrapped);
+
+    for (const char* made : {"new Owned(7)", "wrapped"}) {
+        INFO(made);
+        // Each check in a scope of its own: they share one context.
+        const auto with = [made](const char* body) {
+            return std::string("(() => { const o = ") + made + "; " + body + " })()";
+        };
+        CHECK(ub_test::EvalInt(fixture.context, with("return o.value;")) == 7);
+        CHECK(ub_test::EvalTruth(fixture.context, with("return o.hasOwnProperty('value');")));
+        CHECK(ub_test::EvalText(fixture.context, with("return Object.keys(o).join();")) == "value");
+        CHECK(ub_test::EvalText(fixture.context, with("return JSON.stringify(o);")) == R"({"value":7})");
+        CHECK(ub_test::EvalInt(fixture.context,
+                               with("const copy = {};"
+                                    " for (const k in o) { if (o.hasOwnProperty(k)) copy[k] = o[k]; }"
+                                    " return copy.value;")) == 7);
+        CHECK(ub_test::EvalInt(fixture.context, with("o.value = 12; return o.value;")) == 12);
+    }
+    CHECK_FALSE(ub_test::EvalTruth(fixture.context, "Object.hasOwn(Owned.prototype, 'value')"));
+}
+
 UNIBIND_TEST_CASE(CLASSES, "classes: native can wrap an instance without running the constructor") {
     Counter::Reset();
     ub_test::Fixture fixture;
