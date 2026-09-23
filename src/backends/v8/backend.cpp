@@ -1747,23 +1747,56 @@ class ArgumentBuffer {
 
 }  // namespace
 
+/// Whether a stop is in force - and if one is, V8's own termination armed
+/// again, so that whatever script is reached next stops at its first check.
+///
+/// V8 refuses to run script while its termination is pending, but a native
+/// whose own `TryCatch` has caught the stop is no longer "terminating" to V8:
+/// its next call into script ran, and nothing was left to stop it. The stop
+/// is ours to keep (`unibind/isolate.h`), so the entry points that run script
+/// ask here first, and ask again when what they ran came back empty - which is
+/// what re-arms the engine for a getter or a conversion reached afterwards.
+[[nodiscard]] bool Stopped(Isolate& isolate) noexcept {
+    if (!isolate.impl().terminating.load(std::memory_order_acquire)) {
+        return false;
+    }
+    isolate.impl().isolate->TerminateExecution();
+    return true;
+}
+
 std::optional<Slot> CallFunction(const Context& context, Slot function, Slot receiver,
                                  std::span<const Slot> arguments) {
+    Isolate& owner = OwnerOf(context);
+    if (Stopped(owner)) {
+        return std::nullopt;
+    }
     ArgumentBuffer buffer(arguments);
-    return PushMaybe(OwnerOf(context), Resolve(function).As<v8::Function>()->Call(Raw(context), Resolve(receiver),
-                                                                                  buffer.size(), buffer.data()));
+    v8::Local<v8::Value> result;
+    if (!Resolve(function)
+             .As<v8::Function>()
+             ->Call(Raw(context), Resolve(receiver), buffer.size(), buffer.data())
+             .ToLocal(&result)) {
+        (void)Stopped(owner);
+        return std::nullopt;
+    }
+    return PushOrNothing(owner, result);
 }
 
 std::optional<Slot> ConstructObject(const Context& context, Slot function, std::span<const Slot> arguments) {
+    Isolate& owner = OwnerOf(context);
+    if (Stopped(owner)) {
+        return std::nullopt;
+    }
     ArgumentBuffer buffer(arguments);
     v8::Local<v8::Object> result;
     if (!Resolve(function)
              .As<v8::Function>()
              ->NewInstance(Raw(context), buffer.size(), buffer.data())
              .ToLocal(&result)) {
+        (void)Stopped(owner);
         return std::nullopt;
     }
-    return PushOrNothing(OwnerOf(context), result);
+    return PushOrNothing(owner, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -3469,11 +3502,19 @@ std::optional<Slot> RunScript(const Context& context, ScriptRec* script) {
         return std::nullopt;
     }
     Isolate& owner = OwnerOf(context);
+    if (Stopped(owner)) {
+        return std::nullopt;
+    }
     // Bind to the realm being run in, not the one that compiled it, so the code
     // sees this realm's globals. See unibind/script.h.
     v8::Context::Scope entered(Raw(context));
     v8::Local<v8::Script> bound = script->handle.Get(Raw(owner))->BindToCurrentContext();
-    return PushMaybe(owner, bound->Run(Raw(context)));
+    v8::Local<v8::Value> result;
+    if (!bound->Run(Raw(context)).ToLocal(&result)) {
+        (void)Stopped(owner);
+        return std::nullopt;
+    }
+    return PushOrNothing(owner, result);
 }
 
 }  // namespace detail

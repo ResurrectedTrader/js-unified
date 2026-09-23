@@ -723,3 +723,88 @@ UNIBIND_TEST_CASE2(INTERRUPTS, TERMINATION, "regressions: an interrupt waits out
                            "(function () { let n = 0; for (let i = 0; i < 100; ++i) ++n; return n; })()") == 100);
     CHECK(held.interrupts.load() == 1);
 }
+
+namespace {
+
+/// A native that calls back into script, is stopped there by another thread,
+/// catches the stop in a handler of its own - and then carries on calling
+/// into script, as a native that loops over callbacks does.
+struct CallsOn {
+    ub::Isolate* isolate = nullptr;
+    std::atomic<bool> looping{false};
+    std::atomic<int> ranAfterStop{0};
+    bool firstStopped = false;
+    bool againRefused = false;
+    bool getterRefused = false;
+};
+
+void NoteRun(const ub::CallbackInfo& info) {
+    auto* state = info.Data<CallsOn>();
+    if (state->looping.exchange(true)) {
+        state->ranAfterStop.fetch_add(1);
+    }
+}
+
+void CallTwice(const ub::CallbackInfo& info) {
+    auto* state = info.Data<CallsOn>();
+    const auto callback = info[0].To<ub::Function>();
+    const auto holder = info[1].To<ub::Object>();
+    if (!callback || !holder) {
+        return;
+    }
+    const ub::TryCatch caught(info.GetIsolate());
+    state->firstStopped = !callback->Call(info.GetContext(), info.This(), {}).has_value() && caught.HasTerminated();
+    state->againRefused = !callback->Call(info.GetContext(), info.This(), {}).has_value();
+    state->getterRefused = !holder->Get(info.GetContext(), "loops").has_value();
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(TERMINATION, "regressions: a native that caught a stop cannot run script by calling again") {
+    // "Every operation that would run script fails until the termination is
+    // cancelled." Inside a native whose own TryCatch has caught the stop, V8
+    // no longer counts itself as terminating, so the native's next call into
+    // script ran - and a loop in it ran for ever, nothing left to stop it.
+    // SpiderMonkey's backend refused, as the header says.
+    ub_test::Fixture fixture;
+    CallsOn state;
+    state.isolate = &fixture.iso();
+    const auto note = ub::Function::New(fixture.context, &NoteRun, ub::CallbackData::For(state));
+    const auto callTwice = ub::Function::New(fixture.context, &CallTwice, ub::CallbackData::For(state));
+    REQUIRE(note.has_value());
+    REQUIRE(callTwice.has_value());
+    ub_test::Expose(fixture.context, "note", *note);
+    ub_test::Expose(fixture.context, "callTwice", *callTwice);
+
+    std::atomic<bool> finished{false};
+    std::thread stopper([&state, &finished] {
+        while (!state.looping) {
+            std::this_thread::yield();
+        }
+        state.isolate->TerminateExecution();
+        // What runs after the stop would run for ever; stop it again, late,
+        // so the case fails instead of hanging.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!finished && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        while (!finished) {
+            state.isolate->TerminateExecution();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+    const auto result = ub::Evaluate(fixture.context, R"(
+        const loop = () => { note(); for (;;) {} };
+        callTwice(loop, { get loops() { note(); for (;;) {} } });
+    )");
+    finished = true;
+    stopper.join();
+
+    CHECK_FALSE(result.has_value());
+    CHECK(fixture.iso().IsExecutionTerminating());
+    CHECK(state.firstStopped);
+    CHECK(state.againRefused);
+    CHECK(state.getterRefused);
+    CHECK(state.ranAfterStop.load() == 0);
+    fixture.iso().CancelTerminateExecution();
+}
