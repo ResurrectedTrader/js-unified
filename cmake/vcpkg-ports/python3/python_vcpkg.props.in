@@ -49,4 +49,57 @@
       </AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
+
+  <!--
+    unibind: extension modules built into a static core.
+
+    The port rewrites each module listed in PYTHON_BUILTIN_EXTENSIONS from a DynamicLibrary to a
+    StaticLibrary, which is what the conditions below recognise (pythoncore is the only other
+    static library in the build). This file is imported just before Microsoft.Cpp.targets, so
+    what it sets overrides the project's own settings.
+  -->
+  <PropertyGroup Condition="'$(ConfigurationType)' == 'StaticLibrary' and '$(ProjectName)' != 'pythoncore'">
+    <_VcpkgPythonBuiltinModule>true</_VcpkgPythonBuiltinModule>
+    <TargetExt>.lib</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(_VcpkgPythonBuiltinModule)' == 'true'">
+    <ClCompile>
+      <!-- Compiled as part of the core: PyMODINIT_FUNC is not dllexport, internal headers are available -->
+      <PreprocessorDefinitions>Py_BUILD_CORE_BUILTIN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Lib>
+      <!-- Only the module's own objects: its third-party and system libraries are the consumer's link inputs -->
+      <AdditionalDependencies></AdditionalDependencies>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(_VcpkgPythonBuiltinModule)' == 'true'">
+    <!-- pythoncore depends on the module now, not the other way round -->
+    <ProjectReference Remove="pythoncore.vcxproj" />
+    <!-- The version resource belongs to a .pyd; the core has its own -->
+    <ResourceCompile Remove="@(ResourceCompile)" />
+  </ItemGroup>
+
+  <!-- pythoncore builds the modules first and merges their objects into python3X.lib -->
+  <PropertyGroup>
+    <_VcpkgPythonBuiltinProjects>${PYTHON_BUILTIN_PROJECTS}</_VcpkgPythonBuiltinProjects>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(ProjectName)|$(ConfigurationType)' == 'pythoncore|StaticLibrary'">
+    <ProjectReference Include="$(_VcpkgPythonBuiltinProjects)">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(ProjectName)|$(ConfigurationType)' == 'pythoncore|StaticLibrary'">
+    <Lib>
+      <!-- Replaces zlib above: third-party libraries are not merged into the core either -->
+      <AdditionalDependencies>${PYTHON_BUILTIN_LIBS}</AdditionalDependencies>
+    </Lib>
+  </ItemDefinitionGroup>
+
+  <!-- python.exe and pythonw.exe link the static core, so they need what the built-ins call -->
+  <ItemDefinitionGroup Condition="'$(ConfigurationType)' == 'Application'">
+    <Link>
+      <AdditionalDependencies>${PYTHON_BUILTIN_SYSTEM_LIBS};%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
 </Project>
