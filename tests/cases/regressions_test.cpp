@@ -731,3 +731,19 @@ UNIBIND_TEST_CASE(STRINGS, "regressions: text refused for not being UTF-8 leaves
     // And the engine is as usable as it was.
     CHECK(ub_test::EvalInt(fixture.context, "6 * 7") == 42);
 }
+
+UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a buffer too large to allocate is empty, not the end of the process") {
+    // `ArrayBuffer::New` answers empty when the engine cannot make the buffer.
+    // A length is often a number read from input, so one too large for the
+    // engine - or for the address space - is an ordinary failure, answered
+    // without an exception and without ending the process.
+    ub_test::Fixture fixture;
+
+    for (const std::size_t length :
+         {std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max() / 2}) {
+        CAPTURE(length);
+        CHECK_FALSE(ub::ArrayBuffer::New(fixture.context, length).has_value());
+        CHECK_FALSE(fixture.iso().HasPendingException());
+    }
+    CHECK(ub_test::EvalInt(fixture.context, "6 * 7") == 42);
+}

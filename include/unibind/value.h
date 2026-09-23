@@ -339,7 +339,9 @@ struct ElementTypeOfTag<std::uint64_t> : std::integral_constant<ElementType, Ele
 /// Raw bytes script can share. An `ArrayBuffer` has no elements of its own; a
 /// `TypedArray` is the view that gives it a width.
 struct ArrayBuffer : Object {
-    /// A buffer of `byteLength` zero bytes.
+    /// A buffer of `byteLength` zero bytes. Empty, with nothing thrown, if the
+    /// engine cannot make one that long - a length past its maximum, or one it
+    /// cannot allocate.
     [[nodiscard]] static std::optional<Local<ArrayBuffer>> New(const Context& context, std::size_t byteLength) {
         return detail::WrapSlot<ArrayBuffer>(detail::MakeArrayBuffer(context, {}, byteLength));
     }

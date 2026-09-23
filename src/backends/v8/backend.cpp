@@ -1204,8 +1204,15 @@ uint32_t ArrayLength(Slot array) noexcept {
 std::optional<Slot> MakeArrayBuffer(const Context& context, std::span<const std::byte> bytes, size_t byteLength) {
     assert(bytes.size() <= byteLength && "an array buffer was asked to hold more than it is long");
     Isolate& owner = OwnerOf(context);
-    v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(Raw(owner), byteLength);
-    if (buffer.IsEmpty()) {
+    // `MaybeNew`, and the ceiling checked first: `New` answers an allocation
+    // that fails by ending the process, and both answer a length past the
+    // engine's maximum that way. A length is often a number read from input,
+    // and the header promises an empty answer for a buffer that cannot be made.
+    if (byteLength > v8::ArrayBuffer::kMaxByteLength) {
+        return std::nullopt;
+    }
+    v8::Local<v8::ArrayBuffer> buffer;
+    if (!v8::ArrayBuffer::MaybeNew(Raw(owner), byteLength).ToLocal(&buffer)) {
         return std::nullopt;
     }
     if (!bytes.empty()) {
