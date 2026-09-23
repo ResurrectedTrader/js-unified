@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -415,4 +416,108 @@ UNIBIND_TEST_CASE2(JOBS, INTERRUPTS, "regressions: posting when there is no memo
     CHECK_FALSE(isolate.PostJob(nullptr, {}));
     CHECK_FALSE(isolate.PostDelayedJob(nullptr, {}, 1.0));
     CHECK_FALSE(isolate.RequestInterrupt(nullptr, {}));
+}
+
+namespace {
+
+/// A connection that goes away - or stops - from inside the first message it
+/// is sent that `trigger` names, which is where a socket write fails.
+struct Dropping final : ub::InspectorClient {
+    void SendProtocolMessage(std::string_view message) override {
+        ++sent;
+        if (!acted && !trigger.empty() && message.find(trigger) != std::string_view::npos) {
+            acted = true;
+            sentAtAct = sent;
+            if (stopOnly) {
+                (*session)->Stop();
+            } else {
+                session->reset();
+            }
+        }
+        if (message.starts_with("{\"id\":")) {
+            responses.emplace_back(message);
+        }
+    }
+    void RunMessageLoopOnPause() override {
+        ++pauses;
+        if (*session != nullptr) {
+            (*session)->Resume();
+        }
+    }
+    void QuitMessageLoopOnPause() override {}
+
+    std::unique_ptr<ub::InspectorSession>* session = nullptr;
+    std::string trigger;
+    bool stopOnly = false;
+    bool acted = false;
+    int sent = 0;
+    int sentAtAct = 0;
+    int pauses = 0;
+    std::vector<std::string> responses;
+};
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INSPECTOR, "regressions: a session may go, or stop, inside a notification it is sent") {
+    // "A session may be destroyed anywhere on the isolate's thread", and the
+    // commonest place is the one an embedder does not choose: a socket write
+    // that fails inside SendProtocolMessage. For a notification the engine is
+    // still inside the session's own agent when the client is called - a
+    // console message, a script being parsed - and V8 went on to use the
+    // agent it had just freed. Stop in a scriptParsed notification did the
+    // same to the debugger agent.
+    if (!ub::Inspector::Supported()) {
+        ub_test::ReportSkip("this backend has no inspector");
+        return;
+    }
+    ub_test::Fixture fixture;
+    std::unique_ptr<ub::InspectorSession> session;
+    Dropping client;
+    client.session = &session;
+    auto inspector = ub::Inspector::New(fixture.iso(), client);
+    REQUIRE(inspector != nullptr);
+    inspector->ContextCreated(fixture.context, "main");
+
+    const auto connect = [&](std::string trigger, bool stopOnly) {
+        session = inspector->Connect();
+        REQUIRE(session != nullptr);
+        session->DispatchProtocolMessage(R"({"id":1,"method":"Runtime.enable"})");
+        session->DispatchProtocolMessage(R"({"id":2,"method":"Debugger.enable"})");
+        client.trigger = std::move(trigger);
+        client.stopOnly = stopOnly;
+        client.acted = false;
+        client.pauses = 0;
+    };
+
+    // Gone inside a console message script logged.
+    connect("Runtime.consoleAPICalled", false);
+    CHECK(ub_test::EvalInt(fixture.context, "console.log('one'); console.log('two'); 1") == 1);
+    CHECK(client.acted);
+    CHECK(session == nullptr);
+    CHECK(client.sent == client.sentAtAct);
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 2") == 2);
+    CHECK(client.pauses == 0);
+
+    // Gone inside the notice that a script was parsed.
+    connect("Debugger.scriptParsed", false);
+    CHECK(ub::Evaluate(fixture.context, "debugger; 3", {.resourceName = "parsed.js"}).has_value());
+    CHECK(client.acted);
+    CHECK(session == nullptr);
+    CHECK(client.pauses == 0);
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 4") == 4);
+    CHECK(client.sent == client.sentAtAct);
+
+    // Stopped there, and so pausing nothing - and still answered.
+    connect("Debugger.scriptParsed", true);
+    CHECK(ub::Evaluate(fixture.context, "debugger; 5", {.resourceName = "stopped.js"}).has_value());
+    CHECK(client.acted);
+    REQUIRE(session != nullptr);
+    CHECK(client.pauses == 0);
+    session->DispatchProtocolMessage(R"({"id":3,"method":"Runtime.evaluate","params":{"expression":"6 * 7"}})");
+    CHECK(client.responses.back().find("\"value\":42") != std::string::npos);
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 6") == 6);
+    CHECK(client.pauses == 0);
+
+    session.reset();
+    inspector->ContextDestroyed(fixture.context);
 }

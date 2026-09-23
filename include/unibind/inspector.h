@@ -139,6 +139,15 @@ class InspectorSession {
     /// dispatch made, several frames below the engine's session: a connection
     /// that closes during a pause is destroyed right there, not remembered
     /// for later.
+    ///
+    /// **Inside `SendProtocolMessage` with a notification** - a console
+    /// message, a parsed script, the notice of a pause: the send a socket
+    /// write fails in - the engine is still inside the part of the session
+    /// that raised it. The session is gone to the client at once, and the
+    /// engine's half of it goes as soon as that send has unwound: at the next
+    /// call into the inspector, before a pause is run, or at the isolate's
+    /// next safe point, whichever comes first. A pause it was holding ends
+    /// then, rather than before this returns.
     ~InspectorSession();
 
     InspectorSession(const InspectorSession&) = delete;
@@ -170,7 +179,9 @@ class InspectorSession {
     /// nothing waits on a DevTools that is not there. **During a pause it ends
     /// the pause**: the inspector calls `InspectorClient::QuitMessageLoopOnPause`
     /// before this returns, unless another session still has the debugger on.
-    /// Final - there is no restart - and a second call does nothing.
+    /// Final - there is no restart - and a second call does nothing. Inside a
+    /// notification it is put off exactly as destruction is, for the same
+    /// reason, and stops pausing script from then on.
     void Stop();
 
     /// Implementation detail: the backend's per-session state.

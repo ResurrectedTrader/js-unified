@@ -213,6 +213,7 @@ struct Isolate::Impl {
     /// through here - so a wake-up that arrives after the inspector has gone
     /// finds nothing rather than a freed queue. Isolate thread only.
     Inspector* inspector = nullptr;
+    Inspector::Impl* inspectorImpl = nullptr;
     std::shared_ptr<InspectorDispatcher> inspectorDispatcher;
 };
 
@@ -4097,6 +4098,8 @@ struct InspectorDispatcher::Impl {
 
 namespace {
 
+void SettleInspector(Isolate& isolate);
+
 /// Run what `RequestDispatch` queued, in order, until nothing is left - which
 /// includes anything requested while it runs. Called from a V8 interrupt and
 /// from a posted job, whichever reaches the isolate first; the other finds the
@@ -4113,6 +4116,9 @@ void DrainDispatches(Isolate& isolate) {
         const std::scoped_lock guard(shared.mutex);
         shared.wakePending = false;
     }
+    // Whatever a notification put off is done here too; see
+    // `Inspector::Impl::notifying`.
+    SettleInspector(isolate);
     for (;;) {
         JobCallback callback = nullptr;
         CallbackData data;
@@ -4141,16 +4147,34 @@ void DispatchJob(Isolate& isolate, CallbackData /*data*/) {
 /// The inspector's side of the embedder's client. V8 asks it for the default
 /// realm, the time and a script's URL, and tells it about pauses.
 struct Inspector::Impl final : v8_inspector::V8InspectorClient {
-    Impl(Isolate& owner, InspectorClient& client) : owner(&owner), client(&client) {}
+    Impl(Isolate& owner, InspectorClient& client);
 
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
     Impl(Impl&&) = delete;
     Impl& operator=(Impl&&) = delete;
-    ~Impl() override = default;
+    ~Impl() override;
 
-    void runMessageLoopOnPause(int /*contextGroupId*/) override { client->RunMessageLoopOnPause(); }
-    void quitMessageLoopOnPause() override { client->QuitMessageLoopOnPause(); }
+    /// What was put off inside a notification is done first, and if that ends
+    /// the pause - a session going was what kept it - the embedder's loop is
+    /// not started for a pause that is already over.
+    void runMessageLoopOnPause(int /*contextGroupId*/) override {
+        settling = true;
+        quitWhileSettling = false;
+        Settle();
+        settling = false;
+        if (quitWhileSettling) {
+            return;
+        }
+        client->RunMessageLoopOnPause();
+    }
+    void quitMessageLoopOnPause() override {
+        if (settling) {
+            quitWhileSettling = true;
+            return;
+        }
+        client->QuitMessageLoopOnPause();
+    }
     double currentTimeMS() override { return client->CurrentTimeMs(); }
 
     /// The realm announced most recently and not yet withdrawn - or collected,
@@ -4174,6 +4198,14 @@ struct Inspector::Impl final : v8_inspector::V8InspectorClient {
         return v8_inspector::StringBuffer::create(ViewOf(ToUtf16(*url)));
     }
 
+    /// Stop and destroy the sessions that asked for it inside a notification,
+    /// now that no notification is being sent. See `notifying`.
+    void Settle();
+
+    /// Keep the isolate coming back here soon even if the embedder does
+    /// nothing else with the inspector: a wake-up drains, and a drain settles.
+    void WakeToSettle() const noexcept;
+
     Isolate* owner;
     InspectorClient* client;
     std::shared_ptr<InspectorDispatcher> dispatcher;
@@ -4181,6 +4213,24 @@ struct Inspector::Impl final : v8_inspector::V8InspectorClient {
     /// is where an evaluation naming no context runs. Weak: DevTools seeing a
     /// realm is no reason for it to live.
     std::vector<v8::Global<v8::Context>> contexts;
+    /// How many notifications are being sent right now, across every session.
+    ///
+    /// A notification is sent from inside the agent that raised it - a console
+    /// message from the runtime agent, a parsed script from the debugger's -
+    /// and V8 goes on using that agent after the send returns. A session
+    /// destroyed there frees the agent under it, and one stopped there tears
+    /// the debugger agent's state down under it. So while this is above zero,
+    /// `~InspectorSession` and `InspectorSession::Stop` detach at once - the
+    /// client hears nothing more from a session that went - and leave the rest
+    /// here for `Settle`, which runs at the next point nothing of V8's is
+    /// mid-notification: the next call into the inspector, the next pause, or
+    /// the wake-up they ask for. A response needs none of this: V8 sends it
+    /// after the agent has returned, through a session it holds weakly.
+    int notifying = 0;
+    bool settling = false;
+    bool quitWhileSettling = false;
+    std::vector<InspectorSession::Impl*> stopping;
+    std::vector<std::unique_ptr<InspectorSession::Impl>> doomed;
     // Last, so that it goes first: V8's inspector calls back into this object
     // while it is being torn down.
     std::unique_ptr<v8_inspector::V8Inspector> inspector;
@@ -4188,13 +4238,15 @@ struct Inspector::Impl final : v8_inspector::V8InspectorClient {
 
 /// One connection: V8's channel, forwarding every message to the embedder.
 ///
-/// Destroying one inside a pause, or inside a callback its own dispatch made,
-/// is V8's design and not something to defer: V8 reaches a session and its
-/// channel through weak pointers across exactly those calls, because a
-/// DevTools connection that closes in the middle of a pause is ordinary. The
-/// suite holds it to that.
+/// Destroying one inside a pause, or inside a response to its own dispatch, is
+/// V8's design and not something to defer: V8 reaches a session and its channel
+/// through weak pointers across exactly those calls, because a DevTools
+/// connection that closes in the middle of a pause is ordinary. Inside a
+/// notification it is not - see `Inspector::Impl::notifying`. The suite holds
+/// it to both.
 struct InspectorSession::Impl final : v8_inspector::V8Inspector::Channel {
-    Impl(Isolate& owner, InspectorClient& client) : owner(&owner), client(&client) {}
+    Impl(Inspector::Impl& inspector, InspectorClient& client)
+        : owner(inspector.owner), inspector(&inspector), client(&client) {}
 
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
@@ -4203,15 +4255,28 @@ struct InspectorSession::Impl final : v8_inspector::V8Inspector::Channel {
     ~Impl() override = default;
 
     void sendResponse(int /*callId*/, std::unique_ptr<v8_inspector::StringBuffer> message) override {
-        client->SendProtocolMessage(ToUtf8(message->string(), EightBit::Utf8));
+        if (client != nullptr) {
+            client->SendProtocolMessage(ToUtf8(message->string(), EightBit::Utf8));
+        }
     }
     void sendNotification(std::unique_ptr<v8_inspector::StringBuffer> message) override {
+        if (client == nullptr) {
+            return;
+        }
+        // The count is the inspector's, which outlives this call whatever the
+        // embedder does inside it; `this` may be put aside for `Settle` by then.
+        Inspector::Impl& counted = *inspector;
+        ++counted.notifying;
         client->SendProtocolMessage(ToUtf8(message->string(), EightBit::Utf8));
+        --counted.notifying;
     }
     // Nothing is buffered on this side, so there is nothing to flush.
     void flushProtocolNotifications() override {}
 
     Isolate* owner;
+    Inspector::Impl* inspector;
+    /// Null once the session has gone, while V8's half waits for `Settle`: the
+    /// client is sent nothing more on its behalf.
     InspectorClient* client;
     /// `Stop` is final, and ours rather than V8's to promise: a stopped
     /// session's `Resume` and `Stop` do nothing, whatever the engine would
@@ -4220,6 +4285,54 @@ struct InspectorSession::Impl final : v8_inspector::V8Inspector::Channel {
     // Last, so that it goes before the channel it reports through.
     std::unique_ptr<v8_inspector::V8InspectorSession> session;
 };
+
+Inspector::Impl::Impl(Isolate& owner, InspectorClient& client) : owner(&owner), client(&client) {}
+
+Inspector::Impl::~Impl() = default;
+
+void Inspector::Impl::Settle() {
+    if (notifying > 0) {
+        return;
+    }
+    if (stopping.empty() && doomed.empty()) {
+        return;
+    }
+    const v8::HandleScope scope(owner->impl().isolate);
+    // One at a time, and off the list before V8 is asked: stopping or
+    // destroying a session calls back into this object.
+    while (!stopping.empty()) {
+        InspectorSession::Impl* next = stopping.back();
+        stopping.pop_back();
+        next->session->stop();
+    }
+    while (!doomed.empty()) {
+        const std::unique_ptr<InspectorSession::Impl> next = std::move(doomed.back());
+        doomed.pop_back();
+        next->session.reset();
+    }
+}
+
+namespace {
+
+void NothingToDispatch(Isolate& /*isolate*/, CallbackData /*data*/) {}
+
+}  // namespace
+
+void Inspector::Impl::WakeToSettle() const noexcept {
+    // Refused only when out of memory, and then the next call into the
+    // inspector settles instead.
+    (void)dispatcher->RequestDispatch(&NothingToDispatch);
+}
+
+namespace {
+
+void SettleInspector(Isolate& isolate) {
+    if (isolate.impl().inspectorImpl != nullptr) {
+        isolate.impl().inspectorImpl->Settle();
+    }
+}
+
+}  // namespace
 
 bool Inspector::Supported() noexcept {
     return true;
@@ -4248,6 +4361,7 @@ std::unique_ptr<Inspector> Inspector::New(Isolate& isolate, InspectorClient& cli
         return nullptr;
     }
     isolate.impl().inspector = made.get();
+    isolate.impl().inspectorImpl = made->impl_.get();
     isolate.impl().inspectorDispatcher = made->impl_->dispatcher;
     {
         InspectorDispatcher::Impl& shared = made->impl_->dispatcher->impl();
@@ -4269,14 +4383,20 @@ Inspector::~Inspector() {
     }
     if (owner.impl().inspector == this) {
         owner.impl().inspector = nullptr;
+        owner.impl().inspectorImpl = nullptr;
         owner.impl().inspectorDispatcher.reset();
     }
     const v8::HandleScope scope(owner.impl().isolate);
+    // Whatever is still put aside goes before the engine's inspector it
+    // belongs to: a session never outlives its inspector.
+    impl_->notifying = 0;
+    impl_->Settle();
     impl_->inspector.reset();
     impl_->contexts.clear();
 }
 
 void Inspector::ContextCreated(const Context& context, std::string_view name) {
+    impl_->Settle();
     v8::Isolate* raw = impl_->owner->impl().isolate;
     const v8::HandleScope scope(raw);
     v8::Local<v8::Context> local = detail::Raw(context);
@@ -4301,9 +4421,11 @@ void Inspector::ContextCreated(const Context& context, std::string_view name) {
     const v8_inspector::V8ContextInfo info(local, CONTEXT_GROUP, ViewOf(title));
     impl_->inspector->contextCreated(info);
     impl_->contexts.emplace_back(raw, local).SetWeak();
+    impl_->Settle();
 }
 
 void Inspector::ContextDestroyed(const Context& context) {
+    impl_->Settle();
     v8::Isolate* raw = impl_->owner->impl().isolate;
     const v8::HandleScope scope(raw);
     v8::Local<v8::Context> local = detail::Raw(context);
@@ -4311,13 +4433,15 @@ void Inspector::ContextDestroyed(const Context& context) {
     std::erase_if(impl_->contexts, [raw, local](const v8::Global<v8::Context>& kept) {
         return kept.IsEmpty() || kept.Get(raw) == local;
     });
+    impl_->Settle();
 }
 
 std::unique_ptr<InspectorSession> Inspector::Connect() {
+    impl_->Settle();
     // As in `New`: ours first, so that out of memory is a null, then V8's.
     std::unique_ptr<InspectorSession> made;
     try {
-        made.reset(new InspectorSession(std::make_unique<InspectorSession::Impl>(*impl_->owner, *impl_->client)));
+        made.reset(new InspectorSession(std::make_unique<InspectorSession::Impl>(*impl_, *impl_->client)));
     } catch (const std::bad_alloc&) {
         return nullptr;
     }
@@ -4376,12 +4500,28 @@ bool InspectorDispatcher::RequestDispatch(JobCallback callback, CallbackData dat
 InspectorSession::InspectorSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 InspectorSession::~InspectorSession() {
+    Inspector::Impl& inspector = *impl_->inspector;
+    std::erase(inspector.stopping, impl_.get());
+    if (inspector.notifying > 0) {
+        // Inside a notification: gone as far as the client can tell, and V8's
+        // half put aside until nothing of V8's is mid-send. See `notifying`.
+        impl_->client = nullptr;
+        try {
+            inspector.doomed.push_back(std::move(impl_));
+            inspector.WakeToSettle();
+            return;
+        } catch (const std::bad_alloc&) {
+            // Nowhere to keep it, so it goes now, as it always used to.
+        }
+    }
     const v8::HandleScope scope(impl_->owner->impl().isolate);
     impl_->session.reset();
 }
 
 void InspectorSession::DispatchProtocolMessage(std::string_view message) {
     Isolate& owner = *impl_->owner;
+    Inspector::Impl& inspector = *impl_->inspector;
+    inspector.Settle();
     const v8::HandleScope scope(owner.impl().isolate);
     // A stopped isolate runs no script until the stop is cancelled, and a
     // `Runtime.evaluate` is script like any other - but it goes straight to
@@ -4393,15 +4533,17 @@ void InspectorSession::DispatchProtocolMessage(std::string_view message) {
         owner.impl().isolate->TerminateExecution();
     }
     // Nothing of `this` is touched once the dispatch has started: a callback
-    // inside it may destroy the session.
+    // inside it may destroy the session. The inspector outlives the dispatch.
     impl_->session->dispatchProtocolMessage(
         v8_inspector::StringView(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+    inspector.Settle();
 }
 
 void InspectorSession::Resume() {
     if (impl_->stopped) {
         return;
     }
+    impl_->inspector->Settle();
     const v8::HandleScope scope(impl_->owner->impl().isolate);
     impl_->session->resume();
 }
@@ -4411,6 +4553,19 @@ void InspectorSession::Stop() {
         return;
     }
     impl_->stopped = true;
+    Inspector::Impl& inspector = *impl_->inspector;
+    if (inspector.notifying > 0) {
+        // As for destruction, and for the same reason: the debugger agent a
+        // stop tears down may be the one sending. Stopped as far as this API
+        // is concerned now, and in V8 once the send is done.
+        try {
+            inspector.stopping.push_back(impl_.get());
+            inspector.WakeToSettle();
+            return;
+        } catch (const std::bad_alloc&) {
+            // Nowhere to keep it, so it happens now, as it always used to.
+        }
+    }
     const v8::HandleScope scope(impl_->owner->impl().isolate);
     impl_->session->stop();
 }
