@@ -14,7 +14,6 @@ add_executable(unibind_python_tests
     binary_test.cpp
     serialization_test.cpp
     codecache_test.cpp
-
     objects_test.cpp
     functions_test.cpp
     templates_test.cpp
