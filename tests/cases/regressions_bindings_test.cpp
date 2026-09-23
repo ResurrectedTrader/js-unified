@@ -441,3 +441,49 @@ UNIBIND_TEST_CASE(INTERCEPTORS,
     CHECK(ub_test::EvalTruth(fixture.context, "o instanceof F") == false);
     CHECK(tpl.HasInstance(fixture.context, ub_test::Eval(fixture.context, "o")) == std::optional<bool>(true));
 }
+
+namespace {
+
+ub::Intercepted LogAndDeclineWrite(const ub::Local<ub::Name>& property, const ub::Local<ub::Value>& /*value*/,
+                                   const ub::PropertyCallbackInfo& info) {
+    const auto text = property.To<ub::String>();
+    info.Data<HookLog>()->seen += "set-n" + (text ? text->Utf8Value() : std::string("?")) + " ";
+    return ub::Intercepted::No;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: an intercepted object is the receiver of what it declines") {
+    // A hook that declines hands the access to the ordinary lookup, and the
+    // ordinary lookup has a receiver: the object the access was made on. On
+    // SpiderMonkey an intercepted object is a proxy over a hidden target, and
+    // the backend forwarded a declined access with the *target* as receiver.
+    // So a getter or setter further up the chain saw the target as `this` -
+    // handing script an object that bypasses every hook - and a write through
+    // an object that merely inherits from an intercepted one landed on the
+    // intercepted object instead of on the one written to. V8 also leaves the
+    // setter hook out of a write it only sees through the prototype chain.
+    ub_test::Fixture fixture;
+    HookLog log;
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.SetHandler(ub::NamedPropertyHandler{
+        .getter = &DeclineRead, .setter = &LogAndDeclineWrite, .data = ub::CallbackData::For(log)});
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+    ub_test::Eval(fixture.context,
+                  "var seen; Object.setPrototypeOf(o, { get me() { return this; }, set me(v) { seen = this; } })");
+
+    CHECK(ub_test::EvalTruth(fixture.context, "o.me === o"));
+    CHECK(ub_test::EvalTruth(fixture.context, "o.me = 1, seen === o"));
+    CHECK(ub_test::EvalTruth(fixture.context, "(() => { const c = Object.create(o); return c.me === c; })()"));
+    CHECK(ub_test::EvalText(fixture.context, "o.own = 1, String(Object.hasOwn(o, 'own'))") == "true");
+    CHECK(log.seen == "set-nme set-nown ");
+
+    log.seen.clear();
+    CHECK(ub_test::EvalText(fixture.context,
+                            "(() => { const c = Object.create(o); c.later = 2; "
+                            "return Object.hasOwn(c, 'later') + ' ' + Object.hasOwn(o, 'later'); })()") ==
+          "true false");
+    CHECK(log.seen.empty());
+}

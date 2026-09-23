@@ -343,8 +343,13 @@ target. A proxy made with a concrete prototype keeps that one and answers
 `setPrototypeOf` by changing it without asking the handler, while a declined
 `get` forwarded to the target walks the target's chain, which then never
 changes. With the lazy prototype there is one chain, the target's, and a
-declined lookup walks the one the language expects. `set` forwards with the
-*target* as receiver so it does not come straight back through the trap.
+declined lookup walks the one the language expects - with the receiver the
+access was made on, not the target, so a getter or setter up the chain sees the
+proxy (or whatever inherits from it) as `this`. The target is the one object
+script must never hold, since nothing on it goes through a hook. A write made on
+an object that merely inherits from the proxy does not reach the setter hook -
+V8's interceptor sees only writes made on its own object - and lands on the
+object written to.
 
 Consequences worth knowing:
 

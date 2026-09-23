@@ -690,13 +690,23 @@ bool InterceptorHandler::get(JSContext* cx, JS::HandleObject proxy, JS::HandleVa
         }
     }
     // Not intercepted: the ordinary lookup, on the target and its prototype
-    // chain - which is the proxy's prototype chain, by construction.
-    JS::RootedValue self(cx, JS::ObjectValue(*target));
-    return JS_ForwardGetPropertyTo(cx, target, id, self, vp);
+    // chain - which is the proxy's prototype chain, by construction - with the
+    // receiver the access was made on. Not the target: a getter up the chain
+    // would see it as `this`, and the target is the one object script must
+    // never hold, since nothing on it goes through a hook.
+    return JS_ForwardGetPropertyTo(cx, target, id, receiver, vp);
 }
 
 bool InterceptorHandler::set(JSContext* cx, JS::HandleObject proxy, JS::HandleId id, JS::HandleValue value,
                              JS::HandleValue receiver, JS::ObjectOpResult& result) const {
+    // A write made on something that inherits from this object - V8 hands its
+    // setter hook only a write made on the object itself. What the object has
+    // there is still asked, through `getOwnPropertyDescriptor` and so through
+    // the query and getter hooks, and the property lands on the receiver: the
+    // language's own ordinary set, as V8 does it too.
+    if (!receiver.isObject() || &receiver.toObject() != proxy) {
+        return BaseProxyHandler::set(cx, proxy, id, value, receiver, result);
+    }
     JS::RootedObject target(cx, TargetOf(proxy));
     TemplateRec* tpl = HooksOf(target);
     std::uint32_t index = 0;
@@ -725,10 +735,10 @@ bool InterceptorHandler::set(JSContext* cx, JS::HandleObject proxy, JS::HandleId
             }
         }
     }
-    // The receiver is the target, not the proxy: forwarding with the proxy as
-    // receiver would come straight back here.
-    JS::RootedValue self(cx, JS::ObjectValue(*target));
-    return JS_ForwardSetPropertyTo(cx, target, id, value, self, result);
+    // Declined: the ordinary set on the target, with this object as receiver,
+    // so a setter up the chain sees it as `this` - see `get`. A data write
+    // still lands on the target, through `defineProperty` below.
+    return JS_ForwardSetPropertyTo(cx, target, id, value, receiver, result);
 }
 
 namespace {
