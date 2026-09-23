@@ -664,3 +664,62 @@ UNIBIND_TEST_CASE(REALMS, "regressions: a realm there is no memory for is no rea
     const ub::ContextScope entered(*made);
     CHECK(ub_test::EvalInt(*made, "6 * 7") == 42);
 }
+
+namespace {
+
+/// A native that holds the isolate's thread until another thread has asked
+/// for an interrupt and then a stop, so both are waiting when script next
+/// checks.
+struct Held {
+    ub::Isolate* isolate = nullptr;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> asked{false};
+    std::atomic<int> interrupts{0};
+};
+
+void CountInterrupt(ub::Isolate& /*isolate*/, ub::CallbackData data) {
+    data.As<Held>()->interrupts.fetch_add(1);
+}
+
+void HoldUntilAsked(const ub::CallbackInfo& info) {
+    auto* held = info.Data<Held>();
+    held->entered = true;
+    while (!held->asked) {
+        std::this_thread::yield();
+    }
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(INTERRUPTS, TERMINATION, "regressions: an interrupt waits out a stop that arrives with it") {
+    // An interrupt and a stop waiting at the same check: V8 takes the stop
+    // alone and keeps the interrupt for the next script after the cancel,
+    // while SpiderMonkey's backend ran the interrupt in the middle of the
+    // stop. Whether an embedder's callback ran before the isolate was torn
+    // down depended on the engine; now it waits on both.
+    ub_test::Fixture fixture;
+    Held held;
+    held.isolate = &fixture.iso();
+    const auto hold = ub::Function::New(fixture.context, &HoldUntilAsked, ub::CallbackData::For(held));
+    REQUIRE(hold.has_value());
+    ub_test::Expose(fixture.context, "hold", *hold);
+
+    std::thread asker([&held] {
+        while (!held.entered) {
+            std::this_thread::yield();
+        }
+        CHECK(held.isolate->RequestInterrupt(&CountInterrupt, ub::CallbackData::For(held)));
+        held.isolate->TerminateExecution();
+        held.asked = true;
+    });
+    const auto stopped = ub::Evaluate(fixture.context, "hold(); for (;;) {}");
+    asker.join();
+    CHECK_FALSE(stopped.has_value());
+    CHECK(fixture.iso().IsExecutionTerminating());
+    CHECK(held.interrupts.load() == 0);
+
+    fixture.iso().CancelTerminateExecution();
+    CHECK(ub_test::EvalInt(fixture.context,
+                           "(function () { let n = 0; for (let i = 0; i < 100; ++i) ++n; return n; })()") == 100);
+    CHECK(held.interrupts.load() == 1);
+}
