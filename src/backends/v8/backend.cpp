@@ -1270,6 +1270,13 @@ std::optional<Slot> MakeTypedArray(const Context& context, ElementType type, Slo
     if (byteOffset > byteLength || wanted > byteLength - byteOffset) {
         return std::nullopt;
     }
+    // Two more that V8 enforces by aborting, or not at all: an offset the
+    // element type cannot start at - a RangeError in script, a failed CHECK
+    // here - and a detached buffer, a TypeError in script that V8's API would
+    // make a view over without a word. `DataView::New` already refuses it.
+    if (byteOffset % elementSize != 0 || raw->WasDetached()) {
+        return std::nullopt;
+    }
     v8::Local<v8::TypedArray> view = NewTypedArray(type, raw, byteOffset, length);
     if (view.IsEmpty()) {
         return std::nullopt;

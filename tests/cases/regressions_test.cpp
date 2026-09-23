@@ -276,3 +276,39 @@ UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: an error a native throws under
     CHECK(location->sourceLine == std::optional<std::string>("boom();"));
     // NOLINTEND(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array at an offset its elements cannot start at is empty") {
+    // A typed array's byte offset must be a multiple of its element size -
+    // `new Int32Array(buffer, 1)` is a RangeError in script. Asked from native
+    // code, the answer is empty, as for any view that does not fit; it must not
+    // be the engine's own check, which on one engine ends the process.
+    ub_test::Fixture fixture;
+
+    const auto buffer = ub::ArrayBuffer::New(fixture.context, 32);
+    REQUIRE(buffer.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK_FALSE(ub::TypedArray::New(fixture.context, ub::ElementType::Int32, *buffer, 1, 1).has_value());
+    CHECK_FALSE(ub::TypedArray::New(fixture.context, ub::ElementType::Uint16, *buffer, 3, 2).has_value());
+    CHECK_FALSE(ub::TypedArray::New(fixture.context, ub::ElementType::Float64, *buffer, 4, 1).has_value());
+    CHECK(ub::TypedArray::New(fixture.context, ub::ElementType::Float64, *buffer, 8, 3).has_value());
+    CHECK(ub::TypedArray::New(fixture.context, ub::ElementType::Uint8, *buffer, 3, 2).has_value());
+    // NOLINTEND(bugprone-unchecked-optional-access)
+    CHECK_FALSE(fixture.iso().HasPendingException());
+}
+
+UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array over a detached buffer is refused like a DataView") {
+    // `new Uint8Array(detached)` is a TypeError in script, and `DataView::New`
+    // over one is already empty. A typed array must not be the one view that
+    // can be made over nothing.
+    ub_test::Fixture fixture;
+
+    const auto buffer =
+        ub_test::Eval(fixture.context, "const b = new ArrayBuffer(8); b.transfer(); b").To<ub::ArrayBuffer>();
+    REQUIRE(buffer.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(ub::ByteLength(*buffer) == 0);
+    CHECK_FALSE(ub::DataView::New(fixture.context, *buffer, 0, 0).has_value());
+    CHECK_FALSE(ub::TypedArray::New(fixture.context, ub::ElementType::Uint8, *buffer, 0, 0).has_value());
+    // NOLINTEND(bugprone-unchecked-optional-access)
+    CHECK_FALSE(fixture.iso().HasPendingException());
+}

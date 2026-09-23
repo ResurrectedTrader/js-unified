@@ -359,7 +359,9 @@ struct ArrayBufferView : Object {};
 /// `Float64Array` and the rest.
 struct TypedArray : ArrayBufferView {
     /// A view over `buffer`. `length` is in *elements*; the view must lie
-    /// inside the buffer, or this is empty.
+    /// inside the buffer and start at a multiple of its element size, and the
+    /// buffer must not have been detached, or this is empty - each of those is
+    /// an exception in script, and none is one here.
     [[nodiscard]] static std::optional<Local<TypedArray>> New(const Context& context, ElementType type,
                                                               const Local<ArrayBuffer>& buffer, std::size_t byteOffset,
                                                               std::size_t length) {
