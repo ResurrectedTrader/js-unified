@@ -69,3 +69,32 @@ UNIBIND_TEST_CASE2(CLASSES, CALLABLE_CLASS,
     CHECK(callable.IsInstance(ub_test::Eval(fixture.context, "new CallableGadget()")));
     CHECK(callable.IsInstance(ub_test::Eval(fixture.context, "CallableGadget()")));
 }
+
+namespace {
+
+/// Writes to its receiver before it answers, as a binding author would.
+std::unique_ptr<Gadget> MakeGadgetStamping(const ub::CallbackInfo& info) {
+    if (!info.This().Set(info.GetContext(), "stamped", ub::Integer::New(info.GetIsolate(), 42)).value_or(false)) {
+        info.ThrowTypeError("the constructor could not write to its receiver");
+        return nullptr;
+    }
+    return std::make_unique<Gadget>();
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(CLASSES, CALLABLE_CLASS,
+                   "regressions: a plain call to a class constructs on the instance it returns") {
+    // A plain call yields an instance "made the same way `new` makes one", and
+    // a constructor's receiver is the instance being made. On V8 a plain call
+    // ran the constructor with the call's receiver - the global object - and
+    // made the instance afterwards, so what the constructor wrote to `this`
+    // landed on `globalThis` and the instance came back without it.
+    ub_test::Fixture fixture;
+    const auto cls = ExposeGadgetClass<&MakeGadgetStamping>(fixture, "Stamped", true);
+
+    CHECK(ub_test::EvalInt(fixture.context, "new Stamped().stamped") == 42);
+    CHECK(ub_test::EvalInt(fixture.context, "Stamped().stamped") == 42);
+    CHECK(ub_test::EvalText(fixture.context, "typeof globalThis.stamped") == "undefined");
+    CHECK(cls.IsInstance(ub_test::Eval(fixture.context, "Stamped.call({})")));
+}

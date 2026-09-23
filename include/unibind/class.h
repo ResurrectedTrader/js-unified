@@ -324,7 +324,8 @@ class Class {
     /// `CallbackInfo::IsConstructCall()`, which is there to be branched on -
     /// for a different default, a warning, a different name in an error - not
     /// to change what comes back. **A plain call yields an instance**, made the
-    /// same way `new` makes one.
+    /// same way `new` makes one - including that the callback's `info.This()` is
+    /// that instance, not the receiver the call was made on.
     ///
     /// Letting a plain call return something that is *not* an instance was the
     /// alternative and is rejected: a class whose call does not make an

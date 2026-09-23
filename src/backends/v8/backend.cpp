@@ -2484,28 +2484,36 @@ void ClassConstructTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
         ThrowError(isolate, ErrorKind::TypeError, "this constructor cannot be invoked without 'new'");
         return;
     }
-
-    v8::Local<v8::Object> self;
-    if (constructing) {
-        self = info.This();
-        // The field exists but V8 has not written it, and reading an aligned
-        // pointer out of an unwritten field is undefined - so it gets a value
-        // before anything, including a constructor that unwraps its own `this`,
-        // can ask for one.
-        if (self->InternalFieldCount() > NATIVE_FIELD) {
-            self->SetAlignedPointerInInternalField(NATIVE_FIELD, nullptr, v8::kEmbedderDataTypeTagDefault);
-        }
-    }
-
     if (rec->constructor == nullptr) {
         ThrowError(isolate, ErrorKind::TypeError, "this class cannot be constructed from script");
         return;
+    }
+
+    // The instance first, and the native afterwards, so that the constructor's
+    // receiver is the object being made either way. `new` has one already; a
+    // plain call on a ConstructOrCall class makes the one `new` would have, or
+    // the constructor would run against the call's receiver - the global
+    // object, as often as not - and write there. See Class<T>::ConstructOrCall.
+    v8::Local<v8::Object> self;
+    if (constructing) {
+        self = info.This();
+    } else if (!RawObjectTemplate(rec->instance)->NewInstance(Raw(isolate)->GetCurrentContext()).ToLocal(&self)) {
+        return;
+    }
+    // The field exists but nothing has written it, and reading an aligned
+    // pointer out of an unwritten field is undefined - so it gets a value
+    // before anything, including a constructor that unwraps its own `this`,
+    // can ask for one.
+    if (self->InternalFieldCount() > NATIVE_FIELD) {
+        self->SetAlignedPointerInInternalField(NATIVE_FIELD, nullptr, v8::kEmbedderDataTypeTagDefault);
     }
 
     NativeBox* box = nullptr;
     {
         CallFrame frame(isolate, &info);
         CallbackState state = CallState(isolate, frame.frame(), info, {});
+        state.receiver = self;
+        state.holder = self;
         // A class constructor answers with its native, never through the
         // return slot. V8 makes an object left in a construct call's slot the
         // result of `new` - right for a `FunctionTemplate`, and wrong here,
@@ -2524,25 +2532,14 @@ void ClassConstructTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
         return;
     }
 
-    if (constructing) {
-        if (!AttachNative(isolate, self, box)) {
-            DestroyBox(box);
-            ThrowError(isolate, ErrorKind::Error, "this instance could not be given its native state");
-        }
-        return;
-    }
-
-    // A plain call on a ConstructOrCall class makes the instance `new` would
-    // have made: the callback answered the same way either way, so the result
-    // is the same object. See Class<T>::ConstructOrCall.
-    v8::HandleScope scope(Raw(isolate));
-    v8::Local<v8::Object> instance;
-    if (!RawObjectTemplate(rec->instance)->NewInstance(Raw(isolate)->GetCurrentContext()).ToLocal(&instance) ||
-        !AttachNative(isolate, instance, box)) {
+    if (!AttachNative(isolate, self, box)) {
         DestroyBox(box);
+        ThrowError(isolate, ErrorKind::Error, "this instance could not be given its native state");
         return;
     }
-    info.GetReturnValue().Set(instance);
+    if (!constructing) {
+        info.GetReturnValue().Set(self);
+    }
 }
 
 }  // namespace
