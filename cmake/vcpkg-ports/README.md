@@ -30,3 +30,12 @@ confused with the registry's.
 
 When the baseline moves, re-copy `ports/python3` from vcpkg and regenerate the
 patch against the patched source tree (`buildtrees/python3/src/*.clean`).
+
+### Built-in extension modules (in progress)
+
+A static core cannot load a `.pyd`, so on the `*-windows-static` triplets the
+port compiles extension modules into `python3X.lib` as built-in modules
+(`0101-builtin-extension-modules.patch`, `python_vcpkg.props.in`, and the
+`PYTHON_BUILTIN_EXTENSIONS` list in `portfile.cmake`). So far: `_asyncio`,
+`_overlapped`, `_socket`, `select`. `0102-asyncio-proactor-in-subinterpreters.patch`
+lets asyncio's default (proactor) loop be made in a sub-interpreter.
