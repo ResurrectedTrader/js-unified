@@ -324,6 +324,9 @@ class Local {
     {
         return detail::GetPropertyAttributes(context, slot_, key.slot());
     }
+    /// The object's own keys, filtered as asked. A key that is an array index -
+    /// 0 to 2^32 - 2 - comes back as a Number, as V8 hands it back; any other
+    /// string key as a String, and a symbol as itself.
     [[nodiscard]] std::optional<Local<Array>> GetOwnPropertyNames(const Context& context, KeyFilter filter = {}) const
         requires std::derived_from<T, Object>
     {

@@ -1892,7 +1892,13 @@ Maybe<Slot> GetOwnPropertyNames(const Context& context, Slot object, KeyFilter f
     for (std::size_t i = 0; i < keys.length(); ++i) {
         JS::RootedId id(op.cx, keys[i]);
         JS::RootedValue value(op.cx);
-        if (!JS_IdToValue(op.cx, id, &value)) {
+        // An array index is a number, as V8 hands one back - but this engine
+        // keeps only an index up to INT32_MAX as an integer key, and one above
+        // that as a string, which would come back as one.
+        std::uint32_t index = 0;
+        if (id.isAtom() && js::StringIsArrayIndex(JS_ASSERT_STRING_IS_LINEAR(id.toString()), &index)) {
+            value.setNumber(index);
+        } else if (!JS_IdToValue(op.cx, id, &value)) {
             return std::nullopt;
         }
         if (!values.append(value)) {

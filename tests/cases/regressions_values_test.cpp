@@ -194,3 +194,44 @@ UNIBIND_TEST_CASE(OBJECTS, "regressions: a prototype that cannot be set is an ex
     CHECK(ub_test::EvalTruth(context, "Object.getPrototypeOf(agreeing) === Array.prototype"));
     // NOLINTEND(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE(OBJECTS, "regressions: an own key that is an array index is a number, however large") {
+    // An own key that is an array index - 0 to 2^32 - 2 - comes back as a
+    // Number, as V8 hands it back; any other string key as a String. The other
+    // engine keeps an index above INT32_MAX as a string internally and handed
+    // it back as one.
+    ub_test::Fixture fixture;
+
+    const auto object = ub_test::Eval(fixture.context, R"(
+        ({ 7: 0, 2147483647: 1, 2147483648: 2, 4294967294: 3, 4294967295: 4, '01': 5, x: 6 }))")
+                            .To<ub::Object>();
+    REQUIRE(object.has_value());
+    const auto keys = object->GetOwnPropertyNames(fixture.context);  // NOLINT(bugprone-unchecked-optional-access)
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->Length() == 7);
+
+    std::vector<std::string> seen;
+    for (std::uint32_t at = 0; at < keys->Length(); ++at) {
+        const auto key = keys->Get(fixture.context, at);
+        REQUIRE(key.has_value());
+        const auto text = key->ToString(fixture.context);
+        REQUIRE(text.has_value());
+        seen.push_back((key->IsNumber() ? "number " : "string ") + text->Utf8Value());
+    }
+    CHECK(seen == std::vector<std::string>{"number 7", "number 2147483647", "number 2147483648", "number 4294967294",
+                                           "string 4294967295", "string 01", "string x"});
+
+    // The same through a proxy, whose keys arrive from its trap as strings.
+    const auto proxy = ub_test::Eval(fixture.context, R"(
+        new Proxy({}, {
+            ownKeys() { return ['3000000000', 'y']; },
+            getOwnPropertyDescriptor() { return { value: 1, enumerable: true, configurable: true }; },
+        }))")
+                           .To<ub::Object>();
+    REQUIRE(proxy.has_value());
+    const auto proxyKeys = proxy->GetOwnPropertyNames(fixture.context);  // NOLINT(bugprone-unchecked-optional-access)
+    REQUIRE(proxyKeys.has_value());
+    REQUIRE(proxyKeys->Length() == 2);
+    CHECK(proxyKeys->Get(fixture.context, 0U)->IsNumber());  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK(proxyKeys->Get(fixture.context, 1U)->IsString());  // NOLINT(bugprone-unchecked-optional-access)
+}
