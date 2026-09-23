@@ -372,7 +372,10 @@ be partly borrowed.
   checks themselves are assertions, so they fire only where assertions are
   live. A Release build carries the epoch and does not test it.
 - Use of a `Local` after its frame closed: caught in checked builds by an
-  epoch word carried in the handle and compared against the frame's. On x86
+  epoch word carried in the handle and compared against the frame's. A frame
+  overwrites its epoch with one no handle carries as it closes, so the check
+  does not depend on a later frame reusing the same storage - which an
+  optimised build usually does and an unoptimised one usually does not. On x86
   the option changes `sizeof(Local)` from 8 to 12; on x64 it changes nothing,
   because the epoch fits in the padding (§6). It is an ABI change either way —
   which is why the flag lives in a **generated** `unibind/config.h` rather than

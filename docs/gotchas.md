@@ -102,6 +102,27 @@ operators still call the shim's `malloc`. This tree's test suite does exactly
 that, only in the configuration that needs it, and only after probing the
 archive's symbol index to find out - `tests/cmake/EngineAllocator.cmake`.
 
+### An `operator new` that throws is survivable only where unibind allocates
+
+**Silent on a release V8, an abort on a debug one.** Replacing `operator new`
+with one that throws `std::bad_alloc` - the standard one does, when memory runs
+out - is supported where the *library* allocates: its own allocations are
+caught and answered with the empty result the header documents, and nothing is
+handed over twice or not at all. It is not supported where the *engine*
+allocates through the same operator. V8 calls `operator new` from inside itself
+(a template instantiation's cache, a global handle's young-object list) and is
+compiled without exceptions, so a throw from there unwinds through frames that
+clean nothing up: a handle scope left open, a cache half-written, a root the
+collector no longer tracks. A debug V8 notices the first of those and aborts; a
+release V8 goes on with it, and what goes wrong later is somewhere else. Where
+the library's own entry point is `noexcept`, such a throw ends at
+`std::terminate`, deliberately, rather than being caught and carried on from.
+
+Nothing an embedder or a backend can do makes the engine's allocations
+recoverable. An embedder that injects allocation failures to test itself - as
+this repository's suite does - aims them at the library's allocations and keeps
+them out of the engine's; `docs/testing.md` has how the suite does that.
+
 ### `js-config.h` does not describe the build it shipped with
 
 **Silent, and the most expensive one here.** `js-config.h` is the header
@@ -792,9 +813,11 @@ that was instant anyway, because that is a different question.
 
 **Silent, and it looks like a working cache.** Both engines compile a function's
 body on its first call, so a blob made straight after `Script::Compile` holds
-the top level and nothing inside a function; made after a run, it holds what
-that run happened to call. The next start consumes it, `UsedCodeCache()` says
-true, and every function still compiles on first use. Compile with
+the top level and nothing inside a function. Made after a run, V8's holds what
+that run happened to call and SpiderMonkey's still holds only the compile as it
+was - measured, not assumed, by the suite's eager-compile cases. The next
+start consumes it, `UsedCodeCache()` says true, and every function still
+compiles on first use. Compile with
 `CompileOptions::EagerCompile` when the point is the blob, and pass it to
 `CompileWithCache` as well, so that a stale blob is replaced by an eager compile
 rather than a lazy one. V8 would otherwise answer an eager compile of source it

@@ -29,6 +29,7 @@
 
 #include "support/ownership.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -718,7 +719,7 @@ UNIBIND_TEST_CASE(OWNERSHIP, "ownership: a native is destroyed on the thread tha
 // ---------------------------------------------------------------------------
 // What an allocation failure *inside* the hand-over costs
 //
-// `Wrap` allocates more than once - the box, the engine's own record of the
+// `Wrap` allocates more than once - the box, the backend's record of the
 // instance, the slot the handle needs - and only the first of those is covered
 // above, because a single injected failure always lands on the first. The
 // sweep below walks the failure through the call, and the question at every
@@ -727,65 +728,113 @@ UNIBIND_TEST_CASE(OWNERSHIP, "ownership: a native is destroyed on the thread tha
 //
 // The failure it is written for: a box the engine has already been told about,
 // and which the caller then frees as well.
+//
+// It walks the hand-over's *own* allocations and stops before the engine's. An
+// engine may call the same `operator new`, but none is built to be unwound
+// through - V8 is compiled without exceptions, so a `std::bad_alloc` thrown
+// from inside it skips the engine's own cleanup and leaves it corrupt (a debug
+// V8 aborts on the handle scope it left open; a release one carries on). That
+// is a fact about the engine rather than a question about ownership, so the
+// sweep stays out of it. It can, because a backend whose engine shares the
+// process's `operator new` makes every allocation of its own before it asks the
+// engine for anything (and an engine with an allocator of its own asks for none
+// of these), so the first so-many allocations of a hand-over are the backend's.
+// How many is measured rather than assumed: the fewest a complete hand-over
+// asks for in the same state, once the engine has done what it does only the
+// first time a class makes an instance in a realm.
 // ---------------------------------------------------------------------------
+
+namespace {
+
+/// One hand-over in a frame with nothing left inline, so that the slot the
+/// wrapper needs is one of the allocations that can fail. Fails allocation
+/// number `skip` of the call when asked to.
+struct HandOver {
+    std::shared_ptr<Tracked> native;
+    bool made = false;
+    long long fired = 0;
+    long long requested = 0;
+};
+
+[[nodiscard]] HandOver HandOverCrowded(ub_test::Fixture& fixture, const ub::Class<Tracked>& cls,
+                                       std::optional<long long> skip) {
+    HandOver attempt;
+    attempt.native = std::make_shared<Tracked>(7);
+
+    const ub::HandleScope crowded(fixture.iso());
+    std::vector<ub::Local<ub::Integer>> filler;
+    filler.reserve(UNIBIND_FRAME_INLINE_SLOTS);
+    for (int i = 0; i < UNIBIND_FRAME_INLINE_SLOTS; ++i) {
+        filler.push_back(ub::Integer::New(fixture.iso(), i));
+    }
+
+    ub::TryCatch tryCatch(fixture.iso());
+    std::optional<ub::Local<ub::Object>> made;
+    const long long before = ub_test::AllocationsRequested();
+    if (skip) {
+        ub_test::AllocationFailure failing(1, *skip);
+        try {
+            made = cls.Wrap(fixture.context, attempt.native);
+        } catch (const std::bad_alloc&) {
+            // A failure may arrive as an empty result or as a throw out of the
+            // allocator. The ownership question is the same one.
+        }
+        attempt.fired = failing.Stop();
+    } else {
+        made = cls.Wrap(fixture.context, attempt.native);
+    }
+    attempt.requested = ub_test::AllocationsRequested() - before;
+    attempt.made = made.has_value();
+    tryCatch.Reset();
+    return attempt;
+}
+
+}  // namespace
 
 UNIBIND_TEST_CASE(OWNERSHIP, "ownership: a hand-over that runs out of memory gives the native back exactly once") {
     Lives::Reset();
-    constexpr long long SITES = 8;
     std::vector<int> ids;
+    long long sites = 0;
     long long reached = 0;
 
     {
         ub_test::Fixture fixture;
         const auto cls = DeclareTracked(fixture.iso());
 
-        for (long long skip = 0; skip < SITES; ++skip) {
+        // The first hand-over is the engine's first instance of the class in
+        // this realm, and is not measured. The fewest of the rest is the
+        // backend's own share of a hand-over: whatever an engine or another
+        // thread adds only ever adds.
+        for (int i = 0; i < 4; ++i) {
+            const HandOver dry = HandOverCrowded(fixture, cls, std::nullopt);
+            ids.push_back(dry.native->id);
+            REQUIRE(dry.made);
+            if (i > 0) {
+                sites = sites == 0 ? dry.requested : std::min(sites, dry.requested);
+            }
+        }
+        MESSAGE("a hand-over in a crowded frame asks for ", sites, " allocations");
+
+        for (long long skip = 0; skip < sites; ++skip) {
             CAPTURE(skip);
-            auto shared = std::make_shared<Tracked>(7);
-            const int id = shared->id;
-            ids.push_back(id);
-
-            // A frame with nothing left inline, so the slot the wrapper needs
-            // is one of the allocations that can fail - the last of them, and
-            // the one that happens after the engine already has the box.
-            ub::HandleScope crowded(fixture.iso());
-            std::vector<ub::Local<ub::Integer>> filler;
-            filler.reserve(UNIBIND_FRAME_INLINE_SLOTS);
-            for (int i = 0; i < UNIBIND_FRAME_INLINE_SLOTS; ++i) {
-                filler.push_back(ub::Integer::New(fixture.iso(), i));
-            }
-
-            ub::TryCatch tryCatch(fixture.iso());
-            std::optional<ub::Local<ub::Object>> made;
-            long long fired = 0;
-            {
-                ub_test::AllocationFailure failing(1, skip);
-                try {
-                    made = cls.Wrap(fixture.context, shared);
-                } catch (const std::bad_alloc&) {
-                    // A failure may arrive as an empty result or as a throw out
-                    // of the allocator. The ownership question is the same one.
-                }
-                fired = failing.Stop();
-            }
-            tryCatch.Reset();
-            if (fired == 0) {
+            const HandOver attempt = HandOverCrowded(fixture, cls, skip);
+            ids.push_back(attempt.native->id);
+            if (attempt.fired == 0) {
                 continue;
             }
             ++reached;
 
-            // Nothing has been destroyed yet whatever happened: the embedder
-            // still holds a share of its own.
-            CHECK(Lives::Deaths(id) == 0);
-            CHECK(shared->value == 7);
-            // The engine may hold a share even though the wrapper was not
-            // made: a hand-over that failed *after* the box reached the engine
-            // is one the engine gives back, at teardown rather than now. What
-            // must never happen is a share going twice, or going while the
-            // embedder still holds one - which is what the per-native count
-            // after the isolate is gone asks.
-            CHECK(shared.use_count() >= 1);
-            CHECK(shared.use_count() <= 2);
+            // No wrapper, and nothing destroyed yet whatever happened: the
+            // embedder still holds a share of its own. The engine may hold one
+            // too - a failure *after* the box reached the engine is a hand-over
+            // the engine gives back, at teardown rather than now. What must never
+            // happen is a share going twice, or going while the embedder still
+            // holds one, which is what the count per native below asks.
+            CHECK_FALSE(attempt.made);
+            CHECK(attempt.native.use_count() >= 1);
+            CHECK(attempt.native.use_count() <= 2);
+            CHECK(Lives::Deaths(attempt.native->id) == 0);
+            CHECK(attempt.native->value == 7);
         }
     }
 
@@ -795,7 +844,7 @@ UNIBIND_TEST_CASE(OWNERSHIP, "ownership: a hand-over that runs out of memory giv
         return;
     }
 
-    INFO("failures landed at ", reached, " of ", SITES, " allocation sites");
+    INFO("failures landed at ", reached, " of ", sites, " allocation sites");
     for (const int id : ids) {
         CAPTURE(id);
         CHECK(Lives::Deaths(id) == 1);

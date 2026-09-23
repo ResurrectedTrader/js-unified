@@ -195,6 +195,11 @@ void Expose(const ub::Context& context, std::string_view name, const ub::Local<T
 /// Blocks allocated and not yet freed, process-wide.
 [[nodiscard]] long long OutstandingAllocations() noexcept;
 
+/// Allocations asked for since the process started, granted or not. Like the
+/// count above it is process-wide, so the difference across a call is what the
+/// call asked for plus whatever another thread asked for meanwhile - never less.
+[[nodiscard]] long long AllocationsRequested() noexcept;
+
 /// Make `count` allocations fail - throwing `std::bad_alloc` from the throwing
 /// forms, returning null from the nothrow ones - which is what running out of
 /// memory looks like to the code under test, after letting `skip` of them

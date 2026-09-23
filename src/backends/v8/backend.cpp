@@ -213,6 +213,20 @@ struct Isolate::Impl {
 
 namespace detail {
 
+/// An empty vector, made by a constructor that is allowed to fail.
+///
+/// Under the MSVC STL's iterator debugging - every Debug build - even an empty
+/// vector allocates: its container proxy. The default constructor makes that
+/// allocation and is `noexcept`, so running out of memory there is
+/// `std::terminate`, not the `std::bad_alloc` the caller is waiting to catch.
+/// The range constructor makes the same allocation and may throw. An empty range
+/// of move iterators is used so that it asks nothing of `T` beyond being movable.
+template <class T>
+[[nodiscard]] std::unique_ptr<std::vector<T>> NewEmptyVector() {
+    T* const none = nullptr;
+    return std::make_unique<std::vector<T>>(std::make_move_iterator(none), std::make_move_iterator(none));
+}
+
 /// What a native function was declared with.
 ///
 /// Lives as long as the isolate when a template or a class owns it, and as
@@ -252,9 +266,18 @@ struct Frame {
         }
     }
 
+    /// A closed frame's epoch is one no handle of it carries, so a handle that
+    /// outlived it is diagnosed whether or not a later frame reused the storage.
+    /// An optimised build usually does reuse it and an unoptimised one usually
+    /// does not, and without this the check caught only the first. Volatile,
+    /// because a store in a destructor to an object that is about to end is
+    /// exactly the store an optimiser may drop.
     ~Frame() {
         CloseV8Scope();
         ApplyDeferredEscapes();
+#if UNIBIND_HANDLE_CHECKS
+        *static_cast<volatile uint32_t*>(&epoch) = ~epoch;
+#endif
     }
 
     Frame(const Frame&) = delete;
@@ -277,13 +300,31 @@ struct Frame {
         }
         try {
             if (overflow == nullptr) {
-                overflow = std::make_unique<std::vector<v8::Local<v8::Value>>>();
+                overflow = NewEmptyVector<v8::Local<v8::Value>>();
             }
             overflow->push_back(value);
         } catch (const std::bad_alloc&) {
             return NO_SLOT;
         }
         return argCount + count++;
+    }
+
+    /// Make room for `more` pushes, so that they cannot fail. False when the
+    /// room could not be made; nothing has been pushed either way.
+    [[nodiscard]] bool Reserve(SlotIndex more) noexcept {
+        const SlotIndex needed = count + more;
+        if (needed <= UNIBIND_FRAME_INLINE_SLOTS) {
+            return true;
+        }
+        try {
+            if (overflow == nullptr) {
+                overflow = NewEmptyVector<v8::Local<v8::Value>>();
+            }
+            overflow->reserve(needed - UNIBIND_FRAME_INLINE_SLOTS);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        return true;
     }
 
     [[nodiscard]] v8::Local<v8::Value> At(SlotIndex index) const {
@@ -776,7 +817,7 @@ Slot EscapeSlot(Frame& closing, Slot value) noexcept {
     }
     try {
         if (closing.deferred == nullptr) {
-            closing.deferred = std::make_unique<std::vector<std::pair<SlotIndex, v8::Global<v8::Value>>>>();
+            closing.deferred = NewEmptyVector<std::pair<SlotIndex, v8::Global<v8::Value>>>();
         }
         closing.deferred->emplace_back(index, v8::Global<v8::Value>(Raw(owner), local));
     } catch (const std::bad_alloc&) {
@@ -2369,13 +2410,49 @@ void FinalizeNative(const v8::WeakCallbackInfo<InstanceRecord>& data) {
     data.SetSecondPassCallback(&FinalizeNativeLate);
 }
 
+/// File `box` on the isolate's list of survivors, under a record of its own,
+/// before anything has been published. Null when either could not be
+/// allocated, and then nothing has been filed.
+///
+/// These are the backend's own allocations for a hand-over, and they are made
+/// before the engine is asked for anything, so that running out of memory in
+/// them is a hand-over that never started. The engine's own allocations are a
+/// different matter: see `ClassInstantiate`.
+[[nodiscard]] InstanceRecord* FileNative(Isolate& isolate, NativeBox* box) noexcept {
+    try {
+        auto owned = std::make_unique<InstanceRecord>();
+        owned->owner = &isolate;
+        owned->box = box;
+        InstanceRecord* record = owned.get();
+        isolate.impl().liveNatives.emplace(record, std::move(owned));
+        return record;
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+
+/// Take a record `FileNative` made back off the list, leaving its box alone:
+/// the hand-over did not happen, and the box is still the caller's.
+void UnfileNative(Isolate& isolate, InstanceRecord* record) noexcept {
+    record->box = nullptr;
+    isolate.impl().liveNatives.erase(record);
+}
+
+/// Put a filed box on `instance` and give the record the weak root that says
+/// when the instance has gone. Past this the engine owns the box: the instance
+/// carries it, and the finalizer or `~Isolate` gives it back exactly once.
+void PublishNative(Isolate& isolate, v8::Local<v8::Object> instance, InstanceRecord* record) noexcept {
+    instance->SetAlignedPointerInInternalField(NATIVE_FIELD, record->box, v8::kEmbedderDataTypeTagDefault);
+    record->handle.Reset(Raw(isolate), instance);
+    record->handle.SetWeak(record, &FinalizeNative, v8::WeakCallbackType::kParameter);
+}
+
 /// Hand `box` to the engine, or hand nothing over at all.
 ///
-/// All-or-nothing on purpose, and it is what lets `ClassInstantiate` say
-/// plainly who owns the box: after a true answer the engine does - the
-/// instance carries it and the isolate has it on the list that finishes the
-/// survivors - and after a false one nothing has been published, so the caller
-/// still does and destroys it.
+/// All-or-nothing on purpose, and it is what lets the construct trampoline say
+/// plainly who owns the box: after a true answer the engine does, and after a
+/// false one nothing has been published, so the caller still does and destroys
+/// it.
 ///
 /// The internal field is checked rather than assumed. An object that cannot
 /// carry a native must not be given one: writing past the field count is a
@@ -2389,29 +2466,11 @@ void FinalizeNative(const v8::WeakCallbackInfo<InstanceRecord>& data) {
         instance->SetAlignedPointerInInternalField(NATIVE_FIELD, nullptr, v8::kEmbedderDataTypeTagDefault);
         return true;
     }
-    InstanceRecord* record = nullptr;
-    try {
-        auto owned = std::make_unique<InstanceRecord>();
-        owned->owner = &isolate;
-        owned->box = box;
-        record = owned.get();
-        // Recorded before it is published, so that a failure here is a failure
-        // that published nothing.
-        isolate.impl().liveNatives.emplace(record, std::move(owned));
-    } catch (const std::bad_alloc&) {
+    InstanceRecord* record = FileNative(isolate, box);
+    if (record == nullptr) {
         return false;
     }
-    instance->SetAlignedPointerInInternalField(NATIVE_FIELD, box, v8::kEmbedderDataTypeTagDefault);
-    try {
-        record->handle.Reset(Raw(isolate), instance);
-        record->handle.SetWeak(record, &FinalizeNative, v8::WeakCallbackType::kParameter);
-    } catch (const std::bad_alloc&) {
-        // The engine's own bookkeeping ran out of memory while making the weak
-        // root. The box is already published, so this is still a hand-over
-        // that happened: without the root the collector will not finish it,
-        // and `~Isolate` - which walks the list this record is already on -
-        // will. Exactly once either way, which is the promise.
-    }
+    PublishNative(isolate, instance, record);
     return true;
 }
 
@@ -2537,33 +2596,49 @@ std::optional<Slot> ClassInstantiate(const Context& context, ClassRec* rec, Nati
     assert((native == nullptr || native->type == rec->nativeType) &&
            "a class was handed a native of a type it does not wrap");
     Isolate& owner = OwnerOf(context);
-    v8::Local<v8::Object> instance;
-    try {
-        // Built from the instance template, so it gets the class's prototype
-        // and its internal field without the script constructor running.
-        if (!RawObjectTemplate(rec->instance)->NewInstance(Raw(context)).ToLocal(&instance) ||
-            !AttachNative(owner, instance, native)) {
-            // Ownership transferred at the call, so a hand-over that did not
-            // happen ends here rather than back at the caller.
-            DestroyBox(native);
-            return std::nullopt;
-        }
-    } catch (const std::bad_alloc&) {
-        // The engine allocates here too - through `operator new`, where an
-        // embedder that replaced it can make it fail - and this function is
-        // `noexcept`, so an escaping `bad_alloc` is `std::terminate` rather
-        // than the empty answer the contract promises. (Measured: without this
-        // catch, an injected failure at the fourth allocation inside the call
-        // ends the process.) It must also arrive as a failure that consumed
-        // the box, or the caller is left holding one it was told it had handed
-        // over.
+    Frame* frame = owner.impl().current;
+    assert(frame != nullptr && "a value was created with no HandleScope open");
+
+    // Everything of the backend's own that the hand-over needs is allocated
+    // first: room in the frame for the handle, and the record that files the
+    // box on the isolate. A failure among them has handed nothing over, and
+    // ownership transferred at the call, so the box is given back here.
+    //
+    // First, because the engine's allocations cannot fail the same way. V8 is
+    // built without exceptions, so a `std::bad_alloc` out of an `operator new`
+    // it called unwinds through frames that clean nothing up - an open handle
+    // scope, a half-made instance, a root half-recorded - and there is no state
+    // to go on from. Debug V8 says so (a handle scope level mismatch); release
+    // V8 carries on with it. Nothing here catches such a throw, and
+    // `noexcept` turns it into `std::terminate`: see docs/gotchas.md.
+    if (!frame->Reserve(1)) {
         DestroyBox(native);
         return std::nullopt;
     }
-    // Past this point the *engine* owns the box: the instance carries it and
-    // the isolate has it on the list ~Isolate finishes. The handle below can
-    // still fail to be made, and the box is not this function's to give back
-    // when it does - the finalizer or teardown gives it back exactly once.
+    InstanceRecord* const record = native != nullptr ? FileNative(owner, native) : nullptr;
+    if (native != nullptr && record == nullptr) {
+        DestroyBox(native);
+        return std::nullopt;
+    }
+
+    // Built from the instance template, so it gets the class's prototype and
+    // its internal field without the script constructor running.
+    v8::Local<v8::Object> instance;
+    if (!RawObjectTemplate(rec->instance)->NewInstance(Raw(context)).ToLocal(&instance) ||
+        instance->InternalFieldCount() <= NATIVE_FIELD) {
+        if (record != nullptr) {
+            UnfileNative(owner, record);
+        }
+        DestroyBox(native);
+        return std::nullopt;
+    }
+    if (record != nullptr) {
+        PublishNative(owner, instance, record);
+    } else {
+        instance->SetAlignedPointerInInternalField(NATIVE_FIELD, nullptr, v8::kEmbedderDataTypeTagDefault);
+    }
+    // The room was made above, so this cannot fail: a hand-over either happens
+    // with a handle to show for it or does not happen at all.
     return PushOrNothing(owner, instance);
 }
 
@@ -2975,6 +3050,14 @@ namespace {
 [[nodiscard]] ScriptRec* CompileInto(const Context& context, std::string_view source, const ScriptOrigin& origin,
                                      std::span<const uint8_t> codeCache, CompileOptions options) {
     Isolate& owner = OwnerOf(context);
+    // A compile may not start while a termination is unwinding: V8's compile
+    // entry asserts it in a debug build, and a release one compiles anyway. A
+    // stopped isolate runs nothing (decision 15), so nothing compiled now could
+    // run; it fails as every other call made during a stop does, and the
+    // caller's `TryCatch` says why.
+    if (Raw(owner)->IsExecutionTerminating()) {
+        return nullptr;
+    }
     v8::Local<v8::String> text;
     if (!NewString(owner, source).ToLocal(&text)) {
         return nullptr;

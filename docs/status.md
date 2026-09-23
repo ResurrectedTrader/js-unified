@@ -533,8 +533,10 @@ eager compile carries a mark there and is filed apart. SpiderMonkey has no such
 cache and needs neither; its eager compile is `ParseEverythingEagerly`.
 
 The suite holds this by the one thing about a blob that is portable to look at,
-its size - an eager blob of mostly-function source is over twice a lazy one
-on both engines - including for an eager compile of source the same isolate had
+its size - an eager blob is larger than a lazy one of the same source, and no
+smaller than a lazy one made after every function has run, on both engines and
+in every build of them (`docs/testing.md` says why not by a fixed factor) -
+including for an eager compile of source the same isolate had
 just compiled lazily, and one that followed a refused blob.
 
 ### 20. What belongs to an isolate, what belongs to the process (`unibind/isolate.h`)

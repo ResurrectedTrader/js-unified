@@ -27,6 +27,9 @@
 namespace {
 
 std::atomic<long long> g_outstanding{0};
+/// Every allocation asked for, whether it was granted, refused on purpose or
+/// failed for real.
+std::atomic<long long> g_requested{0};
 
 /// How many of the next allocations must fail. Not atomic-safe against other
 /// threads by design: the suite is single-threaded, and an injected failure
@@ -41,6 +44,7 @@ long long g_allocationsToSkip = 0;
 
 /// True when this allocation is the one that has to fail.
 [[nodiscard]] bool ShouldFail() noexcept {
+    g_requested.fetch_add(1, std::memory_order_relaxed);
     if (g_failuresArmed <= 0) {
         return false;
     }
@@ -133,6 +137,10 @@ namespace ub_test {
 
 long long OutstandingAllocations() noexcept {
     return g_outstanding.load(std::memory_order_relaxed);
+}
+
+long long AllocationsRequested() noexcept {
+    return g_requested.load(std::memory_order_relaxed);
 }
 
 void FailNextAllocations(long long count, long long skip) noexcept {

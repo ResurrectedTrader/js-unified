@@ -89,7 +89,7 @@ pointing inside SpiderMonkey's own crash macro.
 | templates | `cases/templates_test.cpp` | constants, methods, accessors, nesting, inheritance, `HasInstance`, instantiation into several realms, and the call/construct grid: a template given a callback answers to both and tells them apart, while a method and both halves of an accessor answer to neither `new` |
 | interceptors | `cases/interceptors_test.cpp` | all five named and all five indexed hooks, driven through `in`, `Object.keys`, `getOwnPropertyDescriptor` and `delete` |
 | classes | `cases/classes_test.cpp` | construction, a constructor that hands back a share with its own deleter, statics, accessors, one instance carrying an accessor its class does not, `Wrap`, checked unwrapping, and finalizers |
-| ownership and destruction | `cases/ownership_test.cpp` | who owns a native and when it is destroyed: exactly once per native and never twice, a native still whole after a collection that spared it, two wrappers over one native, co-ownership with the embedder in both directions, the last reference winning whichever one it is, the no-op-deleter escape hatch, the failure paths that must not leak, an allocation failure walked through *every* step of the hand-over (which is where the double free lived), what a function, a function carrying a script value that points back at it, and an external cost their isolate once they are collected, and that finalizing one instance costs the same however many the isolate has made |
+| ownership and destruction | `cases/ownership_test.cpp` | who owns a native and when it is destroyed: exactly once per native and never twice, a native still whole after a collection that spared it, two wrappers over one native, co-ownership with the embedder in both directions, the last reference winning whichever one it is, the no-op-deleter escape hatch, the failure paths that must not leak, an allocation failure walked through every step of the hand-over the backend makes itself (which is where the double free lived) and kept out of the engine's own, what a function, a function carrying a script value that points back at it, and an external cost their isolate once they are collected, and that finalizing one instance costs the same however many the isolate has made |
 | a sandbox | `cases/sandbox_test.cpp` | the one composition: a second realm, an interceptor over every property, a `Global` held across calls, and a prototype method that has to survive the interceptor |
 | termination | `cases/termination_test.cpp` | stopping a running script from another thread, telling a stop from a throw, script not being able to catch one, a remembered stop, repeatability, and a blocking native running to completion |
 | stacks | `cases/stacks_test.cpp` | frames off a caught exception and off the running stack, the origin's line offset reaching a diagnostic, and the empty answers |
@@ -299,11 +299,25 @@ skips if not.
 
 Nothing outside an engine can see whether a function body was compiled, so the
 `EAGER_COMPILE` cases look at the one thing that is portable: the size of the
-code-cache blob. An eager blob of source that is mostly function bodies is over
-twice a lazy one on both engines, and the cases assert "more than one and a half
-times" and report the two sizes. That covers an eager compile after a lazy one
-of the same source in the same isolate - which V8 would otherwise answer from
-its own cache with the lazy result - and after a refused blob.
+code-cache blob. Not against a fixed factor, though. How much a *lazy* blob
+holds is the engine build's business - for the suite's source a debug V8's is
+more than three times a release V8's, and its eager blob is only about a
+quarter larger than its lazy one where a release V8's is more than three times
+it - so "more than one and a half times", which is what the cases asserted
+first, passed on every release engine and failed on the debug one. What they
+assert now holds on every engine and every build of one, and they report all
+three sizes:
+
+- an eager blob is **larger than a lazy one** of the same source; and
+- it is **at least as large as a lazy one made after every function has run**,
+  inner ones included - the blob an embedder would otherwise have to warm up to
+  get. V8's blob takes in what has run since the compile, so there the two are
+  the same size, to the byte, in both builds; SpiderMonkey's is the compile as
+  it was, so there the second is no larger than the first lazy one.
+
+That covers an eager compile after a lazy one of the same source in the same
+isolate - which V8 would otherwise answer from its own cache with the lazy
+result, a blob no larger than the lazy one - and after a refused blob.
 
 ## What the new areas assert, and what they cannot
 
@@ -339,6 +353,23 @@ Neither engine promises to collect, so "destroyed after both wrappers are gone"
 is asserted as "not destroyed while one remains, and destroyed exactly once by
 the time the isolate is" - which is the strongest portable form of it.
 
+**An injected allocation failure is kept out of the engine.** `ownership: a
+hand-over that runs out of memory gives the native back exactly once` walks one
+failure through every allocation `Wrap` makes, and the walk used to be a fixed
+eight stops - which on V8 reached the engine's own `operator new` calls, from
+`ObjectTemplate::NewInstance` and from the global handle behind the weak root.
+V8 is compiled without exceptions, so a `std::bad_alloc` thrown there unwinds
+through frames that clean nothing up: a debug V8 aborts on the handle-scope
+level the unwound `NewInstance` left behind, and a release V8 carries on with
+its handle scopes, its instantiation cache and its young-handle list quietly
+wrong. That is not a question about ownership and no backend can answer it, so
+the case now measures how many allocations a complete hand-over asks for - the
+fewest over a few, after one that lets the engine do its first-instance work -
+and walks only those. They are the backend's: V8's backend makes every
+allocation of its own before it asks the engine for anything (the record that
+files the box, and the frame slot the handle will need), and SpiderMonkey's
+engine allocates through its own allocator and asks for none of them.
+
 ### Termination
 
 The contract these hold the backends to is in `unibind/isolate.h`. Two things about
@@ -355,6 +386,13 @@ still terminating and runs nothing. Whether *closing* the handler also ends the
 stop is the open question listed at the end of this file, so that case reports
 it rather than asserting it, and every other case cancels (a no-op when nothing
 is armed) before carrying on. A decision either way touches one case.
+
+**A compile during a stop fails without asking the engine.** V8 asserts, in a
+debug build, that nothing enters its compiler while a termination is unwinding;
+a release V8 compiles anyway. Decision 15 says a stopped isolate may be asked
+to compile and run and that nothing will run, so the backend answers a compile
+itself while V8 is terminating - it fails, as the run it would lead to would -
+rather than make a call the engine forbids.
 
 **A native that does not re-enter the engine cannot be interrupted**, on either
 engine: a stop takes effect where the *engine* checks for one, so the spinning
@@ -682,38 +720,68 @@ process of its own expecting exactly that death. Like the use-after-scope check
 it exists only where it can hold - `CONFIGURATIONS Debug`, and only with
 `UNIBIND_HANDLE_CHECKS` - so a Release run neither checks it nor tolerates it.
 
-## A Debug build is not green, and what that does and does not mean
+## A Debug build is green, and what it took
 
-CI runs Release on both engines and both architectures, which is what the
-engine archives are built for. A local Debug tree (`UNIBIND_ENGINE_FLAVOR=debug`
-against a debug engine) is worth building for the checked-build tests, and when
-you do, three things fail that are not the library being wrong. They are
-written down here so that the next person does not spend the afternoon that
-finding them costs.
+CI runs the suite in Release on both engines and both architectures, which is
+what the engine archives are built for, and in Debug against each engine's
+debug build as well. A debug engine compiles in its own assertions - V8's
+`DCHECK`s, SpiderMonkey's `MOZ_ASSERT`s - and the rule here is that one firing
+is a bug until proven otherwise. Every one so far has been, and none of them
+was visible in a release build, which is the reason the Debug run is not
+optional:
 
-- **Two cases trip a V8 `DCHECK`**, which a release engine does not compile in.
-  `ownership: a hand-over that runs out of memory gives the native back exactly
-  once` leaves V8's own handle-scope level one deeper than its API check expects
-  after an injected allocation failure (`api.cc: scope_level_ == ...
-  handle_scope_data()->level`), and `termination: a handler does not swallow a
-  stop the way it swallows an exception` compiles a script while the isolate is
-  still terminating, which is precisely what decision 15 says a stopped isolate
-  may be asked to do and what `DCHECK(!i_isolate->is_execution_terminating())`
-  says it may not. Both are arguments with a debug engine about behaviour the
-  release engine implements; `whole-suite-in-one-process` then fails for the
-  first of them, and `parity` for both.
-- **The use-after-scope check does not fire.** Its provocation, not the check.
-  The epoch only mismatches if the new frame lands on the *same* storage the
-  closed one had, and where the compiler gives the two scopes different stack
-  addresses - a `/RTC1` Debug build, with guard bytes between them, does - the
-  stale handle resolves through the dead frame's own memory, which still reads
-  its old epoch. The read then returns the value the reused V8 handle block now
-  holds, the process exits cleanly, and CTest reports the `WILL_FAIL` test as a
-  failure. The diagnosis is sound and the way the test reaches it is not
-  portable.
-
-The decision-27 check has no such problem: nothing about it depends on storage
-being reused, and it is counted rather than inferred.
+- **An allocation failure injected into V8.** The ownership sweep walked its
+  failure into V8's own `operator new` calls, and a `std::bad_alloc` thrown
+  through an engine built without exceptions left V8's handle-scope level one
+  deeper than its API check expects (`scope_level_ == ...
+  handle_scope_data()->level`). The release engine carried on with the same
+  corruption. The backend now makes its own allocations for a hand-over before
+  it enters the engine and the sweep stays in front of the engine's - see
+  "Ownership" above, and `docs/gotchas.md` for what that means for an
+  embedder's own allocator.
+- **An empty `std::vector` that could not fail politely.** Under the MSVC STL's
+  iterator debugging even an empty vector allocates - its container proxy - in
+  a default constructor that is `noexcept`, so a frame's first overflow slot
+  running out of memory was `std::terminate` instead of the empty handle
+  `docs/lifetimes.md` rule 9 promises. The V8 backend makes those vectors with a
+  constructor that may throw.
+- **A compile while a termination is unwinding**, which V8 asserts against and
+  decision 15 asks for: see "Termination" above.
+- **Eager blobs held to a release engine's proportions.** A debug V8's lazy
+  blob is several times a release one's; "Eager compiles are seen through the
+  blob" above has what the cases compare instead.
+- **The use-after-scope check's provocation.** Its epoch mismatched only if a
+  new frame landed on the storage the closed one had, and an unoptimised build
+  gives two scopes different stack addresses, so the stale handle resolved
+  through the dead frame's memory, which still read its old epoch - and the
+  `WILL_FAIL` test passed its handle and exited cleanly. A frame now writes an
+  epoch no handle carries as it closes, on both backends, so the check fires
+  whether or not the storage was reused (`docs/lifetimes.md` section 9).
+- **A debug SpiderMonkey that did not link.** Its library is built with
+  `MOZ_DIAGNOSTIC_ASSERT_ENABLED`, which `js-config.h` does not record, and
+  `JS::AutoAssertNoGC` is laid out by it - a context pointer and out-of-line
+  members with it, an empty class with inline ones without. The link said only
+  "duplicate symbol"; the object size was wrong too. The backend now defines it
+  for a debug engine, from the one list of engine defines in
+  `cmake/UnibindEngines.cmake`.
+- **A script run in a realm that did not instantiate it.** A `JSScript` belongs
+  to one realm, and "compile once, run in any realm" (decision 10) executed it
+  in whichever was entered - a realm mismatch a debug engine asserts. A run in
+  another realm now instantiates the stencil there.
+- **A cross-compartment wrapper's realm, entered.** A wrapper has no realm, only
+  a compartment; the backend now enters a global of that compartment, asks
+  questions about the unwrapped object in its own realm, and wraps an
+  interceptor's key list into the current compartment rather than reading it
+  out of its own.
+- **Strings read across zones.** Every realm was its own zone, and a string -
+  which belongs to the isolate here - made in one was read in another: an atom
+  marked white for the zone reading it, which a release engine's collector could
+  later free under it. Every realm of an isolate is now in one zone, each still
+  in a compartment of its own.
+- **A stack quota under the engine's minimum margin.** `ThreadStackQuotaForSize`
+  takes a tenth of the stack as its margin, which below 320 KiB is less than the
+  32 KiB the engine needs to throw its "too much recursion"; small stacks now
+  keep the whole minimum. `docs/spidermonkey.md` section 5.10 has all five.
 
 ## What building the sandbox found
 

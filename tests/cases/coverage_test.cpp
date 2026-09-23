@@ -164,7 +164,9 @@ void RecordTag(ub::Isolate& /*isolate*/, ub::CallbackData data) {
 }
 
 /// Mostly function bodies, none of which the top level calls: source whose
-/// eager and lazy blobs differ in size by a wide margin on both engines.
+/// eager blob is larger than its lazy one on every engine. See the eager
+/// compilation section of `codecache_test.cpp` for what is compared, and why not
+/// by a fixed factor.
 [[nodiscard]] std::string ManyFunctions() {
     std::string source;
     for (int i = 0; i < 40; ++i) {
@@ -175,6 +177,23 @@ void RecordTag(ub::Isolate& /*isolate*/, ub::CallbackData data) {
     }
     source += "41;\n";
     return source;
+}
+
+/// The blob an ordinary compile of `ManyFunctions` gives once everything in it,
+/// the functions they return included, has run - in an isolate of its own.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> BlobAfterRunningEverything(std::string_view source) {
+    std::string everything = "var sum = 0;";
+    for (int i = 0; i < 40; ++i) {
+        everything.append(" sum += g").append(std::to_string(i)).append("(2)();");
+    }
+    everything += " 1";
+
+    ub_test::Fixture fixture;
+    const auto script = ub::Script::Compile(fixture.context, source, {.resourceName = "none.js"});
+    REQUIRE(script.has_value());
+    REQUIRE(script->Run(fixture.context).has_value());
+    CHECK(ub_test::EvalInt(fixture.context, everything) == 1);
+    return script->CreateCodeCache();
 }
 
 /// A client that keeps what it is sent and resumes any pause at once.
@@ -733,8 +752,9 @@ UNIBIND_TEST_CASE(EAGER_COMPILE, "coverage: with a good blob, asking for eager u
 }
 
 UNIBIND_TEST_CASE(EAGER_COMPILE, "coverage: with no blob at all, asking for eager compiles eagerly") {
-    ub_test::Fixture fixture;
     const std::string source = ManyFunctions();
+    const auto ran = BlobAfterRunningEverything(source);
+    ub_test::Fixture fixture;
 
     const auto lazy = ub::Script::Compile(fixture.context, source, {.resourceName = "none.js"});
     REQUIRE(lazy.has_value());
@@ -745,12 +765,14 @@ UNIBIND_TEST_CASE(EAGER_COMPILE, "coverage: with no blob at all, asking for eage
     REQUIRE(eager.has_value());
     CHECK_FALSE(eager->UsedCodeCache());
     const auto eagerBlob = eager->CreateCodeCache();
-    if (!lazyBlob || !eagerBlob) {
+    if (!lazyBlob || !eagerBlob || !ran) {
         ub_test::ReportSkip("this engine declined to produce a code cache for the test source");
         return;
     }
-    MESSAGE("lazy blob ", lazyBlob->size(), " bytes, eager blob from an empty cache ", eagerBlob->size(), " bytes");
-    CHECK(eagerBlob->size() > lazyBlob->size() + (lazyBlob->size() / 2));
+    MESSAGE("lazy blob ", lazyBlob->size(), " bytes, after running everything ", ran->size(),
+            " bytes, eager blob from an empty cache ", eagerBlob->size(), " bytes");
+    CHECK(eagerBlob->size() > lazyBlob->size());
+    CHECK(eagerBlob->size() >= ran->size());
 }
 
 UNIBIND_TEST_CASE(EAGER_COMPILE,
