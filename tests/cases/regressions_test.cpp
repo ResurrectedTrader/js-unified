@@ -530,3 +530,27 @@ UNIBIND_TEST_CASE(CLASSES,
     CHECK_FALSE(result.has_value());
     CHECK(tryCatch.HasCaught());
 }
+
+namespace {
+
+std::size_t g_zeroLimitFrames = 99;
+
+void CaptureNoFrames(const ub::CallbackInfo& info) {
+    g_zeroLimitFrames = ub::CaptureStackFrames(info.GetIsolate(), 0).size();
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(STACK_FRAMES, "regressions: capturing at most no frames captures none") {
+    // `limit` caps the frames collected, and a cap of zero is a cap: no frames.
+    // It is not a request for all of them, which one backend read it as.
+    ub_test::Fixture fixture;
+
+    const auto capture = ub::Function::New(fixture.context, &CaptureNoFrames);
+    REQUIRE(capture.has_value());
+    ub_test::Expose(fixture.context, "captureNone", *capture);  // NOLINT(bugprone-unchecked-optional-access)
+    g_zeroLimitFrames = 99;
+    CHECK(ub_test::EvalInt(fixture.context,
+                           "function a() { captureNone(); return 1; } function b() { return a(); } b()") == 1);
+    CHECK(g_zeroLimitFrames == 0);
+}

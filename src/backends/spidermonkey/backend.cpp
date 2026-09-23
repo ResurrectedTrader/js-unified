@@ -2365,6 +2365,12 @@ std::vector<StackFrame> ReadSavedFrames(JSContext* cx, JS::HandleObject top, std
 }  // namespace
 
 std::vector<StackFrame> CaptureStack(Isolate& isolate, std::uint32_t limit) {
+    // A cap of zero frames is zero frames, as on V8 - not "no cap", which is
+    // what zero means to `ReadSavedFrames` and what the engine's `MaxFrames`
+    // cannot be asked for.
+    if (limit == 0) {
+        return {};
+    }
     JSContext* cx = Raw(isolate);
     // `CaptureCurrentStack` allocates `SavedFrame` objects, so it needs a realm
     // like everything else - and `unibind/exception.h` says this one needs not
@@ -2374,8 +2380,7 @@ std::vector<StackFrame> CaptureStack(Isolate& isolate, std::uint32_t limit) {
         return {};
     }
     JS::RootedObject stack(cx);
-    // `MaxFrames` asserts on zero, and "as many as you like" is `AllFrames`.
-    JS::StackCapture capture = limit == 0 ? JS::StackCapture(JS::AllFrames()) : JS::StackCapture(JS::MaxFrames(limit));
+    JS::StackCapture capture{JS::MaxFrames(limit)};
     if (!JS::CaptureCurrentStack(cx, &stack, std::move(capture))) {
         JS_ClearPendingException(cx);
         return {};

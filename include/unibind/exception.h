@@ -51,9 +51,9 @@ inline void Throw(Isolate& isolate, const Local<T>& value) {
 /// this native call, innermost first.
 ///
 /// This is the answer to "who called me", which a native callback wants for a
-/// diagnostic and cannot get any other way. `limit` caps the frames collected;
-/// engines cap it again at their own configured depth, so a short stack is not
-/// evidence that there were no more frames.
+/// diagnostic and cannot get any other way. `limit` caps the frames collected,
+/// and zero collects none; engines cap it again at their own configured depth,
+/// so a short stack is not evidence that there were no more frames.
 ///
 /// Empty if no script is running, or if the engine kept no stack. It needs no
 /// open `HandleScope`: frames come out as plain strings and numbers, not
