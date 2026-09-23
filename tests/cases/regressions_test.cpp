@@ -414,3 +414,46 @@ UNIBIND_TEST_CASE2(STACK_FRAMES, MESSAGE_LOCATION,
     CHECK_FALSE(NamesBuiltinCode(g_capturedFrames));
     CHECK(g_capturedFrames.size() == 2);
 }
+
+namespace {
+struct ProbeClient final : ub::InspectorClient {
+    void SendProtocolMessage(std::string_view message) override { messages.emplace_back(message); }
+    void RunMessageLoopOnPause() override {}
+    void QuitMessageLoopOnPause() override {}
+    std::vector<std::string> messages;
+};
+}  // namespace
+
+UNIBIND_TEST_CASE(INSPECTOR, "regressions: a realm announced twice is withdrawn by one ContextDestroyed") {
+    // Announcing a realm again - to rename it, say - must not leave DevTools
+    // a second, stale entry for it that nothing can take back: once the realm
+    // is withdrawn, DevTools no longer offers it under any name.
+    ub_test::Fixture fixture;
+    if (!ub::Inspector::Supported()) {
+        ub_test::ReportSkip("this backend has no inspector");
+        return;
+    }
+    ProbeClient client;
+    const auto inspector = ub::Inspector::New(fixture.iso(), client);
+    REQUIRE(inspector != nullptr);
+    auto other = ub::Context::New(fixture.iso());
+    REQUIRE(other.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    inspector->ContextCreated(*other, "other");
+    inspector->ContextCreated(fixture.context, "first name");
+    inspector->ContextCreated(fixture.context, "second name");
+    inspector->ContextDestroyed(fixture.context);
+    // NOLINTEND(bugprone-unchecked-optional-access)
+
+    const auto session = inspector->Connect();
+    REQUIRE(session != nullptr);
+    session->DispatchProtocolMessage(R"({"id":1,"method":"Runtime.enable"})");
+    int offered = 0;
+    for (const std::string& message : client.messages) {
+        if (message.find("Runtime.executionContextCreated") != std::string::npos) {
+            ++offered;
+            CHECK(message.find("\"other\"") != std::string::npos);
+        }
+    }
+    CHECK(offered == 1);
+}

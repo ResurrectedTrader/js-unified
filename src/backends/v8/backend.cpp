@@ -3786,12 +3786,26 @@ void Inspector::ContextCreated(const Context& context, std::string_view name) {
     v8::Isolate* raw = impl_->owner->impl().isolate;
     const v8::HandleScope scope(raw);
     v8::Local<v8::Context> local = detail::Raw(context);
+    // Collected entries go here rather than in a weak callback, which would
+    // have to reach this vector from inside a collection. A realm announced
+    // before is withdrawn first: V8 files each announcement as a context of its
+    // own and `contextDestroyed` finds only the latest, so announcing twice
+    // would leave DevTools an entry for the realm that nothing could take back.
+    bool announced = false;
+    std::erase_if(impl_->contexts, [raw, local, &announced](const v8::Global<v8::Context>& kept) {
+        if (kept.IsEmpty()) {
+            return true;
+        }
+        const bool same = kept.Get(raw) == local;
+        announced = announced || same;
+        return same;
+    });
+    if (announced) {
+        impl_->inspector->contextDestroyed(local);
+    }
     const std::vector<uint16_t> title = ToUtf16(name);
     const v8_inspector::V8ContextInfo info(local, CONTEXT_GROUP, ViewOf(title));
     impl_->inspector->contextCreated(info);
-    // Collected entries go here rather than in a weak callback, which would
-    // have to reach this vector from inside a collection.
-    std::erase_if(impl_->contexts, [](const v8::Global<v8::Context>& kept) { return kept.IsEmpty(); });
     impl_->contexts.emplace_back(raw, local).SetWeak();
 }
 

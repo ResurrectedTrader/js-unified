@@ -179,7 +179,9 @@ class Inspector {
     /// Show DevTools a realm, under `name`. Every realm of the isolate is in one
     /// group, and the one most recently announced and not yet withdrawn is the
     /// default - where a `Runtime.evaluate` that names no context runs.
-    /// Announcing a realm does not keep it alive.
+    /// Announcing a realm does not keep it alive, and announcing one again
+    /// replaces its entry - under the new name, as the newest - rather than
+    /// adding a second.
     void ContextCreated(const Context& context, std::string_view name);
     /// The realm is going; DevTools stops offering it, and the default falls
     /// back to the one announced before it. Call it before the `Context` is let
