@@ -2472,30 +2472,22 @@ Maybe<MessageLocation> TryCatchLocation(const TryCatchState& state, const Contex
 
     MessageLocation location;
     bool located = false;
-    // An Error knows where it was made, and a syntax error where it was found -
-    // with the offending line, which is the one case the engine quotes itself.
+    // Where it was thrown, as V8 places every exception: the engine captured
+    // the stack at the throw, and its top frame is that place. For an Error
+    // that is *not* where it was made - `const e = new Error(); ...; throw e;`
+    // is placed at the `throw` - which is why the stack comes before the
+    // error's own report.
+    //
+    // The one exception is a syntax error, found while compiling: the stack at
+    // that throw is whatever called the compile, and the position that matters
+    // is in the source being compiled. The engine says which errors those are
+    // by quoting the offending line itself, which it does for nothing else.
     JS::RootedValue value(cx, state.exception.get());
-    if (value.isObject()) {
-        JS::RootedObject object(cx, &value.toObject());
-        JS::BorrowedErrorReport report(cx);
-        if (JS_ErrorFromException(cx, object, report)) {
-            if (report->filename) {
-                location.scriptName = report->filename.c_str();
-            }
-            location.lineNumber = static_cast<std::int32_t>(report->lineno);
-            location.columnNumber = static_cast<std::int32_t>(report->column.oneOriginValue());
-            if (report->linebuf() != nullptr) {
-                JS::RootedString line(cx, JS_NewUCStringCopyN(cx, report->linebuf(), report->linebufLength()));
-                if (line != nullptr) {
-                    location.sourceLine = EncodeToStdString(cx, line);
-                }
-            }
-            located = true;
-        }
-    }
-    // Anything else thrown is placed where it was thrown: the engine captured
-    // the stack at the throw, and its top frame is that place.
-    if (!located && state.stack != nullptr) {
+    JS::RootedObject object(cx, value.isObject() ? &value.toObject() : nullptr);
+    JS::BorrowedErrorReport report(cx);
+    const bool reported = object != nullptr && JS_ErrorFromException(cx, object, report);
+    const bool compileError = reported && report->linebuf() != nullptr;
+    if (!compileError && state.stack != nullptr) {
         JS::RootedObject stack(cx, state.stack.get());
         std::vector<StackFrame> top = ReadSavedFrames(cx, stack, 1);
         if (!top.empty()) {
@@ -2504,6 +2496,22 @@ Maybe<MessageLocation> TryCatchLocation(const TryCatchState& state, const Contex
             location.columnNumber = top.front().columnNumber;
             located = true;
         }
+    }
+    // An error with no stack at the throw - a syntax error, or one thrown from
+    // native code with no script running - is placed where its report says.
+    if (!located && reported) {
+        if (report->filename) {
+            location.scriptName = report->filename.c_str();
+        }
+        location.lineNumber = static_cast<std::int32_t>(report->lineno);
+        location.columnNumber = static_cast<std::int32_t>(report->column.oneOriginValue());
+        if (compileError) {
+            JS::RootedString line(cx, JS_NewUCStringCopyN(cx, report->linebuf(), report->linebufLength()));
+            if (line != nullptr) {
+                location.sourceLine = EncodeToStdString(cx, line);
+            }
+        }
+        located = true;
     }
     if (JS_IsExceptionPending(cx)) {
         JS_ClearPendingException(cx);

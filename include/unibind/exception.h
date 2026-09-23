@@ -153,11 +153,13 @@ class TryCatch {
 
     /// Where the caught exception was raised, and the text of that line.
     ///
-    /// For an `Error`, where it was made; for any other thrown value, where it
-    /// was thrown; for a syntax error, the offending position in the source
-    /// being compiled - which is the case this exists for beside `StackFrames`,
-    /// because a script that never compiled has no frame to report. It is what
-    /// an embedder prints as `file:line: message` followed by the line itself.
+    /// Where it was thrown, whatever was thrown - an `Error` made on one line
+    /// and thrown on another is placed at the `throw`, and one a native
+    /// callback threw is placed at the call into it. For a syntax error, the
+    /// offending position in the source being compiled - which is the case
+    /// this exists for beside `StackFrames`, because a script that never
+    /// compiled has no frame to report. It is what an embedder prints as
+    /// `file:line: message` followed by the line itself.
     ///
     /// Empty when nothing was caught, on a termination, and when the engine
     /// has no position - a value thrown by native code with no script running.

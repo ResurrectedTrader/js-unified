@@ -232,3 +232,47 @@ UNIBIND_TEST_CASE(OBJECT_ACCESSORS, "regressions: an accessor set on a proxy is 
     CHECK(ub_test::EvalInt(fixture.context, "proxy.seven") == 7);
     CHECK(ub_test::EvalInt(fixture.context, "target.seven") == 7);
 }
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: an error thrown away from where it was made is placed at the throw") {
+    // V8 places a caught exception where it was thrown, whatever it is - an
+    // Error made on one line and thrown on another is reported at the `throw`,
+    // and so is its quoted line. The other backend must not answer with where
+    // the Error was made.
+    ub_test::Fixture fixture;
+
+    const auto location = LocationOfThrow(fixture, "const e = new Error('made');\nvar x = 1;\nthrow e;",
+                                          {.resourceName = "made-and-thrown.js"});
+    REQUIRE(location.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(location->scriptName == "made-and-thrown.js");
+    CHECK(location->lineNumber == 3);
+    CHECK(location->sourceLine == std::optional<std::string>("throw e;"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+namespace {
+
+void ThrowFromNative(const ub::CallbackInfo& info) {
+    info.Throw(ub::ErrorKind::RangeError, "from native");
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: an error a native throws under script is placed at the call") {
+    // The same rule from the other side: an error made and thrown by native
+    // code has no script position of its own, and it is placed where script
+    // was when it arrived - the call into the native.
+    ub_test::Fixture fixture;
+
+    const auto function = ub::Function::New(fixture.context, &ThrowFromNative);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "boom", *function);  // NOLINT(bugprone-unchecked-optional-access)
+
+    const auto location = LocationOfThrow(fixture, "var a = 1;\nboom();", {.resourceName = "native-throw.js"});
+    REQUIRE(location.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(location->scriptName == "native-throw.js");
+    CHECK(location->lineNumber == 2);
+    CHECK(location->sourceLine == std::optional<std::string>("boom();"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}

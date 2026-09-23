@@ -429,7 +429,11 @@ answers empty.
 
 `TryCatch::Location` is the other half: V8's `v8::Message` - script, line,
 column and the text of the line - in one call, and the one thing to print a
-syntax error with, because a script that never compiled has no frame. Where the
+syntax error with, because a script that never compiled has no frame. It places an
+exception where it was *thrown*, as V8's Message does - an Error made on one
+line and thrown on another at the `throw`. SpiderMonkey's error report names
+where an Error was made, so that backend reads the stack captured at the throw
+and keeps the report for the one thing it is right about, a syntax error. Where the
 engine has no position at all - a throw from native code with no script under
 it - the answer is empty. Both engines answer that case with a location that
 names no line and differ in what they put in the rest, so the header settles it
