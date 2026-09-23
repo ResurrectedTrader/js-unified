@@ -3285,13 +3285,20 @@ std::size_t UsableStackBytes(std::size_t wanted) noexcept {
 /// for its periodic recursion check to be sure of catching the overrun. So a
 /// smaller stack keeps the minimum margin whole, and the quota is what is left
 /// - or half the stack, when the stack is too small to leave anything after it.
+///
+/// Never zero: to the engine a quota of zero is no quota at all, so half of a
+/// one-byte stack would have been a limit nothing reaches rather than one
+/// everything does.
 [[nodiscard]] JS::NativeStackSize StackQuotaFor(std::size_t bytes) noexcept {
     constexpr std::size_t MARGIN = js::MinimumStackLimitMargin;
     constexpr std::size_t PROPORTIONAL_FROM = 10 * MARGIN;
     if (bytes > PROPORTIONAL_FROM) {
         return JS::ThreadStackQuotaForSize(bytes);
     }
-    return bytes > 2 * MARGIN ? bytes - MARGIN : bytes / 2;
+    if (bytes > 2 * MARGIN) {
+        return bytes - MARGIN;
+    }
+    return bytes > 1 ? bytes / 2 : 1;
 }
 
 /// How `Isolate::TerminateExecution` actually stops a script.

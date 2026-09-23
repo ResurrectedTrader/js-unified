@@ -241,6 +241,7 @@ namespace {
 struct Recursion {
     std::size_t stackLimitBytes = 0;
     bool isolateMade = false;
+    bool realmMade = false;
     bool caught = false;
 };
 
@@ -256,6 +257,7 @@ DWORD WINAPI RecurseOnThisThread(LPVOID parameter) {
     if (!context) {
         return 0;
     }
+    result->realmMade = true;
     const ub::ContextScope entered(*context);
     const ub::TryCatch caught(*isolate);
     const auto value = ub::Evaluate(*context, "function deeper(n) { return deeper(n + 1) + 1; } deeper(0)");
@@ -279,6 +281,22 @@ UNIBIND_TEST_CASE(STACK_LIMIT, "regressions: a stack limit larger than the threa
     CloseHandle(thread);
     REQUIRE(result.isolateMade);
     CHECK(result.caught);
+}
+
+UNIBIND_TEST_CASE(STACK_LIMIT, "regressions: a stack limit of one byte is a limit, not none") {
+    // The smallest limit there is. SpiderMonkey's backend halved a stack too
+    // small to keep a margin in, and half of one byte is zero - which the
+    // engine reads as no limit at all, so runaway recursion walked off the
+    // end of the stack. What a limit that small leaves room for is the
+    // engine's business - no isolate, no realm, or a recursion stopped at
+    // once - but it is a limit.
+    Recursion result{.stackLimitBytes = 1};
+    HANDLE thread = CreateThread(nullptr, std::size_t{1024} * 1024, &RecurseOnThisThread, &result,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    REQUIRE(thread != nullptr);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    CHECK((!result.isolateMade || !result.realmMade || result.caught));
 }
 
 namespace {
