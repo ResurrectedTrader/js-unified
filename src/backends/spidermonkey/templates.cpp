@@ -276,7 +276,10 @@ bool AccessorSetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
 
 [[nodiscard]] JSObject* NewAccessorFunction(JSContext* cx, JSNative native, CallbackRecord* record,
                                             const std::string& name) {
-    JSFunction* function = NewNamedFunction(cx, native, native == &AccessorSetterTrampoline ? 1 : 0, 0, name);
+    // Unnamed, as V8 leaves both halves of a native accessor: `name` is what
+    // the callback is told it answers for, below, not what script reads off
+    // the function.
+    JSFunction* function = NewNamedFunction(cx, native, native == &AccessorSetterTrampoline ? 1 : 0, 0, "");
     if (function == nullptr) {
         return nullptr;
     }

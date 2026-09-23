@@ -623,3 +623,38 @@ UNIBIND_TEST_CASE(CLASSES, "regressions: new on a class with no constructor is a
                           "(() => { try { Unmade(); return 'made'; } catch (e) { return e.constructor.name; } })()") ==
         "TypeError");
 }
+
+namespace {
+
+void ReadNothing(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& /*info*/) {}
+
+void WriteNothing(const ub::Local<ub::Name>& /*property*/, const ub::Local<ub::Value>& /*value*/,
+                  const ub::PropertyCallbackInfo& /*info*/) {}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(TEMPLATES, OBJECT_ACCESSORS,
+                   "regressions: the two halves of a native accessor are named alike everywhere") {
+    // What `Object.getOwnPropertyDescriptor(o, 'x').get.name` says is visible
+    // to script, and V8 names a native accessor's getter and setter nothing
+    // at all. SpiderMonkey's backend named both after the property, so the
+    // same descriptor read differently on the two engines.
+    ub_test::Fixture fixture;
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.SetAccessor("declared", &ReadNothing, &WriteNothing);
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    REQUIRE(instance
+                ->SetAccessor(fixture.context, "own", &ReadNothing,
+                              &WriteNothing)  // NOLINT(bugprone-unchecked-optional-access)
+                .value_or(false));
+    ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+
+    for (const std::string_view key : {"declared", "own"}) {
+        CAPTURE(key);
+        CHECK(ub_test::EvalText(fixture.context, "(() => { const d = Object.getOwnPropertyDescriptor(o, '" +
+                                                     std::string(key) +
+                                                     "'); return JSON.stringify([d.get.name, d.set.name, d.get.length, "
+                                                     "d.set.length]); })()") == R"(["","",0,1])");
+    }
+}
