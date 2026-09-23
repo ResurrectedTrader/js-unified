@@ -329,11 +329,19 @@ class Local {
     {
         return Wrap<Array>(detail::GetOwnPropertyNames(context, slot_, filter));
     }
+    /// `Object.getPrototypeOf`: an object or null. On a proxy that is its
+    /// `getPrototypeOf` trap, which can throw - empty then, with the exception
+    /// pending.
     [[nodiscard]] std::optional<Local<Value>> GetPrototype(const Context& context) const
         requires std::derived_from<T, Object>
     {
         return Wrap<Value>(detail::GetPrototype(context, slot_));
     }
+    /// `Object.setPrototypeOf`: true when the prototype was set. An object that
+    /// refuses - it is not extensible, the change would make a cycle, a proxy's
+    /// trap says no - is a TypeError, as is a prototype that is neither an
+    /// object nor null; empty then, with the exception pending, and empty too
+    /// with whatever a proxy's trap threw. Never false.
     template <class U>
     [[nodiscard]] std::optional<bool> SetPrototype(const Context& context, const Local<U>& prototype) const
         requires std::derived_from<T, Object>

@@ -1927,7 +1927,16 @@ Maybe<bool> SetPrototype(const Context& context, Slot object, Slot prototype) {
         return std::nullopt;
     }
     JS::RootedValue raw(op.cx);
-    if (!op.Value(prototype, &raw) || (!raw.isObject() && !raw.isNull())) {
+    if (!op.Value(prototype, &raw)) {
+        return std::nullopt;
+    }
+    // A TypeError, as `Object.setPrototypeOf` throws one - not an empty answer
+    // with nothing to say why.
+    if (!raw.isObject() && !raw.isNull()) {
+        JS::RootedValue error(op.cx);
+        if (MakeErrorValue(op.cx, ErrorKind::TypeError, "Object prototype may only be an Object or null", &error)) {
+            JS_SetPendingException(op.cx, error);
+        }
         return std::nullopt;
     }
     JS::RootedObject value(op.cx, raw.isObject() ? &raw.toObject() : nullptr);

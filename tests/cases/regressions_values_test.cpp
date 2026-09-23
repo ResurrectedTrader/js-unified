@@ -101,3 +101,96 @@ UNIBIND_TEST_CASE2(EXCEPTIONS, FUNCTIONS,
     CHECK(ub_test::EvalText(fixture.context, "try { native(target); 'nothing'; } catch (e) { e.message; }") == "one");
     CHECK_FALSE(outer.HasCaught());
 }
+
+UNIBIND_TEST_CASE(OBJECTS, "regressions: a proxy's prototype is the one its trap answers") {
+    // `GetPrototype` is `Object.getPrototypeOf`, and on a proxy that is the
+    // `getPrototypeOf` trap. V8's own call reads the proxy's map instead - the
+    // trap never runs, the answer is null, and a trap that throws does not.
+    ub_test::Fixture fixture;
+
+    const auto answered =
+        ub_test::Eval(fixture.context, "new Proxy({}, { getPrototypeOf() { return Array.prototype; } })")
+            .To<ub::Object>();
+    REQUIRE(answered.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - each REQUIRE guarantees has_value
+    const auto prototype = answered->GetPrototype(fixture.context);
+    REQUIRE(prototype.has_value());
+    ub_test::Expose(fixture.context, "prototype", *prototype);
+    CHECK(ub_test::EvalTruth(fixture.context, "prototype === Array.prototype"));
+
+    // A proxy with no trap answers for its target, and a proxy of a proxy asks
+    // the inner one.
+    const auto nested = ub_test::Eval(fixture.context, R"(
+        new Proxy(new Proxy({}, { getPrototypeOf() { return Map.prototype; } }), {}))")
+                            .To<ub::Object>();
+    REQUIRE(nested.has_value());
+    const auto inner = nested->GetPrototype(fixture.context);
+    REQUIRE(inner.has_value());
+    ub_test::Expose(fixture.context, "inner", *inner);
+    CHECK(ub_test::EvalTruth(fixture.context, "inner === Map.prototype"));
+
+    for (const char* source : {"new Proxy({}, { getPrototypeOf() { throw new Error('trap'); } })",
+                               "(() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; })()",
+                               "new Proxy({}, { getPrototypeOf() { return 5; } })"}) {
+        CAPTURE(source);
+        const auto refusing = ub_test::Eval(fixture.context, source).To<ub::Object>();
+        REQUIRE(refusing.has_value());
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(refusing->GetPrototype(fixture.context).has_value());
+        CHECK(handler.HasCaught());
+    }
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+UNIBIND_TEST_CASE(OBJECTS, "regressions: a prototype that cannot be set is an exception, on every object") {
+    // `SetPrototype` is `Object.setPrototypeOf`: true when it took, and a
+    // TypeError when the object refuses. V8's own call swallows that TypeError
+    // - and anything a proxy's trap throws - and reports true for a prototype
+    // that is neither an object nor null without setting anything; the other
+    // engine refused that last one with nothing pending at all.
+    ub_test::Fixture fixture;
+    const auto& context = fixture.context;
+
+    const auto plain = ub::Object::New(context);
+    REQUIRE(plain.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - each REQUIRE guarantees has_value
+    CHECK(plain->SetPrototype(context, ub::Null(fixture.iso())).value_or(false));
+    CHECK(plain->GetPrototype(context)->IsNull());
+
+    const auto refusals = std::vector<std::pair<const char*, const char*>>{
+        {"Object.preventExtensions({})", "({})"},
+        {"new Proxy({}, { setPrototypeOf() { return false; } })", "({})"},
+        {"new Proxy({}, { setPrototypeOf() { throw new Error('mine'); } })", "({})"},
+        {"(() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; })()", "({})"},
+        {"globalThis.cycle = {}", "Object.create(cycle)"},
+        {"({})", "5"},
+        {"({})", "'text'"},
+    };
+    for (const auto& [objectSource, prototypeSource] : refusals) {
+        CAPTURE(objectSource);
+        CAPTURE(prototypeSource);
+        const auto object = ub_test::Eval(context, objectSource).To<ub::Object>();
+        REQUIRE(object.has_value());
+        const auto prototype = ub_test::Eval(context, prototypeSource);
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(object->SetPrototype(context, prototype).has_value());
+        REQUIRE(handler.HasCaught());
+        ub_test::Expose(context, "thrown", handler.Exception());
+        if (std::string_view(objectSource).find("mine") != std::string_view::npos) {
+            CHECK(ub_test::EvalText(context, "thrown.message") == "mine");
+        } else {
+            CHECK(ub_test::EvalTruth(context, "thrown instanceof TypeError"));
+        }
+    }
+
+    // A trap that agrees is agreed with, and one that does the work is seen.
+    const auto agreeing = ub_test::Eval(context, R"(
+        new Proxy({}, { setPrototypeOf(target, p) { return Reflect.setPrototypeOf(target, p); } }))")
+                              .To<ub::Object>();
+    REQUIRE(agreeing.has_value());
+    const auto array = ub_test::Eval(context, "Array.prototype");
+    CHECK(agreeing->SetPrototype(context, array).value_or(false));
+    ub_test::Expose(context, "agreeing", *agreeing);
+    CHECK(ub_test::EvalTruth(context, "Object.getPrototypeOf(agreeing) === Array.prototype"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}

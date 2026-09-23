@@ -406,6 +406,17 @@ struct ContextRec {
     Isolate* owner = nullptr;
     v8::Global<v8::Context> handle;
     int refs = 1;
+    /// This realm's own `Object.getPrototypeOf` and `Object.setPrototypeOf`,
+    /// read when it was made and before any script could replace them.
+    ///
+    /// V8's API has no call that runs a proxy's `getPrototypeOf` or
+    /// `setPrototypeOf` trap: `GetPrototype` reads the proxy's own map, and
+    /// `SetPrototype` runs the trap but swallows what it throws - along with the
+    /// TypeError of any refusal, ordinary objects included. The language's
+    /// functions do all of it, invariant checks and all, so the backend calls
+    /// them. See `GetPrototype` and `SetPrototype`.
+    v8::Global<v8::Function> getPrototypeOf;
+    v8::Global<v8::Function> setPrototypeOf;
 };
 
 /// Compiled source, kept *unbound* - not tied to the realm it was compiled in.
@@ -1274,12 +1285,33 @@ std::optional<Slot> GetOwnPropertyNames(const Context& context, Slot object, Key
     return PushOrNothing(OwnerOf(context), names);
 }
 
+// `Object.getPrototypeOf` and `Object.setPrototypeOf`, as the realm's own
+// functions run them - see `ContextRec::getPrototypeOf` for why V8's API calls
+// will not do. Reading an ordinary object's prototype runs no script, so that
+// one still takes the API's short way; a proxy's goes through its trap.
+
 std::optional<Slot> GetPrototype(const Context& context, Slot object) {
-    return PushOrNothing(OwnerOf(context), Resolve(object).As<v8::Object>()->GetPrototype());
+    v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
+    if (!target->IsProxy()) {
+        return PushOrNothing(OwnerOf(context), target->GetPrototype());
+    }
+    v8::Isolate* raw = Raw(OwnerOf(context));
+    std::array<v8::Local<v8::Value>, 1> arguments{target};
+    return PushMaybe(OwnerOf(context), RecOf(context)->getPrototypeOf.Get(raw)->Call(Raw(context), v8::Undefined(raw),
+                                                                                     1, arguments.data()));
 }
 
 std::optional<bool> SetPrototype(const Context& context, Slot object, Slot prototype) {
-    return FromV8(Resolve(object).As<v8::Object>()->SetPrototype(Raw(context), Resolve(prototype)));
+    v8::Isolate* raw = Raw(OwnerOf(context));
+    std::array<v8::Local<v8::Value>, 2> arguments{Resolve(object), Resolve(prototype)};
+    v8::Local<v8::Value> result;
+    if (!RecOf(context)
+             ->setPrototypeOf.Get(raw)
+             ->Call(Raw(context), v8::Undefined(raw), 2, arguments.data())
+             .ToLocal(&result)) {
+        return std::nullopt;
+    }
+    return true;
 }
 uint32_t ArrayLength(Slot array) noexcept {
     return Resolve(array).As<v8::Array>()->Length();
@@ -3001,10 +3033,38 @@ ContextRec* NewContext(Isolate& isolate) {
     if (context.IsEmpty()) {
         return nullptr;
     }
+    // Read now, while nothing but the engine has touched this realm; see
+    // `ContextRec::getPrototypeOf`.
+    v8::Local<v8::Function> getPrototypeOf;
+    v8::Local<v8::Function> setPrototypeOf;
+    {
+        v8::Isolate* raw = Raw(isolate);
+        const v8::Context::Scope entered(context);
+        v8::Local<v8::Value> objectConstructor;
+        v8::Local<v8::Value> getter;
+        v8::Local<v8::Value> setter;
+        if (!context->Global()
+                 ->Get(context, v8::String::NewFromUtf8Literal(raw, "Object"))
+                 .ToLocal(&objectConstructor) ||
+            !objectConstructor->IsObject() ||
+            !objectConstructor.As<v8::Object>()
+                 ->Get(context, v8::String::NewFromUtf8Literal(raw, "getPrototypeOf"))
+                 .ToLocal(&getter) ||
+            !objectConstructor.As<v8::Object>()
+                 ->Get(context, v8::String::NewFromUtf8Literal(raw, "setPrototypeOf"))
+                 .ToLocal(&setter) ||
+            !getter->IsFunction() || !setter->IsFunction()) {
+            return nullptr;
+        }
+        getPrototypeOf = getter.As<v8::Function>();
+        setPrototypeOf = setter.As<v8::Function>();
+    }
     auto* rec = new ContextRec();
     rec->owner = &isolate;
     ++isolate.impl().embedderRefs;
     rec->handle.Reset(Raw(isolate), context);
+    rec->getPrototypeOf.Reset(Raw(isolate), getPrototypeOf);
+    rec->setPrototypeOf.Reset(Raw(isolate), setPrototypeOf);
     context->SetAlignedPointerInEmbedderData(CONTEXT_SLOT, rec, v8::kEmbedderDataTypeTagDefault);
     return rec;
 }
