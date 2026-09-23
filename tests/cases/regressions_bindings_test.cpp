@@ -269,3 +269,44 @@ UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: every array index reaches the inde
     CHECK(ub_test::EvalText(fixture.context, "o['01']") == "named");
     CHECK(log.seen == "n4294967295 n01 ");
 }
+
+namespace {
+
+std::optional<ub::Local<ub::Array>> ListRepeatedKeys(const ub::PropertyCallbackInfo& info) {
+    const auto keys = ub::Evaluate(info.GetContext(), "['a', 'a', 'declared', 'b', 'a']");
+    if (!keys) {
+        return std::nullopt;
+    }
+    return keys->To<ub::Array>();
+}
+
+ub::Intercepted AnswerListedKeys(const ub::Local<ub::Name>& property, const ub::PropertyCallbackInfo& info) {
+    const auto text = property.To<ub::String>();
+    if (!text || (text->Utf8Value() != "a" && text->Utf8Value() != "b")) {
+        return ub::Intercepted::No;
+    }
+    info.GetReturnValue().Set(1);
+    return ub::Intercepted::Yes;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: a key an enumerator lists twice is one own key") {
+    // An object has no key twice. V8 folds an enumerator's repeats, and a key
+    // the object already has, into one; SpiderMonkey's backend appended the
+    // hook's list to the object's own keys as it stood, so `Object.keys`
+    // listed `a` three times and the declared property twice.
+    ub_test::Fixture fixture;
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.Set("declared", ub::Constant(1));
+    shape.SetHandler(ub::NamedPropertyHandler{.getter = &AnswerListedKeys, .enumerator = &ListRepeatedKeys});
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalText(fixture.context, "Object.keys(o).join()") == "declared,a,b");
+    CHECK(ub_test::EvalText(fixture.context, "Reflect.ownKeys(o).join()") == "declared,a,b");
+    CHECK(ub_test::EvalText(fixture.context,
+                            "(() => { const r = []; for (const k in o) r.push(k); return r.join(); })()") ==
+          "declared,a,b");
+}

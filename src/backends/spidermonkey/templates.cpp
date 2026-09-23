@@ -14,9 +14,12 @@
 
 #include <js/Proxy.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <new>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "internal.h"
@@ -852,6 +855,22 @@ bool InterceptorHandler::ownPropertyKeys(JSContext* cx, JS::HandleObject proxy, 
                 return false;
             }
         }
+    }
+    // An object has no key twice, and V8 folds a hook's repeats - and a key the
+    // object already has - into the first. Done in one pass that makes no GC
+    // thing, so no key can move while the raw bits stand for it.
+    try {
+        std::unordered_set<std::uintptr_t> seen;
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < props.length(); ++i) {
+            if (seen.insert(props[i].get().asRawBits()).second) {
+                props[kept++].set(props[i]);
+            }
+        }
+        props.shrinkBy(props.length() - kept);
+    } catch (const std::bad_alloc&) {
+        JS_ReportOutOfMemory(cx);
+        return false;
     }
     return true;
 }
