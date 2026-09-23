@@ -711,6 +711,11 @@ class IsolateRealm {
 /// threw, or saw an operation throw, and carries on without a handler of its
 /// own is about to return to the script that called it, and the exception is
 /// that script's to catch - not the embedder's further out.
+///
+/// With no handler open and no native running, nothing will ever take it:
+/// V8 reports such an exception as uncaught and lets it go, so it is let go
+/// here too rather than carried into the engine, which asserts that nothing
+/// is pending when it starts to compile.
 void CatchPendingException(Isolate& isolate) noexcept;
 
 /// Every operation that takes a `Context` runs in that realm, which is what

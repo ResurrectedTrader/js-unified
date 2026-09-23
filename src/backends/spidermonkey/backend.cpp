@@ -2261,12 +2261,23 @@ void Drain(TryCatchState& state) noexcept {
 }  // namespace
 
 void CatchPendingException(Isolate& isolate) noexcept {
-    TryCatchState* handler = isolate.impl().tryCatch;
-    if (handler == nullptr || handler->nativeDepth != isolate.impl().nativeDepth ||
-        !JS_IsExceptionPending(Raw(isolate))) {
+    JSContext* cx = Raw(isolate);
+    if (!JS_IsExceptionPending(cx)) {
         return;
     }
-    Drain(*handler);
+    TryCatchState* handler = isolate.impl().tryCatch;
+    // With no handler at all and no script to return to, V8 has already
+    // reported the exception as uncaught and let it go; nothing will ever
+    // take it here, and the engine must not be entered with it pending.
+    if (handler == nullptr) {
+        if (isolate.impl().nativeDepth == 0) {
+            JS_ClearPendingException(cx);
+        }
+        return;
+    }
+    if (handler->nativeDepth == isolate.impl().nativeDepth) {
+        Drain(*handler);
+    }
 }
 
 void ThrowValue(Isolate& isolate, Slot value) {
