@@ -699,3 +699,35 @@ UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: a script named with bytes that
     CHECK(location->sourceLine == std::optional<std::string>("null.property;"));
     // NOLINTEND(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE(STRINGS, "regressions: text refused for not being UTF-8 leaves nothing pending") {
+    // `String::New` - and the symbol factories, and every property lookup by a
+    // `string_view` key - refuses bytes that are not UTF-8 by answering empty.
+    // That is the whole of the answer: nothing was thrown, so nothing may be
+    // left pending for whatever the caller does next to trip over.
+    ub_test::Fixture fixture;
+    auto& isolate = fixture.iso();
+    const std::string_view bad(
+        "a\xFF"
+        "b",
+        3);
+
+    CHECK_FALSE(ub::String::New(isolate, bad).has_value());
+    CHECK_FALSE(isolate.HasPendingException());
+    CHECK_FALSE(ub::Symbol::New(isolate, bad).has_value());
+    CHECK_FALSE(isolate.HasPendingException());
+    CHECK_FALSE(ub::Symbol::For(isolate, bad).has_value());
+    CHECK_FALSE(isolate.HasPendingException());
+
+    const auto object = ub::Object::New(fixture.context);
+    REQUIRE(object.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK_FALSE(object->Get(fixture.context, bad).has_value());
+    CHECK_FALSE(isolate.HasPendingException());
+    CHECK_FALSE(object->Set(fixture.context, bad, ub::Integer::New(isolate, 1)).has_value());
+    CHECK_FALSE(isolate.HasPendingException());
+    // NOLINTEND(bugprone-unchecked-optional-access)
+
+    // And the engine is as usable as it was.
+    CHECK(ub_test::EvalInt(fixture.context, "6 * 7") == 42);
+}

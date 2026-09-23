@@ -191,6 +191,12 @@ JSObject* UtilityGlobal(Isolate& isolate) noexcept {
 }
 
 JSString* MakeRawString(JSContext* cx, std::string_view utf8) noexcept {
+    // Refused here rather than by the engine, which refuses by throwing: text
+    // that is not UTF-8 is an empty answer and nothing more, and an exception
+    // left pending would be found by whatever the caller does next.
+    if (FirstInvalidUtf8(utf8) != std::string_view::npos) {
+        return nullptr;
+    }
     return JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(utf8.data(), utf8.size()));
 }
 
