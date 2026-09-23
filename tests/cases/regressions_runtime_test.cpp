@@ -7,9 +7,11 @@
 /// caught.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "support/harness.h"
@@ -336,4 +338,81 @@ UNIBIND_TEST_CASE2(INSPECTOR, TERMINATION, "regressions: a stopped isolate runs 
 
     session.reset();
     inspector->ContextDestroyed(fixture.context);
+}
+
+namespace {
+
+void Count(ub::Isolate& /*isolate*/, ub::CallbackData data) {
+    if (auto* count = data.As<int>()) {
+        ++*count;
+    }
+}
+
+/// Call `post` with the next allocation failing, over and over, until one of
+/// the calls actually needed memory. Answers how many were taken and whether
+/// the one refused said so.
+struct Starved {
+    int taken = 0;
+    bool refusedOne = false;
+    bool refusalReported = false;
+};
+
+template <class Post>
+Starved PostUntilStarved(Post post) {
+    Starved result;
+    for (int attempt = 0; attempt < 4096 && !result.refusedOne; ++attempt) {
+        bool accepted = false;
+        long long fired = 0;
+        {
+            ub_test::AllocationFailure failing(1);
+            accepted = post();
+            fired = failing.Stop();
+        }
+        if (fired > 0) {
+            result.refusedOne = true;
+            result.refusalReported = !accepted;
+        }
+        result.taken += accepted ? 1 : 0;
+    }
+    return result;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(JOBS, INTERRUPTS, "regressions: posting when there is no memory for it is refused, not fatal") {
+    // PostJob, PostDelayedJob and RequestInterrupt are noexcept and grow a
+    // queue, and a queue that cannot grow throws: std::terminate, from the one
+    // operation an embedder calls from a thread that knows nothing of the
+    // isolate. Now a request that cannot be kept is refused and says so.
+    ub_test::Fixture fixture;
+    ub::Isolate& isolate = fixture.iso();
+
+    int jobRuns = 0;
+    const Starved jobs = PostUntilStarved([&] { return isolate.PostJob(&Count, ub::CallbackData::For(jobRuns)); });
+    int delayedRuns = 0;
+    const Starved delayed =
+        PostUntilStarved([&] { return isolate.PostDelayedJob(&Count, ub::CallbackData::For(delayedRuns), 1e-9); });
+    int interruptRuns = 0;
+    const Starved interrupts =
+        PostUntilStarved([&] { return isolate.RequestInterrupt(&Count, ub::CallbackData::For(interruptRuns)); });
+    if (!jobs.refusedOne || !delayed.refusedOne || !interrupts.refusedOne) {
+        ub_test::ReportSkip("an allocation never failed, so nothing was refused");
+        return;
+    }
+    CHECK(jobs.refusalReported);
+    CHECK(delayed.refusalReported);
+    CHECK(interrupts.refusalReported);
+
+    // What was taken runs, once each; what was refused does not.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    isolate.PumpJobs();
+    CHECK(jobRuns == jobs.taken);
+    CHECK(delayedRuns == delayed.taken);
+    CHECK(ub_test::EvalInt(fixture.context,
+                           "(function () { let n = 0; for (let i = 0; i < 100; ++i) ++n; return n; })()") == 100);
+    CHECK(interruptRuns == interrupts.taken);
+
+    CHECK_FALSE(isolate.PostJob(nullptr, {}));
+    CHECK_FALSE(isolate.PostDelayedJob(nullptr, {}, 1.0));
+    CHECK_FALSE(isolate.RequestInterrupt(nullptr, {}));
 }

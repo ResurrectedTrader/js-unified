@@ -783,7 +783,12 @@ class Isolate {
     /// not to. A callback that asks for itself again unconditionally therefore
     /// never lets the script continue: a sampler that wants a tick every so
     /// often asks for each one from its own timer thread.
-    void RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept;
+    ///
+    /// True when the request was taken. False for a null `callback`, and when
+    /// there was not the memory to keep the request - which is refused rather
+    /// than allowed to end the process from inside a `noexcept` call - and then
+    /// the callback never runs.
+    bool RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept;
 
     /// Queue `callback` to run on this isolate's thread the next time it pumps.
     ///
@@ -819,7 +824,11 @@ class Isolate {
     ///     not inside a call and no realm is current. Let nothing escape: it
     ///     runs between two things the script thread was doing, so wrap engine
     ///     calls in a `TryCatch` and report failure to the embedder.
-    void PostJob(JobCallback callback, CallbackData data) noexcept;
+    ///   * **True when the work was queued.** False for a null `callback`, and
+    ///     when there was not the memory to queue it - refused rather than
+    ///     allowed to end the process from inside a `noexcept` call - and then
+    ///     it never runs.
+    bool PostJob(JobCallback callback, CallbackData data) noexcept;
 
     /// `PostJob`, but not before `delayInSeconds` have passed - V8's
     /// `TaskRunner::PostDelayedTask`, for the timer an embedder would otherwise
@@ -843,8 +852,9 @@ class Isolate {
     ///     hundred years, infinity included - is a job that never falls due,
     ///     not one that wraps round into the past.
     ///   * Callable from any thread. Still waiting when the isolate is
-    ///     destroyed means dropped, as for any posted work.
-    void PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept;
+    ///     destroyed means dropped, as for any posted work, and false means
+    ///     never queued, as for `PostJob`.
+    bool PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept;
 
     /// Run everything pending - promise continuations and posted work - until
     /// there is nothing left.

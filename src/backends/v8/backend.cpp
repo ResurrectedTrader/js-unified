@@ -3841,33 +3841,44 @@ void InterruptTrampoline(v8::Isolate* raw, void* data) {
 
 }  // namespace
 
-void Isolate::RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept {
+bool Isolate::RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept {
     if (callback == nullptr) {
-        return;
+        return false;
     }
     {
         const std::scoped_lock guard(impl_->work);
-        impl_->interrupts.emplace_back(callback, data);
+        // Growing the queue can run out of memory, and this is noexcept: an
+        // exception here would be std::terminate, not a request refused.
+        try {
+            impl_->interrupts.emplace_back(callback, data);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
     }
     impl_->isolate->RequestInterrupt(&InterruptTrampoline, this);
+    return true;
 }
 
-void Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
+bool Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
     if (callback == nullptr) {
-        return;
+        return false;
     }
     const std::scoped_lock guard(impl_->work);
-    impl_->jobs.emplace_back(callback, data);
+    try {
+        impl_->jobs.emplace_back(callback, data);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
 }
 
-void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept {
+bool Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept {
     // `!(x > 0)` rather than `x <= 0`, so that a NaN is no delay too.
     if (!(delayInSeconds > 0)) {
-        PostJob(callback, data);
-        return;
+        return PostJob(callback, data);
     }
     if (callback == nullptr) {
-        return;
+        return false;
     }
     // Past what the clock can count - a little under three hundred years from
     // now, in integer nanoseconds - the conversion would overflow and land in
@@ -3880,7 +3891,12 @@ void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double del
     const auto due = delay < room / 2 ? now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay)
                                       : std::chrono::steady_clock::time_point::max();
     const std::scoped_lock guard(impl_->work);
-    impl_->delayedJobs.emplace(due, std::make_pair(callback, data));
+    try {
+        impl_->delayedJobs.emplace(due, std::make_pair(callback, data));
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
 }
 
 void Isolate::PumpJobs() {
@@ -4340,14 +4356,19 @@ bool InspectorDispatcher::RequestDispatch(JobCallback callback, CallbackData dat
         return false;
     }
     if (!shared.wakePending) {
-        shared.wakePending = true;
         // Both, and whichever arrives first drains: an interrupt reaches a
         // script that is running and never fires while the isolate is idle, and
         // a job is the other way round. Asked for under the lock, which is what
-        // keeps the isolate alive until they have been.
+        // keeps the isolate alive until they have been. The job first, because
+        // it is the one that can be refused, and a request with no job behind
+        // it would wait for a script that may never run.
         Isolate& owner = *shared.owner;
+        if (!owner.PostJob(&DispatchJob, {})) {
+            shared.queue.pop_back();
+            return false;
+        }
         owner.impl().isolate->RequestInterrupt(&DispatchInterrupt, &owner);
-        owner.PostJob(&DispatchJob, {});
+        shared.wakePending = true;
     }
     return true;
 }

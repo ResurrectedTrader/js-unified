@@ -3395,36 +3395,47 @@ void Isolate::CancelTerminateExecution() noexcept {
     impl_->terminating.store(false, std::memory_order_release);
 }
 
-void Isolate::RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept {
+bool Isolate::RequestInterrupt(InterruptCallback callback, CallbackData data) noexcept {
     if (callback == nullptr) {
-        return;
+        return false;
     }
     {
         const std::lock_guard<std::mutex> lock(impl_->interruptMutex);
-        impl_->interrupts.push_back({.callback = callback, .data = data});
+        // Growing the queue can run out of memory, and this is noexcept: an
+        // exception here would be std::terminate, not a request refused.
+        try {
+            impl_->interrupts.push_back({.callback = callback, .data = data});
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
     }
     JS_RequestInterruptCallback(impl_->cx);
+    return true;
 }
 
-void Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
+bool Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
     if (callback == nullptr) {
-        return;
+        return false;
     }
     const std::lock_guard<std::mutex> lock(impl_->jobMutex);
     // Never coalesced: posting the same callback twice runs it twice, which is
     // what `unibind/isolate.h` promises and what makes a queue of work a queue
     // rather than a set of flags.
-    impl_->jobs.push_back({.callback = callback, .data = data});
+    try {
+        impl_->jobs.push_back({.callback = callback, .data = data});
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
 }
 
-void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept {
+bool Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept {
     // `!(x > 0)` rather than `x <= 0`, so that a NaN is no delay too.
     if (!(delayInSeconds > 0)) {
-        PostJob(callback, data);
-        return;
+        return PostJob(callback, data);
     }
     if (callback == nullptr) {
-        return;
+        return false;
     }
     // Past what the clock can count - a little under three hundred years from
     // now, in integer nanoseconds - the conversion would overflow and land in
@@ -3437,7 +3448,12 @@ void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double del
     const auto due = delay < room / 2 ? now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay)
                                       : std::chrono::steady_clock::time_point::max();
     const std::lock_guard<std::mutex> lock(impl_->jobMutex);
-    impl_->delayedJobs.emplace(due, Impl::PostedJob{.callback = callback, .data = data});
+    try {
+        impl_->delayedJobs.emplace(due, Impl::PostedJob{.callback = callback, .data = data});
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
 }
 
 namespace {
