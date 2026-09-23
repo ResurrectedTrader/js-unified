@@ -658,3 +658,90 @@ UNIBIND_TEST_CASE2(TEMPLATES, OBJECT_ACCESSORS,
                                                      "d.set.length]); })()") == R"(["","",0,1])");
     }
 }
+
+namespace {
+
+/// Each of these reads or calls straight back through the engine for the same
+/// thing it was asked for, from C++, with no script frame in between.
+ub::Intercepted ReadNamedAgain(const ub::Local<ub::Name>& property, const ub::PropertyCallbackInfo& info) {
+    const auto again = info.This().Get(info.GetContext(), property);
+    if (again) {
+        info.GetReturnValue().Set(*again);
+    }
+    return ub::Intercepted::Yes;
+}
+
+ub::Intercepted ReadIndexAgain(std::uint32_t index, const ub::PropertyCallbackInfo& info) {
+    const auto again = info.This().Get(info.GetContext(), index);
+    if (again) {
+        info.GetReturnValue().Set(*again);
+    }
+    return ub::Intercepted::Yes;
+}
+
+void ReadAccessorAgain(const ub::Local<ub::Name>& property, const ub::PropertyCallbackInfo& info) {
+    const auto again = info.This().Get(info.GetContext(), property);
+    if (again) {
+        info.GetReturnValue().Set(*again);
+    }
+}
+
+void CallSelfAgain(const ub::CallbackInfo& info) {
+    // The function's value is an object whose `self` is the function.
+    const auto holder = info.Data().To<ub::Object>();
+    if (!holder) {
+        return;
+    }
+    const auto self = holder->Get(info.GetContext(), "self");
+    if (!self) {
+        return;
+    }
+    const auto function = self->To<ub::Function>();
+    if (!function) {
+        return;
+    }
+    const auto again = function->Call(info.GetContext(), info.This());
+    if (again) {
+        info.GetReturnValue().Set(*again);
+    }
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(INTERCEPTORS, FUNCTION_VALUE_DATA,
+                   "regressions: native recursion through the engine runs out of stack as an exception") {
+    // Runaway recursion is an exception the script can catch, never a stack
+    // overflow in the host - and V8 checks the stack only where it enters
+    // script. A callback that goes straight back through the engine from C++
+    // - reading the property it is answering for, or calling the function it
+    // is - enters no script: V8 calls an interceptor and a native function
+    // directly, so the recursion walked off the end of the thread's stack and
+    // took the process with it. SpiderMonkey checks in each of these paths.
+    for (int kind = 0; kind < 4; ++kind) {
+        CAPTURE(kind);
+        ub_test::Fixture fixture;
+        const auto shape = ub::ObjectTemplate::New(fixture.iso());
+        if (kind == 0) {
+            shape.SetHandler(ub::NamedPropertyHandler{.getter = &ReadNamedAgain});
+        } else if (kind == 1) {
+            shape.SetHandler(ub::IndexedPropertyHandler{.getter = &ReadIndexAgain});
+        } else if (kind == 2) {
+            shape.SetAccessor("x", &ReadAccessorAgain);
+        }
+        const auto instance = shape.NewInstance(fixture.context);
+        REQUIRE(instance.has_value());
+        ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+        const auto holder = ub::Object::New(fixture.context);
+        REQUIRE(holder.has_value());
+        const auto self = ub::Function::New(fixture.context, &CallSelfAgain, *holder);  // NOLINT
+        REQUIRE(self.has_value());
+        REQUIRE(holder->Set(fixture.context, "self", *self).value_or(false));  // NOLINT
+        ub_test::Expose(fixture.context, "f", *self);  // NOLINT(bugprone-unchecked-optional-access)
+
+        ub::TryCatch tryCatch(fixture.iso());
+        const auto result = ub::Evaluate(fixture.context, kind == 1 ? "o[1]" : kind == 3 ? "f()" : "o.x");
+        CHECK_FALSE(result.has_value());
+        CHECK(tryCatch.HasCaught());
+        CHECK_FALSE(tryCatch.HasTerminated());
+    }
+}

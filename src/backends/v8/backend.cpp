@@ -206,6 +206,12 @@ struct Isolate::Impl {
     /// realm, and V8 makes it in the current one or crashes. SpiderMonkey's
     /// backend has the same thing for the same reason.
     v8::Global<v8::Context> utility;
+    /// The lowest stack address a native call may start at - see
+    /// `RefuseDeeperNative`. The isolate's own stack limit when one was asked
+    /// for, and otherwise the bottom of the thread's real stack less the room
+    /// the engine needs to throw; 0, which refuses nothing, where the thread's
+    /// stack could not be asked about.
+    uintptr_t stackGuard = 0;
     /// The isolate's inspector, if it has one - there is at most one - and its
     /// dispatcher, which holds the queue `InspectorDispatcher::RequestDispatch`
     /// fills. What a V8 interrupt and a posted job are handed is this isolate,
@@ -1766,6 +1772,25 @@ std::optional<Slot> ConstructObject(const Context& context, Slot function, std::
 
 namespace {
 
+/// Whether this native call is too deep to be let run, in which case a
+/// RangeError has been thrown in its place and it must return at once.
+///
+/// V8 checks the stack where it enters script and nowhere else. A callback
+/// that goes straight back through the engine from C++ - reading the property
+/// it is answering for, calling the function it is - enters no script: V8
+/// calls an interceptor, an accessor's function and a native function directly
+/// from its API, so that recursion never meets the check and walks off the end
+/// of the thread's stack. Every trampoline asks this first, against the guard
+/// `Isolate::New` worked out from the thread's real stack.
+[[nodiscard]] bool RefuseDeeperNative(Isolate& isolate) {
+    const char here = 0;
+    if (reinterpret_cast<uintptr_t>(&here) >= isolate.impl().stackGuard) {
+        return false;
+    }
+    ThrowError(isolate, ErrorKind::RangeError, "Maximum call stack size exceeded");
+    return true;
+}
+
 /// Opens a frame for the duration of a callback, borrowing the argument array.
 class CallFrame {
    public:
@@ -1864,6 +1889,9 @@ template <class T>
 
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     auto* record = PointerFrom<CallbackRecord>(info.DataV2());
 
     CallFrame frame(isolate, &info);
@@ -1889,6 +1917,9 @@ constexpr int VALUE_DATA_VALUE_FIELD = 1;
 /// always did.
 void ValueFunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     v8::Local<v8::Object> bundle = info.DataV2().As<v8::Value>().As<v8::Object>();
     const auto callback = reinterpret_cast<FunctionCallback>(bundle->GetInternalField(VALUE_DATA_CALLBACK_FIELD)
                                                                  .As<v8::Value>()
@@ -2110,6 +2141,9 @@ template <class T>
 
 void AccessorGetTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     auto* record = PointerFrom<AccessorRecord>(info.DataV2());
 
     CallFrame frame(isolate, &info);
@@ -2120,6 +2154,9 @@ void AccessorGetTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 void AccessorSetTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     auto* record = PointerFrom<AccessorRecord>(info.DataV2());
 
     CallFrame frame(isolate, &info);
@@ -2409,6 +2446,9 @@ void WriteKeys(Isolate& isolate, const Info& info, const std::optional<Local<Arr
 
 v8::Intercepted NamedGetter(v8::Local<v8::Name> property, const v8::PropertyCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, PropertyValueReturn::SINK);
@@ -2419,6 +2459,9 @@ v8::Intercepted NamedGetter(v8::Local<v8::Name> property, const v8::PropertyCall
 v8::Intercepted NamedSetter(v8::Local<v8::Name> property, v8::Local<v8::Value> value,
                             const v8::PropertyCallbackInfo<v8::Boolean>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2430,6 +2473,9 @@ v8::Intercepted NamedSetter(v8::Local<v8::Name> property, v8::Local<v8::Value> v
 
 v8::Intercepted NamedQuery(v8::Local<v8::Name> property, const v8::PropertyCallbackInfo<v8::Integer>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2445,6 +2491,9 @@ v8::Intercepted NamedQuery(v8::Local<v8::Name> property, const v8::PropertyCallb
 
 v8::Intercepted NamedDeleter(v8::Local<v8::Name> property, const v8::PropertyCallbackInfo<v8::Boolean>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2459,6 +2508,9 @@ v8::Intercepted NamedDeleter(v8::Local<v8::Name> property, const v8::PropertyCal
 
 void NamedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     auto* handler = PointerFrom<NamedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2467,6 +2519,9 @@ void NamedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
 
 v8::Intercepted IndexedGetter(uint32_t index, const v8::PropertyCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, PropertyValueReturn::SINK);
@@ -2476,6 +2531,9 @@ v8::Intercepted IndexedGetter(uint32_t index, const v8::PropertyCallbackInfo<v8:
 v8::Intercepted IndexedSetter(uint32_t index, v8::Local<v8::Value> value,
                               const v8::PropertyCallbackInfo<v8::Boolean>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2486,6 +2544,9 @@ v8::Intercepted IndexedSetter(uint32_t index, v8::Local<v8::Value> value,
 
 v8::Intercepted IndexedQuery(uint32_t index, const v8::PropertyCallbackInfo<v8::Integer>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2499,6 +2560,9 @@ v8::Intercepted IndexedQuery(uint32_t index, const v8::PropertyCallbackInfo<v8::
 
 v8::Intercepted IndexedDeleter(uint32_t index, const v8::PropertyCallbackInfo<v8::Boolean>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return v8::Intercepted::kYes;
+    }
     auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2512,6 +2576,9 @@ v8::Intercepted IndexedDeleter(uint32_t index, const v8::PropertyCallbackInfo<v8
 
 void IndexedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     auto* handler = PointerFrom<IndexedPropertyHandler>(info.DataV2());
     CallFrame frame(isolate, nullptr);
     CallbackState state = PropertyState(isolate, frame.frame(), info, handler->data, DiscardReturn::SINK);
@@ -2660,6 +2727,9 @@ void PublishNative(Isolate& isolate, v8::Local<v8::Object> instance, InstanceRec
 
 void ClassConstructTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
+    if (RefuseDeeperNative(isolate)) {
+        return;
+    }
     auto* rec = PointerFrom<ClassRec>(info.DataV2());
 
     const bool constructing = info.IsConstructCall();
@@ -3674,14 +3744,22 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
     // Error objects, not to a thrown primitive, which is exactly the line
     // unibind/exception.h draws.
     impl->isolate->SetCaptureStackTraceForUncaughtExceptions(true, 64, v8::StackTrace::kDetailed);
-    if (options.stackLimitBytes != 0) {
+    {
         // V8 wants the address of the lowest usable stack slot, and this thread
         // is the isolate's thread, so here is as good a datum as exists.
         const char here = 0;
         const auto top = reinterpret_cast<uintptr_t>(&here);
-        const std::size_t limit = UsableStackBytes(top, options.stackLimitBytes);
+        // What was asked for, or else as much of the thread's stack as can be
+        // promised: native calls are held to it either way (see
+        // `RefuseDeeperNative`), and V8's own limit is moved only when asked.
+        const std::size_t wanted =
+            options.stackLimitBytes != 0 ? options.stackLimitBytes : std::numeric_limits<std::size_t>::max();
+        const std::size_t limit = UsableStackBytes(top, wanted);
         if (top > limit) {
-            impl->isolate->SetStackLimit(top - limit);
+            impl->stackGuard = top - limit;
+            if (options.stackLimitBytes != 0) {
+                impl->isolate->SetStackLimit(top - limit);
+            }
         }
     }
 

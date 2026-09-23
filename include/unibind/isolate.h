@@ -418,6 +418,12 @@ struct IsolateOptions {
     /// that headroom, on both backends: a thread's stack size is not always the
     /// embedder's to know, and a limit past the end of the stack is no limit.
     ///
+    /// Recursion that never enters script is held to the same limit - with 0,
+    /// to the thread's real stack less that headroom: a native callback that
+    /// goes straight back through the engine from C++, reading the property it
+    /// is answering for or calling the function it is, gets the exception too,
+    /// where one engine would otherwise check only on entering script.
+    ///
     /// **Which** error is the engine's business and the two do not agree -
     /// `RangeError` on one, `InternalError` on the other - so a portable script
     /// catches it rather than asking what it is.
