@@ -569,8 +569,9 @@ template <class D>
 [[nodiscard]] inline std::size_t ByteOffset(const Local<TypedArray>& view) noexcept {
     return detail::TypedArrayByteOffset(view.slot());
 }
-/// The buffer this view looks at. Empty only if the engine could not hand it
-/// over.
+/// The buffer this view looks at. Empty if the engine could not hand it over,
+/// and empty if it is a `SharedArrayBuffer` - as the overload for any view
+/// below says, and for the same reason.
 [[nodiscard]] inline std::optional<Local<ArrayBuffer>> GetBuffer(const Context& context,
                                                                  const Local<TypedArray>& view) {
     return detail::WrapSlot<ArrayBuffer>(detail::TypedArrayBuffer(context, view.slot()));

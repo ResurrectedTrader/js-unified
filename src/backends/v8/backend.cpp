@@ -1479,8 +1479,9 @@ size_t TypedArrayByteOffset(Slot view) noexcept {
     return Resolve(view).As<v8::TypedArray>()->ByteOffset();
 }
 
+// The same answer as for any view, a `SharedArrayBuffer` refused included.
 std::optional<Slot> TypedArrayBuffer(const Context& context, Slot view) {
-    return PushOrNothing(OwnerOf(context), Resolve(view).As<v8::TypedArray>()->Buffer());
+    return ArrayBufferViewBuffer(context, view);
 }
 
 size_t TypedArrayCopyOut(Slot view, std::span<std::byte> out) noexcept {

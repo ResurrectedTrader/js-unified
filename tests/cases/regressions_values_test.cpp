@@ -235,3 +235,27 @@ UNIBIND_TEST_CASE(OBJECTS, "regressions: an own key that is an array index is a 
     CHECK(proxyKeys->Get(fixture.context, 0U)->IsNumber());  // NOLINT(bugprone-unchecked-optional-access)
     CHECK(proxyKeys->Get(fixture.context, 1U)->IsString());  // NOLINT(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array over shared memory hands back no ArrayBuffer") {
+    // `GetBuffer` on a view is empty when the buffer under it is a
+    // `SharedArrayBuffer`: this API has no type for one, and a
+    // `Local<ArrayBuffer>` over one is a handle whose type lies. The overload
+    // for any view said so and kept to it; the typed-array overload - the one a
+    // `Local<TypedArray>` actually picks - handed the shared buffer back.
+    ub_test::Fixture fixture;
+    if (!ub_test::EvalTruth(fixture.context, "typeof SharedArrayBuffer === 'function'")) {
+        ub_test::ReportSkip("this realm has no SharedArrayBuffer, so script cannot make a view over one");
+        return;
+    }
+
+    const auto view =
+        ub_test::Eval(fixture.context, "new Uint8Array(new SharedArrayBuffer(4)).fill(7)").To<ub::TypedArray>();
+    REQUIRE(view.has_value());
+    CHECK_FALSE(ub::GetBuffer(fixture.context, *view).has_value());
+    CHECK_FALSE(ub::GetBuffer(fixture.context, ub::Local<ub::ArrayBufferView>(*view)).has_value());
+
+    // The elements are still readable; only the buffer has no type here.
+    std::array<std::uint8_t, 4> out{};
+    CHECK(ub::CopyElements<std::uint8_t>(*view, out) == 4);
+    CHECK(out == std::array<std::uint8_t, 4>{7, 7, 7, 7});
+}

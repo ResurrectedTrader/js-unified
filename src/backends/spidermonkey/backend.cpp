@@ -1310,24 +1310,9 @@ std::size_t TypedArrayByteOffset(Slot view) noexcept {
     return JS_GetTypedArrayByteOffset(object);
 }
 
+// The same answer as for any view, a `SharedArrayBuffer` refused included.
 Maybe<Slot> TypedArrayBuffer(const Context& context, Slot view) {
-    JSContext* cx = Raw(context);
-    RealmGuard realm(context);
-    JS::RootedValue raw(cx);
-    if (!ResolveHere(cx, view, &raw) || !raw.isObject()) {
-        return std::nullopt;
-    }
-    JS::RootedObject target(cx, &raw.toObject());
-    if (!JS_IsArrayBufferViewObject(js::UncheckedUnwrap(target))) {
-        return std::nullopt;
-    }
-    bool isShared = false;
-    JSObject* buffer = JS_GetArrayBufferViewBuffer(cx, target, &isShared);
-    if (buffer == nullptr) {
-        JS_ClearPendingException(cx);
-        return std::nullopt;
-    }
-    return PushOrNothing(OwnerOf(context), JS::ObjectValue(*buffer));
+    return ArrayBufferViewBuffer(context, view);
 }
 
 std::size_t TypedArrayCopyOut(Slot view, std::span<std::byte> out) noexcept {
