@@ -696,9 +696,10 @@ has to see goes on the instance template instead, as V8's
 counterClass.InstanceTemplate().SetAccessor("value", &ReadValueUntyped, &WriteValueUntyped);
 ```
 
-That costs per instance on SpiderMonkey, which defines the member on each
-object as it is made - the getter and setter themselves are made once per
-realm and shared, as V8 shares a template's functions.
+Both engines stamp such instances from a model rather than defining each
+member on each object: V8 from the template's map, SpiderMonkey by copying a
+hidden model instance's shape, with the getters and setters made once per realm
+and shared.
 
 Recovering the native is checked, and cannot lie:
 

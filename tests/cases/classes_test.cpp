@@ -842,11 +842,13 @@ UNIBIND_TEST_CASE(CLASSES, "classes: instances share their instance template's a
     // Every instance carries the accessors as own properties, but they are the
     // same getter and setter each time, made once per realm - as V8 makes a
     // template's functions once per context. Making them per instance is what
-    // made a wrapper with many members expensive.
+    // made a wrapper with many members expensive. Instances made by Wrap, by
+    // script's `new`, and by a subclass's `new` all come out the same.
     Counter::Reset();
     ub_test::Fixture fixture;
 
     const auto cls = ub::Class<Counter>::New(fixture.iso(), "Many");
+    cls.Construct<&MakeCounter>();
     constexpr int MEMBERS = 50;
     for (int i = 0; i < MEMBERS; ++i) {
         cls.InstanceTemplate().SetAccessor("p" + std::to_string(i), &ReadValueOwn, &WriteValueOwn);
@@ -860,4 +862,15 @@ UNIBIND_TEST_CASE(CLASSES, "classes: instances share their instance template's a
         const da = Object.getOwnPropertyDescriptor(a, 'p7');
         const db = Object.getOwnPropertyDescriptor(b, 'p7');
         da.get === db.get && da.set === db.set)"));
+
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        const made = new Many(5);
+        class Sub extends Many { extra() { return this.p0 + 1; } }
+        const sub = new Sub(9);
+        const dm = Object.getOwnPropertyDescriptor(made, 'p7');
+        made.p7 === 5 && dm.get === Object.getOwnPropertyDescriptor(a, 'p7').get &&
+            Object.keys(made).length === 50 && JSON.stringify(made).includes('"p49":5') &&
+            sub instanceof Sub && sub instanceof Many && sub.extra() === 10 &&
+            Object.hasOwn(sub, 'p3') && Object.keys(sub).length === 50)"));
+    CHECK(ub_test::EvalInt(fixture.context, "const w = new Many(1); w.p0 = 41; w.p49 + 1") == 42);
 }

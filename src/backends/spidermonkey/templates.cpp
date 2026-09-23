@@ -1208,6 +1208,68 @@ bool MakerOf(JSContext* cx, JS::HandleObject object, TemplateRec** maker) {
 /// run with the instance as its receiver - `info.This()` has to be the object
 /// being made, not a sentinel - and it is also what keeps the box out of the
 /// engine until every fallible step of building the object is behind us.
+// Stamping a class's instances from a model, as V8 stamps them from a map.
+//
+// Replaying an instance template defines its members one by one, on every
+// instance. When every instance of a class would come out the same - the same
+// class, prototype and members - one hidden model instance is stamped that way
+// per realm, and each real instance takes its properties from the model in one
+// step (JS_InitializePropertiesFromCompatibleNativeObject, which Gecko's DOM
+// bindings use for the same purpose): it shares the model's shape rather than
+// building its own. Reserved slots are not copied, so the native, which lives
+// in one, stays each instance's own.
+//
+// Not for an intercepted instance (a proxy, not a native object), one made with
+// a subclass's prototype (the model has the class's own), or a template with a
+// nested template member (every instance gets an object of its own, which a
+// copied shape would share). Those replay as before.
+//
+// The model is cached per realm beside the constructors, with the entry count
+// it was stamped from: members declared after it was made make it be made
+// again. It is never handed to script, and it carries no native, which the
+// finalizer and every unwrap already treat as "not an instance".
+[[nodiscard]] bool CanStampFromModel(const TemplateRec* shape) {
+    for (const TemplateEntry& entry : shape->entries) {
+        if (entry.kind == TemplateEntry::Kind::Child) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ModelFor(JSContext* cx, const Context& context, TemplateRec* shape, ClassRec* owner, JS::HandleObject prototype,
+              JS::MutableHandleObject out) {
+    const auto entryCount = static_cast<std::int32_t>(shape->entries.size());
+    JS::RootedObject cached(cx);
+    if (CacheLookup(cx, context, 'm', shape->id, &cached)) {
+        JS::RootedValue model(cx);
+        JS::RootedValue count(cx);
+        if (!JS_GetElement(cx, cached, 0, &model) || !JS_GetElement(cx, cached, 1, &count)) {
+            return false;
+        }
+        if (model.isObject() && count.isInt32() && count.toInt32() == entryCount) {
+            out.set(&model.toObject());
+            return true;
+        }
+    }
+    JS::RootedObject model(cx, JS_NewObjectWithoutMetadata(cx, &owner->klass, prototype));
+    if (model == nullptr || !ApplyEntries(cx, context, model, shape)) {
+        return false;
+    }
+    JS::RootedObject record(cx, JS::NewArrayObject(cx, 2));
+    if (record == nullptr) {
+        return false;
+    }
+    JS::RootedValue modelValue(cx, JS::ObjectValue(*model));
+    JS::RootedValue countValue(cx, JS::Int32Value(entryCount));
+    if (!JS_SetElement(cx, record, 0, modelValue) || !JS_SetElement(cx, record, 1, countValue) ||
+        !CacheStore(cx, context, 'm', shape->id, record)) {
+        return false;
+    }
+    out.set(model);
+    return true;
+}
+
 JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl, JS::HandleObject prototypeOverride) {
     Seal(tpl);
     // `tpl` is either a function template (instantiate what it constructs) or a
@@ -1226,6 +1288,9 @@ JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl,
     // `Sub.prototype`, and building them from the class's own prototype
     // instead loses every method the subclass declared - silently, with
     // `instanceof Sub` answering false and nothing reporting anything.
+    // A subclass's instance has another prototype, and so cannot take the
+    // class's model; `new` on the class itself passes the class's own.
+    const bool subclassed = prototypeOverride != nullptr && prototypeOverride != prototype;
     if (prototypeOverride != nullptr) {
         prototype = prototypeOverride;
     }
@@ -1263,7 +1328,14 @@ JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl,
         JS::SetReservedSlot(instance, INSTANCE_TEMPLATE_SLOT, JS::PrivateValue(shape));
     }
 
-    if (!ApplyEntries(cx, context, instance, shape)) {
+    if (owner != nullptr && !intercepted && !subclassed && shape != nullptr && CanStampFromModel(shape)) {
+        JS::RootedObject model(cx);
+        JS::RootedObject target(cx, instance);
+        if (!ModelFor(cx, context, shape, owner, prototype, &model) ||
+            !JS_InitializePropertiesFromCompatibleNativeObject(cx, target, model)) {
+            return nullptr;
+        }
+    } else if (!ApplyEntries(cx, context, instance, shape)) {
         return nullptr;
     }
     JS::RootedObject made(cx, instance);
