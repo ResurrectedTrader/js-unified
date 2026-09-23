@@ -54,7 +54,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 120
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         backend: [v8, spidermonkey]
         arch: [x86, x64]
@@ -72,8 +72,8 @@ jobs:
             -DUNIBIND_BACKEND=${{ matrix.backend }} `
             -DUNIBIND_ENGINE_FLAVOR=${{ matrix.flavor }} `
             -DUNIBIND_BUILD_TESTS=OFF `
-            -DUNIBIND_VCPKG_ROOT="${env:VCPKG_INSTALLATION_ROOT}" `
-            -DVCPKG_TARGET_TRIPLET=$triplet `
+            "-DUNIBIND_VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" `
+            "-DVCPKG_TARGET_TRIPLET=$triplet" `
             -DVCPKG_HOST_TRIPLET=x64-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
