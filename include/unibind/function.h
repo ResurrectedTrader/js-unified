@@ -154,7 +154,10 @@ class CallbackContextBase {
     /// captured earlier.
     [[nodiscard]] const Context& GetContext() const noexcept { return detail::CallbackContext(*state_); }
 
-    /// The receiver of the call or the property access.
+    /// The receiver of the call or the property access - always an object,
+    /// converted as V8 converts a native's receiver and as a sloppy-mode
+    /// function's is: `f.call(5)` hands the callback a `Number` wrapper, and
+    /// `f.call(undefined)` or `f.call(null)` the realm's global object.
     [[nodiscard]] Local<Object> This() const noexcept { return Local<Object>::FromSlot(detail::CallbackThis(*state_)); }
     /// The object carrying the handler that was invoked, which is not always
     /// the receiver - for an inherited accessor it is the prototype. Engines

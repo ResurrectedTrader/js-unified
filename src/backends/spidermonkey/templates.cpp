@@ -175,12 +175,18 @@ namespace {
 
 bool AccessorGetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    // Boxed before anything is copied out of the callee: it allocates, and a
+    // moving collector would leave such a copy stale.
+    JS::RootedValue receiver(cx, args.thisv());
+    if (!ReceiverObject(cx, &receiver)) {
+        return false;
+    }
     CallbackRecord* record = RecordOfCallee(args);
     const JS::Value name = NameOfCallee(args);
 
     auto* isolate = static_cast<Isolate*>(JS_GetContextPrivate(cx));
     CallFrame frame(*isolate, &args);
-    const SlotIndex self = frame.frame().Push(args.thisv());
+    const SlotIndex self = frame.frame().Push(receiver);
     // Into the frame before anything else can collect: `name` was copied out
     // of the callee's reserved slot and is not rooted where it stands.
     const SlotIndex nameSlot = frame.frame().Push(name);
@@ -200,13 +206,17 @@ bool AccessorGetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
 
 bool AccessorSetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    JS::RootedValue receiver(cx, args.thisv());
+    if (!ReceiverObject(cx, &receiver)) {
+        return false;
+    }
     CallbackRecord* record = RecordOfCallee(args);
     const JS::Value name = NameOfCallee(args);
     const JS::Value incoming = args.get(0);
 
     auto* isolate = static_cast<Isolate*>(JS_GetContextPrivate(cx));
     CallFrame frame(*isolate, &args);
-    const SlotIndex self = frame.frame().Push(args.thisv());
+    const SlotIndex self = frame.frame().Push(receiver);
     const SlotIndex nameSlot = frame.frame().Push(name);
     const SlotIndex valueSlot = frame.frame().Push(incoming);
     // A setter's result is ignored by the language, so it is given somewhere
@@ -1058,14 +1068,11 @@ bool ConstructorTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
         if (tpl->callRecord == nullptr || tpl->callRecord->callback == nullptr) {
             return true;
         }
-        CallFrame frame(*isolate, &args);
-        JS::Value receiver = args.thisv();
-        if (!receiver.isObject()) {
-            JSObject* global = JS::CurrentGlobalOrNull(cx);
-            if (global != nullptr) {
-                receiver = JS::ObjectValue(*global);
-            }
+        JS::RootedValue receiver(cx, args.thisv());
+        if (!ReceiverObject(cx, &receiver)) {
+            return false;
         }
+        CallFrame frame(*isolate, &args);
         const SlotIndex self = frame.frame().Push(receiver);
         CallbackState state{.owner = isolate,
                             .frame = &frame.frame(),

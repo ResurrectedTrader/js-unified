@@ -808,6 +808,15 @@ class RealmGuard {
                                   CallbackRecord* record, PropertyAttribute attributes,
                                   JS::ObjectOpResult* result = nullptr);
 
+/// A call's receiver as a callback sees it: converted the way a sloppy-mode
+/// function's is, and the way V8 converts one for every native it calls -
+/// undefined and null become the current realm's global object, and a
+/// primitive becomes its wrapper. `This()` is a `Local<Object>`, so handing a
+/// callback the primitive itself would be a number where an object is
+/// promised. False, with an exception pending, only if the wrapper could not be
+/// made.
+[[nodiscard]] bool ReceiverObject(JSContext* cx, JS::MutableHandleValue receiver);
+
 /// The trampoline every native function declared through this API goes
 /// through. Recovers its `CallbackRecord` from the callee's reserved slot.
 bool FunctionTrampoline(JSContext* cx, unsigned argc, JS::Value* vp);

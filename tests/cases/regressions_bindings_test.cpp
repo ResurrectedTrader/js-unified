@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "support/harness.h"
 
@@ -130,4 +131,60 @@ UNIBIND_TEST_CASE(TEMPLATES, "regressions: a function template's constructor may
     CHECK(ub_test::EvalTruth(fixture.context, "new F() instanceof F"));
     CHECK(ub_test::EvalTruth(fixture.context, "new F(5) instanceof F"));
     CHECK(ub_test::EvalInt(fixture.context, "F()") == 1);
+}
+
+namespace {
+
+void AnswerReceiver(const ub::CallbackInfo& info) {
+    info.GetReturnValue().Set(info.This());
+}
+
+/// Reads through its receiver, as an accessor on a prototype does.
+void ReadReceiverValueOf(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
+    const auto valueOf = info.This().Get(info.GetContext(), "valueOf");
+    if (!valueOf) {
+        return;
+    }
+    info.GetReturnValue().Set(info.This());
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(TEMPLATES, "regressions: a primitive receiver reaches a native boxed, as an object") {
+    // `This()` is a `Local<Object>`. V8 converts a callback's receiver the way
+    // a sloppy-mode function's is converted: undefined and null become the
+    // global object, and a primitive its wrapper. SpiderMonkey's backend
+    // replaced a primitive with the global object in a function, and handed
+    // an accessor half the primitive itself - a number in a `Local<Object>`,
+    // which reading a property through crashed.
+    ub_test::Fixture fixture;
+
+    const auto plain = ub::Function::New(fixture.context, &AnswerReceiver);
+    REQUIRE(plain.has_value());
+    ub_test::Expose(fixture.context, "plain", *plain);  // NOLINT(bugprone-unchecked-optional-access)
+
+    const auto constructable = ub::FunctionTemplate::New(fixture.iso(), &AnswerReceiver).GetFunction(fixture.context);
+    REQUIRE(constructable.has_value());
+    ub_test::Expose(fixture.context, "constructable", *constructable);  // NOLINT(bugprone-unchecked-optional-access)
+
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.Set("method", &AnswerReceiver);
+    shape.SetAccessor("accessor", &ReadReceiverValueOf);
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+    ub_test::Eval(fixture.context, "var getter = Object.getOwnPropertyDescriptor(o, 'accessor').get");
+
+    for (const std::string_view callee : {"plain", "constructable", "o.method", "getter"}) {
+        CAPTURE(callee);
+        const std::string call = std::string(callee) + ".call";
+        CHECK(ub_test::EvalText(fixture.context, "(() => { const r = " + call +
+                                                     "(5); return typeof r + ' ' + r.valueOf(); })()") == "object 5");
+        CHECK(ub_test::EvalText(fixture.context,
+                                "(() => { const r = " + call + "('text'); return typeof r + ' ' + r.valueOf(); })()") ==
+              "object text");
+        CHECK(ub_test::EvalTruth(fixture.context, call + "(undefined) === globalThis"));
+        CHECK(ub_test::EvalTruth(fixture.context, call + "(null) === globalThis"));
+        CHECK(ub_test::EvalTruth(fixture.context, "(() => { const r = {}; return " + call + "(r) === r; })()"));
+    }
 }

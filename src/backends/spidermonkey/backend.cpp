@@ -921,34 +921,47 @@ void ReleaseCallbackRecord(CallbackRecord* record) noexcept {
     record->owner->impl().callbacks.erase(record);
 }
 
+bool ReceiverObject(JSContext* cx, JS::MutableHandleValue receiver) {
+    if (receiver.isObject()) {
+        return true;
+    }
+    if (receiver.isNullOrUndefined()) {
+        JSObject* global = JS::CurrentGlobalOrNull(cx);
+        if (global != nullptr) {
+            receiver.setObject(*global);
+        }
+        return true;
+    }
+    JSObject* boxed = JS::ToObject(cx, receiver);
+    if (boxed == nullptr) {
+        return false;
+    }
+    receiver.setObject(*boxed);
+    return true;
+}
+
 bool FunctionTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
     // Read the callee before rval() is touched: SpiderMonkey reuses that slot.
     auto* record =
         static_cast<CallbackRecord*>(js::GetFunctionNativeReserved(&args.callee(), FUNCTION_RECORD_SLOT).toPrivate());
     // And, for the same reason, the data value - which is reached through the
-    // callee - before anything writes the result.
-    JS::Value dataValue = JS::UndefinedValue();
+    // callee - before anything writes the result. Rooted, because boxing the
+    // receiver below allocates and a moving collector would leave a copy stale.
+    JS::RootedValue dataValue(cx);
     if (record->hasValue) {
         const JS::Value holder = js::GetFunctionNativeReserved(&args.callee(), FUNCTION_HOLDER_SLOT);
         dataValue = JS::GetReservedSlot(&holder.toObject(), RECORD_HOLDER_VALUE_SLOT);
+    }
+    JS::RootedValue thisValue(cx, args.thisv());
+    if (!ReceiverObject(cx, &thisValue)) {
+        return false;
     }
 
     auto* isolate = static_cast<Isolate*>(JS_GetContextPrivate(cx));
     CallFrame frame(*isolate, &args);
 
-    JS::Value thisValue = args.thisv();
-    if (!thisValue.isObject()) {
-        // Sloppy-mode boxing, roughly: the API hands a callback a Local<Object>
-        // and there is nothing useful to say about an undefined receiver.
-        JSObject* global = JS::CurrentGlobalOrNull(cx);
-        if (global != nullptr) {
-            thisValue = JS::ObjectValue(*global);
-        }
-    }
     const SlotIndex self = frame.frame().Push(thisValue);
-    // Rooted in the frame before anything can collect: `dataValue` is a copy
-    // out of a reserved slot, and a moving collector would leave it stale.
     const SlotIndex value = record->hasValue ? frame.frame().Push(dataValue) : Frame::NO_SLOT;
 
     args.rval().setUndefined();
