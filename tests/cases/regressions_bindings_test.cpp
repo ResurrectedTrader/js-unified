@@ -522,3 +522,56 @@ UNIBIND_TEST_CASE(CLASSES, "regressions: a new.target with no object prototype m
     CHECK(ub_test::EvalTruth(
         fixture.context, "Object.getPrototypeOf(Reflect.construct(Stamped, [], Elsewhere)) === secondObjectPrototype"));
 }
+
+UNIBIND_TEST_CASE2(CLASSES, INTERCEPTORS, "regressions: a template's shape is fixed once it has been instantiated") {
+    // V8 builds a constructor from a function template the first time it is
+    // instantiated, and treats changing its class name, its parent or its
+    // instance handlers after that as a fatal error: `SetClassName`, `Inherit`
+    // or `SetHandler` on a template already in use ended the process, while
+    // SpiderMonkey's backend took them and applied them to the next realm.
+    // The shape is now fixed at the first instantiation on every backend, and
+    // a later call is ignored.
+    ub_test::Fixture fixture;
+    auto second = ub::Context::New(fixture.iso());
+    REQUIRE(second.has_value());
+    const auto inSecond = [&](std::string_view name, const auto& function, std::string_view source) {
+        const ub::ContextScope entered(*second);  // NOLINT(bugprone-unchecked-optional-access)
+        REQUIRE(function.has_value());
+        ub_test::Expose(*second, name, *function);  // NOLINT(bugprone-unchecked-optional-access)
+        return ub_test::EvalText(*second, source);  // NOLINT(bugprone-unchecked-optional-access)
+    };
+
+    const auto named = ub::FunctionTemplate::New(fixture.iso());
+    named.SetClassName("Early");
+    REQUIRE(named.GetFunction(fixture.context).has_value());
+    named.SetClassName("Late");
+    CHECK(inSecond("Named", named.GetFunction(*second), "Named.name") == "Early");  // NOLINT
+
+    const auto parent = ub::FunctionTemplate::New(fixture.iso());
+    parent.PrototypeTemplate().Set("fromParent", ub::Constant(1));
+    const auto child = ub::FunctionTemplate::New(fixture.iso());
+    REQUIRE(child.GetFunction(fixture.context).has_value());
+    child.Inherit(parent);
+    CHECK(inSecond("Child", child.GetFunction(*second), "typeof new Child().fromParent") == "undefined");  // NOLINT
+
+    // Instantiated through another template: a nested one is instantiated
+    // with the one it is nested in.
+    const auto nested = ub::FunctionTemplate::New(fixture.iso());
+    const auto holder = ub::ObjectTemplate::New(fixture.iso());
+    holder.Set("Nested", nested);
+    REQUIRE(holder.NewInstance(fixture.context).has_value());
+    nested.SetClassName("TooLate");
+    nested.InstanceTemplate().SetHandler(ub::NamedPropertyHandler{.getter = &AnswerListedKeys});
+
+    const auto cls = ub::Class<Gadget>::New(fixture.iso(), "Shaped");
+    REQUIRE(cls.Wrap(fixture.context, std::make_shared<Gadget>()).has_value());
+    cls.SetHandler(ub::NamedPropertyHandler{.getter = &AnswerListedKeys});
+    const auto wrapped = cls.Wrap(fixture.context, std::make_shared<Gadget>());
+    REQUIRE(wrapped.has_value());
+    ub_test::Expose(fixture.context, "wrapped", *wrapped);  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK(ub_test::EvalText(fixture.context, "typeof wrapped.a") == "undefined");
+
+    // What may still change: members, which reach every realm made after.
+    parent.PrototypeTemplate().Set("addedLate", ub::Constant(2));
+    CHECK(inSecond("Parent", parent.GetFunction(*second), "String(new Parent().addedLate)") == "2");  // NOLINT
+}

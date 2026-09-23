@@ -444,6 +444,18 @@ realm or per long-lived object is what it is for. Calling it on an object made
 for every call adds a record per call that is never given back; use an
 `ObjectTemplate` with the accessor on it instead, which records it once.
 
+### A template's class name, parent and handlers are fixed when it is first used
+
+**Silent.** `SetClassName`, `Inherit` and `SetHandler` - on a template or on a
+`Class<T>` - are ignored once the template has been instantiated: after
+`GetFunction`, `NewInstance`, `GetConstructor` or `Wrap`, or after a template
+that instantiates it along with itself was (see `unibind/template.h` for the
+whole list). V8 bakes them into the constructor it builds at that moment and
+ends the process if they change afterwards, so the library stops the call
+rather than passing it on, and does the same on SpiderMonkey. Constants,
+methods and accessors may still be added later, and reach the realms the
+template is instantiated in from then on.
+
 ### Throwing does not stop your C++
 
 **Silent if ignored.** `Throw` marks an exception pending; it takes effect when

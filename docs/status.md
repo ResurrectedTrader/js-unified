@@ -299,6 +299,14 @@ isolate-owned and isolate-lifetime by design (see the header comment in
 they must not become refcounted. Everything holding an engine root is released
 before the isolate is torn down.
 
+A template's *shape* - class name, parent, handlers - is fixed at its first
+instantiation, and a later `SetClassName`, `Inherit` or `SetHandler` is ignored.
+That is V8's rule, where changing any of them afterwards is a fatal error inside
+the engine; SpiderMonkey would have taken the change and applied it to the next
+realm, and follows V8 so the two agree. Each backend records which templates
+have been instantiated - directly, or along with one that instantiates them - in
+its own records, and consults that before passing the call on.
+
 ### 14. A wrapper owns a *share* of its native (`unibind/class.h`)
 
 `Class<T>` used to own its native exclusively, which made two ordinary things

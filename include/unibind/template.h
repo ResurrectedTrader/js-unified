@@ -15,6 +15,21 @@
 ///
 /// Templates live as long as their isolate. A template handle is a
 /// non-owning reference, freely copied.
+///
+/// **A template's shape is fixed the first time it is instantiated.** Its
+/// class name (`SetClassName`), its parent (`Inherit`) and the handlers on it
+/// (`SetHandler`, and `Class<T>::SetHandler`) are part of the constructor the
+/// engine builds then, and V8 treats changing them afterwards as a fatal error
+/// - the process ends inside the engine. So on every backend such a call made
+/// after the first instantiation is ignored. Instantiated means: a function
+/// template's `GetFunction`, an instance made from it or from its instance
+/// template, `Class<T>::GetConstructor` or `Wrap`, an object template's
+/// `NewInstance` - or the same happening to a template that instantiates this
+/// one with it: the function template an object template belongs to, one that
+/// inherits from it, or one it was set on as a property. Declare the shape
+/// first, then use it. Members - constants, methods, accessors, nested
+/// templates - may still be added, and reach every realm the template is
+/// instantiated in afterwards.
 
 #include <cstdint>
 #include <string_view>

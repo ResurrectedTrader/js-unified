@@ -80,6 +80,13 @@ struct TemplateRec {
     /// instance made straight off `InstanceTemplate()` still has to come out
     /// with the constructor's prototype, or `HasInstance` disowns it.
     TemplateRec* instanceOf = nullptr;
+    /// Set on a prototype template: the function template it belongs to.
+    TemplateRec* prototypeOf = nullptr;
+    /// Whether the template has been instantiated - or something that
+    /// instantiates it with itself has. From then on its class name, parent and
+    /// handlers are fixed, as they are on V8, where changing them is a fatal
+    /// error; see `unibind/template.h`.
+    bool sealed = false;
 };
 
 struct ClassRec {
@@ -102,6 +109,32 @@ void DestroyTemplate(TemplateRec* tpl) noexcept {
 void DestroyClass(ClassRec* rec) noexcept {
     delete rec;
 }
+
+namespace {
+
+/// Mark `rec`, and everything instantiating it instantiates with it, as
+/// instantiated: the function template an object template belongs to, a
+/// function template's parent and its two object templates, and every
+/// template set as a property on any of them. The same closure the V8 backend
+/// seals, so a late shape call is ignored on both at the same moment.
+void Seal(TemplateRec* rec) noexcept {
+    if (rec == nullptr || rec->sealed) {
+        return;
+    }
+    rec->sealed = true;
+    Seal(rec->instanceOf);
+    Seal(rec->prototypeOf);
+    Seal(rec->parent);
+    Seal(rec->prototype);
+    Seal(rec->instance);
+    for (const TemplateEntry& entry : rec->entries) {
+        if (entry.kind == TemplateEntry::Kind::Child) {
+            Seal(entry.child);
+        }
+    }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // The per-realm cache
@@ -431,6 +464,7 @@ bool ConstructorTrampoline(JSContext* cx, unsigned argc, JS::Value* vp);
 /// template names in this realm.
 bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::MutableHandleObject functionOut,
                  JS::MutableHandleObject prototypeOut) {
+    Seal(tpl);
     if (CacheLookup(cx, context, 'c', tpl->id, functionOut)) {
         // Both halves are stored together, so one without the other is a cache
         // that cannot be trusted - and trusting it would hand back a null
@@ -1060,6 +1094,7 @@ bool MakerOf(JSContext* cx, JS::HandleObject object, TemplateRec** maker) {
 /// being made, not a sentinel - and it is also what keeps the box out of the
 /// engine until every fallible step of building the object is behind us.
 JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl, JS::HandleObject prototypeOverride) {
+    Seal(tpl);
     // `tpl` is either a function template (instantiate what it constructs) or a
     // shape. A shape that is some function template's instance template still
     // gets that constructor's prototype.
@@ -1492,29 +1527,50 @@ void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetter
 void TemplateSetTemplate(TemplateRec* tpl, std::string_view name, TemplateRec* value, PropertyAttribute attributes) {
     tpl->entries.push_back(TemplateEntry{
         .kind = TemplateEntry::Kind::Child, .name = std::string(name), .child = value, .attributes = attributes});
+    if (tpl->sealed) {
+        // It will be instantiated with `tpl` in every realm from now on.
+        Seal(value);
+    }
 }
 
+// Class name, parent and handlers are fixed at the first instantiation - see
+// unibind/template.h - so each of these four ignores a sealed template.
+
 void TemplateSetNamedHandler(TemplateRec* tpl, const NamedPropertyHandler& handler) {
+    if (tpl->sealed) {
+        return;
+    }
     tpl->named = handler;
     tpl->hasNamed = true;
 }
 
 void TemplateSetIndexedHandler(TemplateRec* tpl, const IndexedPropertyHandler& handler) {
+    if (tpl->sealed) {
+        return;
+    }
     tpl->indexed = handler;
     tpl->hasIndexed = true;
 }
 
 void TemplateSetClassName(TemplateRec* tpl, std::string_view name) {
+    if (tpl->sealed) {
+        return;
+    }
     tpl->className = std::string(name);
 }
 
 void TemplateInherit(TemplateRec* child, TemplateRec* parent) {
+    if (child->sealed) {
+        return;
+    }
     child->parent = parent;
 }
 
 TemplateRec* TemplatePrototype(TemplateRec* tpl) {
     if (tpl->prototype == nullptr) {
         tpl->prototype = NewTemplate(*tpl->owner, false);
+        tpl->prototype->prototypeOf = tpl;
+        tpl->prototype->sealed = tpl->sealed;
     }
     return tpl->prototype;
 }
@@ -1523,6 +1579,7 @@ TemplateRec* TemplateInstance(TemplateRec* tpl) {
     if (tpl->instance == nullptr) {
         tpl->instance = NewTemplate(*tpl->owner, false);
         tpl->instance->instanceOf = tpl;
+        tpl->instance->sealed = tpl->sealed;
     }
     return tpl->instance;
 }

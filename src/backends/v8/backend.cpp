@@ -472,6 +472,19 @@ struct TemplateRec {
     /// asking twice yields the same record.
     TemplateRec* prototype = nullptr;
     TemplateRec* instance = nullptr;
+
+    /// What instantiating this template instantiates too, so that `Seal` can
+    /// follow it: the function template an object template is the prototype
+    /// or instance template of, the one a function template inherits from,
+    /// and every template set as a property of this one.
+    TemplateRec* function = nullptr;
+    TemplateRec* parent = nullptr;
+    std::vector<TemplateRec*> nested;
+    /// Whether V8 may have instantiated this template. From then on it treats
+    /// a change to the shape of the constructor it built - class name, parent,
+    /// instance handlers - as a fatal error, so those calls are ignored rather
+    /// than passed on. See `unibind/template.h`.
+    bool sealed = false;
 };
 
 /// A class: a constructor template, its prototype and its instance shape, plus
@@ -2234,21 +2247,57 @@ std::optional<bool> SetAccessorProperty(const Context& context, Slot object, std
     return FromV8(Resolve(object).As<v8::Object>()->DefineProperty(raw, key, descriptor));
 }
 
+namespace {
+
+/// Mark `rec`, and everything instantiating it instantiates, as possibly
+/// instantiated by V8 - the object template's function template, a function
+/// template's parent and its two object templates, and every template set as
+/// a property on any of them. A superset of what V8 publishes is the safe
+/// side: a shape call it would have allowed is ignored, where one it would
+/// not have is a fatal error.
+void Seal(TemplateRec* rec) noexcept {
+    if (rec == nullptr || rec->sealed) {
+        return;
+    }
+    rec->sealed = true;
+    Seal(rec->function);
+    Seal(rec->parent);
+    Seal(rec->prototype);
+    Seal(rec->instance);
+    for (TemplateRec* nested : rec->nested) {
+        Seal(nested);
+    }
+}
+
+}  // namespace
+
 void TemplateSetTemplate(TemplateRec* tpl, std::string_view name, TemplateRec* value, PropertyAttribute attributes) {
     Isolate& owner = *tpl->owner;
     v8::HandleScope scope(Raw(owner));
+    tpl->nested.push_back(value);
+    if (tpl->sealed) {
+        // It will be instantiated with `tpl` in every realm from now on.
+        Seal(value);
+    }
     RawTemplate(tpl)->Set(RawString(owner, name), RawTemplate(value), RawAttributes(attributes));
 }
 
 void TemplateSetClassName(TemplateRec* tpl, std::string_view name) {
+    if (tpl->sealed) {
+        return;  // fixed at the first instantiation - see unibind/template.h
+    }
     Isolate& owner = *tpl->owner;
     v8::HandleScope scope(Raw(owner));
     RawFunctionTemplate(tpl)->SetClassName(RawString(owner, name));
 }
 
 void TemplateInherit(TemplateRec* child, TemplateRec* parent) {
+    if (child->sealed) {
+        return;  // fixed at the first instantiation - see unibind/template.h
+    }
     Isolate& owner = *child->owner;
     v8::HandleScope scope(Raw(owner));
+    child->parent = parent;
     RawFunctionTemplate(child)->Inherit(RawFunctionTemplate(parent));
 }
 
@@ -2257,6 +2306,8 @@ TemplateRec* TemplatePrototype(TemplateRec* tpl) {
         Isolate& owner = *tpl->owner;
         v8::HandleScope scope(Raw(owner));
         tpl->prototype = AdoptTemplate(owner, TemplateRec::Kind::Object, RawFunctionTemplate(tpl)->PrototypeTemplate());
+        tpl->prototype->function = tpl;
+        tpl->prototype->sealed = tpl->sealed;
     }
     return tpl->prototype;
 }
@@ -2266,11 +2317,14 @@ TemplateRec* TemplateInstance(TemplateRec* tpl) {
         Isolate& owner = *tpl->owner;
         v8::HandleScope scope(Raw(owner));
         tpl->instance = AdoptTemplate(owner, TemplateRec::Kind::Object, RawFunctionTemplate(tpl)->InstanceTemplate());
+        tpl->instance->function = tpl;
+        tpl->instance->sealed = tpl->sealed;
     }
     return tpl->instance;
 }
 
 std::optional<Slot> TemplateNewInstance(const Context& context, TemplateRec* tpl) {
+    Seal(tpl);
     v8::Local<v8::Object> instance;
     if (!RawObjectTemplate(tpl)->NewInstance(Raw(context)).ToLocal(&instance)) {
         return std::nullopt;
@@ -2279,6 +2333,7 @@ std::optional<Slot> TemplateNewInstance(const Context& context, TemplateRec* tpl
 }
 
 std::optional<Slot> TemplateGetFunction(const Context& context, TemplateRec* tpl) {
+    Seal(tpl);
     v8::Local<v8::Function> function;
     if (!RawFunctionTemplate(tpl)->GetFunction(Raw(context)).ToLocal(&function)) {
         return std::nullopt;
@@ -2465,6 +2520,9 @@ void IndexedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
 }  // namespace
 
 void TemplateSetNamedHandler(TemplateRec* tpl, const NamedPropertyHandler& handler) {
+    if (tpl->sealed) {
+        return;  // fixed at the first instantiation - see unibind/template.h
+    }
     Isolate& owner = *tpl->owner;
     v8::HandleScope scope(Raw(owner));
 
@@ -2481,6 +2539,9 @@ void TemplateSetNamedHandler(TemplateRec* tpl, const NamedPropertyHandler& handl
 }
 
 void TemplateSetIndexedHandler(TemplateRec* tpl, const IndexedPropertyHandler& handler) {
+    if (tpl->sealed) {
+        return;  // fixed at the first instantiation - see unibind/template.h
+    }
     Isolate& owner = *tpl->owner;
     v8::HandleScope scope(Raw(owner));
 
@@ -2721,6 +2782,7 @@ std::optional<Slot> ClassInstantiate(const Context& context, ClassRec* rec, Nati
     assert((native == nullptr || native->type == rec->nativeType) &&
            "a class was handed a native of a type it does not wrap");
     Isolate& owner = OwnerOf(context);
+    Seal(rec->function);
     Frame* frame = owner.impl().current;
     assert(frame != nullptr && "a value was created with no HandleScope open");
 
