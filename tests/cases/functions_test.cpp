@@ -128,6 +128,41 @@ void CollectArguments(const ub::CallbackInfo& info) {
     info.GetReturnValue().Set(*array);
 }
 
+/// Answers with the script value it was made with - `undefined` for a function
+/// made with none - and says, by throwing, if it was also handed an embedder
+/// pointer: a function has one kind of data or the other.
+void ReturnValueData(const ub::CallbackInfo& info) {
+    if (info.Data<CallLog>() != nullptr) {
+        info.ThrowTypeError("a function made with a value has no embedder pointer");
+        return;
+    }
+    info.GetReturnValue().Set(info.Data());
+}
+
+/// One callback behind many functions: prefixes its argument with the string
+/// the function was made with.
+void Prefix(const ub::CallbackInfo& info) {
+    const auto prefix = info.Data().ToString(info.GetContext());
+    const auto argument = info[0].ToString(info.GetContext());
+    if (!prefix || !argument) {
+        return;
+    }
+    (void)info.GetReturnValue().Set(prefix->Utf8Value() + argument->Utf8Value());
+}
+
+/// Counts its calls in the object it was made with, so a case can tell whether
+/// the callback ran at all.
+void CountInData(const ub::CallbackInfo& info) {
+    const auto data = info.Data().To<ub::Object>();
+    if (!data) {
+        return;
+    }
+    const auto calls = data->Get(info.GetContext(), "calls");
+    const std::int32_t sofar = calls ? calls->ToInt32(info.GetContext()).value_or(0) : 0;
+    (void)data->Set(info.GetContext(), "calls", ub::Integer::New(info.GetIsolate(), sofar + 1));
+    info.GetReturnValue().Set(sofar + 1);
+}
+
 }  // namespace
 
 TEST_CASE("functions: script calls native and native calls it straight back") {
@@ -389,4 +424,145 @@ TEST_CASE("functions: native into script into native") {
     REQUIRE(result.has_value());
     CHECK(result->To<ub::Integer>()->Int32Value() == 24);
     CHECK(log.calls == 2);
+}
+
+// ---------------------------------------------------------------------------
+// A script value as a function's data: V8's `Function::New` with a
+// `Local<Value>`, read back as `info.Data()`.
+// ---------------------------------------------------------------------------
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA, "functions: one callback behind many functions, each with its own value") {
+    ub_test::Fixture fixture;
+
+    for (const char* name : {"alpha", "beta", "gamma"}) {
+        const auto function = ub::Function::New(fixture.context, &Prefix, ub_test::Str(fixture.iso(), name));
+        REQUIRE(function.has_value());
+        ub_test::Expose(fixture.context, name, *function);
+    }
+
+    CHECK(ub_test::EvalText(fixture.context, "alpha(':1')") == "alpha:1");
+    CHECK(ub_test::EvalText(fixture.context, "beta(':2')") == "beta:2");
+    CHECK(ub_test::EvalText(fixture.context, "gamma(':3') + alpha('!')") == "gamma:3alpha!");
+}
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA, "functions: the value comes back as itself, of whatever kind it is") {
+    ub_test::Fixture fixture;
+
+    const auto object = ub_test::Eval(fixture.context, "({ marker: 'the same object' })");
+    const auto fromObject = ub::Function::New(fixture.context, &ReturnValueData, object);
+    const auto fromNumber = ub::Function::New(fixture.context, &ReturnValueData, ub::Number::New(fixture.iso(), 2.5));
+    const auto fromNull = ub::Function::New(fixture.context, &ReturnValueData, ub::Null(fixture.iso()));
+    REQUIRE(fromObject.has_value());
+    REQUIRE(fromNumber.has_value());
+    REQUIRE(fromNull.has_value());
+
+    const auto answer = fromObject->Call(fixture.context, fixture.context.GlobalObject());
+    REQUIRE(answer.has_value());
+    CHECK(answer->StrictEquals(object));
+
+    ub_test::Expose(fixture.context, "fromNumber", *fromNumber);
+    ub_test::Expose(fixture.context, "fromNull", *fromNull);
+    CHECK(ub_test::EvalNumber(fixture.context, "fromNumber()") == 2.5);
+    CHECK(ub_test::EvalTruth(fixture.context, "fromNull() === null"));
+}
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA, "functions: a function made without a value reads undefined") {
+    // `Data()` is V8's `FunctionCallbackInfo::Data()`, which is undefined for a
+    // function declared with no data - including one declared with an
+    // embedder pointer, which is a different kind of data.
+    ub_test::Fixture fixture;
+    CallLog log;
+
+    const auto plain = ub::Function::New(fixture.context, &ReturnValueData);
+    REQUIRE(plain.has_value());
+    ub_test::Expose(fixture.context, "plain", *plain);
+    CHECK(ub_test::EvalTruth(fixture.context, "plain() === undefined"));
+
+    const auto withPointer = ub::Function::New(fixture.context, &ReturnValueData, ub::CallbackData::For(log));
+    REQUIRE(withPointer.has_value());
+    ub_test::Expose(fixture.context, "withPointer", *withPointer);
+    // It throws because it was handed a pointer; that it was is the point.
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        (function () {
+            try { withPointer(); return false; }
+            catch (e) { return e instanceof TypeError; }
+        })()
+    )"));
+}
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA, "functions: a function with a value is callable and not constructable") {
+    // Exactly as `Function::New` with an embedder pointer (decision 9): `new`
+    // is a TypeError before the callback runs.
+    ub_test::Fixture fixture;
+
+    const auto counter = ub_test::Eval(fixture.context, "({ calls: 0 })");
+    const auto function = ub::Function::New(fixture.context, &CountInData, counter);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "count", *function);
+    ub_test::Expose(fixture.context, "counter", counter);
+
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        (function () {
+            try { new count(); return false; }
+            catch (e) { return e instanceof TypeError; }
+        })()
+    )"));
+    ub::TryCatch tryCatch(fixture.iso());
+    CHECK_FALSE(function->NewInstance(fixture.context).has_value());
+    CHECK(tryCatch.HasCaught());
+    tryCatch.Reset();
+    CHECK(ub_test::EvalInt(fixture.context, "counter.calls") == 0);
+
+    CHECK(ub_test::EvalInt(fixture.context, "count() + count()") == 3);
+    CHECK(ub_test::EvalInt(fixture.context, "counter.calls") == 2);
+}
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA, "functions: the value lives as long as the function, through collections") {
+    // Nothing but the function holds the value: the handle that made it is in
+    // a frame that has closed. A value collected early would come back as
+    // something else, or as nothing.
+    ub_test::Fixture fixture;
+
+    ub::Global<ub::Function> kept;
+    {
+        ub::HandleScope inner(fixture.iso());
+        const auto value = ub_test::Eval(fixture.context, "({ marker: 'still here', list: [1, 2, 3] })");
+        const auto function = ub::Function::New(fixture.context, &ReturnValueData, value);
+        REQUIRE(function.has_value());
+        kept = ub::Global<ub::Function>(fixture.iso(), *function);
+    }
+
+    for (int round = 0; round < 4; ++round) {
+        {
+            ub::HandleScope churn(fixture.iso());
+            for (int i = 0; i < 2000; ++i) {
+                (void)ub::Object::New(fixture.context);
+            }
+        }
+        fixture.iso().RequestGarbageCollection();
+    }
+
+    ub_test::Expose(fixture.context, "kept", kept.Get(fixture.iso()));
+    CHECK(ub_test::EvalText(fixture.context, "kept().marker") == "still here");
+    CHECK(ub_test::EvalInt(fixture.context, "kept().list[2]") == 3);
+    CHECK(ub_test::EvalTruth(fixture.context, "kept() === kept()"));
+}
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA, "functions: a value from another realm is handed back into the caller's") {
+    // A value belongs to an isolate, not to a realm (decision 4), so one made in
+    // a second realm may be a function's data in the first.
+    ub_test::Fixture fixture;
+
+    const auto other = ub::Context::New(fixture.iso());
+    REQUIRE(other.has_value());
+    ub::Local<ub::Value> foreign;
+    {
+        const ub::ContextScope inside(*other);
+        foreign = ub_test::Eval(*other, "({ from: 'elsewhere' })");
+    }
+
+    const auto function = ub::Function::New(fixture.context, &ReturnValueData, foreign);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "fromElsewhere", *function);
+    CHECK(ub_test::EvalText(fixture.context, "fromElsewhere().from") == "elsewhere");
 }

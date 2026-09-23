@@ -87,7 +87,13 @@ const JSClass EXTERNAL_CLASS = {"ub::External", JSCLASS_HAS_RESERVED_SLOTS(1) | 
 /// finalizer of ours to hang one on. It lives in the function's second
 /// reserved slot, so it is reachable exactly as long as the function is, and
 /// its finalizer is what gives the record back.
+///
+/// Its second slot is the script value of a function made with one, which is
+/// kept alive by exactly the same reachability: the collector traces a
+/// reserved slot, so the value goes when the function does and not before, and
+/// a value that refers back to its function does not pin either.
 constexpr std::size_t RECORD_HOLDER_SLOT = 0;
+constexpr std::size_t RECORD_HOLDER_VALUE_SLOT = 1;
 
 void RecordHolderFinalize(JS::GCContext* /*gcx*/, JSObject* object) {
     ReleaseRecordSlot(object, RECORD_HOLDER_SLOT);
@@ -97,7 +103,7 @@ const JSClassOps RECORD_HOLDER_CLASS_OPS = {
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &RecordHolderFinalize, nullptr, nullptr, nullptr,
 };
 
-const JSClass RECORD_HOLDER_CLASS = {"ub::CallbackRecord", JSCLASS_HAS_RESERVED_SLOTS(1) | JSCLASS_FOREGROUND_FINALIZE,
+const JSClass RECORD_HOLDER_CLASS = {"ub::CallbackRecord", JSCLASS_HAS_RESERVED_SLOTS(2) | JSCLASS_FOREGROUND_FINALIZE,
                                      &RECORD_HOLDER_CLASS_OPS};
 
 [[nodiscard]] bool IsExternalObject(const JS::Value& value) noexcept {
@@ -434,8 +440,12 @@ bool IsType(Slot value, TypeCode type) noexcept {
         // another is still a buffer.
         case TypeCode::ArrayBuffer:
             return raw.isObject() && JS::IsArrayBufferObject(Unwrapped(raw));
+        case TypeCode::ArrayBufferView:
+            return raw.isObject() && JS_IsArrayBufferViewObject(Unwrapped(raw));
         case TypeCode::TypedArray:
             return raw.isObject() && JS_IsTypedArrayObject(Unwrapped(raw));
+        case TypeCode::DataView:
+            return raw.isObject() && static_cast<bool>(JS::DataView::fromObject(Unwrapped(raw)));
         case TypeCode::Promise: {
             if (!raw.isObject()) {
                 return false;
@@ -845,6 +855,13 @@ bool FunctionTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
     // Read the callee before rval() is touched: SpiderMonkey reuses that slot.
     auto* record =
         static_cast<CallbackRecord*>(js::GetFunctionNativeReserved(&args.callee(), FUNCTION_RECORD_SLOT).toPrivate());
+    // And, for the same reason, the data value - which is reached through the
+    // callee - before anything writes the result.
+    JS::Value dataValue = JS::UndefinedValue();
+    if (record->hasValue) {
+        const JS::Value holder = js::GetFunctionNativeReserved(&args.callee(), FUNCTION_HOLDER_SLOT);
+        dataValue = JS::GetReservedSlot(&holder.toObject(), RECORD_HOLDER_VALUE_SLOT);
+    }
 
     auto* isolate = static_cast<Isolate*>(JS_GetContextPrivate(cx));
     CallFrame frame(*isolate, &args);
@@ -859,6 +876,9 @@ bool FunctionTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
         }
     }
     const SlotIndex self = frame.frame().Push(thisValue);
+    // Rooted in the frame before anything can collect: `dataValue` is a copy
+    // out of a reserved slot, and a moving collector would leave it stale.
+    const SlotIndex value = record->hasValue ? frame.frame().Push(dataValue) : Frame::NO_SLOT;
 
     args.rval().setUndefined();
     CallbackState state{.owner = isolate,
@@ -869,7 +889,9 @@ bool FunctionTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
                         .thisSlot = self,
                         .holderSlot = self,
                         .data = record->data,
-                        .isConstruct = args.isConstructing()};
+                        .isConstruct = args.isConstructing(),
+                        .valueSlot = value,
+                        .hasValue = record->hasValue};
     record->callback(CallbackInfo(state));
     return FinishNativeCall(cx, args);
 }
@@ -885,11 +907,23 @@ JSObject* NewNativeFunction(JSContext* cx, CallbackRecord* record, std::string_v
     return object;
 }
 
-Maybe<Slot> MakeFunction(const Context& context, FunctionCallback callback, CallbackData data) {
+namespace {
+
+/// `Function::New`, with or without a script value for its data. `value` is
+/// null for the first.
+Maybe<Slot> NewPlainFunction(const Context& context, FunctionCallback callback, CallbackData data, const Slot* value) {
     JSContext* cx = Raw(context);
     Isolate& owner = OwnerOf(context);
     RealmGuard realm(context);
-    CallbackRecord* record = StoreCallback(owner, CallbackRecord{.callback = callback, .data = data});
+    // Into this realm before anything is allocated: a value from another realm
+    // of the isolate is legal to hand over, and the holder that keeps it is in
+    // this one.
+    JS::RootedValue dataValue(cx);
+    if (value != nullptr && !ResolveHere(cx, *value, &dataValue)) {
+        return std::nullopt;
+    }
+    CallbackRecord* record =
+        StoreCallback(owner, CallbackRecord{.callback = callback, .data = data, .hasValue = value != nullptr});
     if (record == nullptr) {
         return std::nullopt;
     }
@@ -908,8 +942,19 @@ Maybe<Slot> MakeFunction(const Context& context, FunctionCallback callback, Call
         return std::nullopt;
     }
     JS::SetReservedSlot(holder, RECORD_HOLDER_SLOT, JS::PrivateValue(record));
+    JS::SetReservedSlot(holder, RECORD_HOLDER_VALUE_SLOT, dataValue);
     js::SetFunctionNativeReserved(function, FUNCTION_HOLDER_SLOT, JS::ObjectValue(*holder));
     return PushOrNothing(owner, function);
+}
+
+}  // namespace
+
+Maybe<Slot> MakeFunction(const Context& context, FunctionCallback callback, CallbackData data) {
+    return NewPlainFunction(context, callback, data, nullptr);
+}
+
+Maybe<Slot> MakeFunctionWithValue(const Context& context, FunctionCallback callback, Slot data) {
+    return NewPlainFunction(context, callback, {}, &data);
 }
 
 Maybe<Slot> MakeExternal(Isolate& isolate, CallbackData data) {
@@ -1208,6 +1253,117 @@ std::size_t TypedArrayCopyOut(Slot view, std::span<std::byte> out) noexcept {
     const std::size_t safe = available < count ? available : count;
     std::memcpy(out.data(), data, safe);
     return safe;
+}
+
+// ---------------------------------------------------------------------------
+// Any view, typed array or DataView
+//
+// The engine's generic `JS_GetArrayBufferView*` answers, with one thing added:
+// a view whose buffer has been detached answers zero for its offset as well as
+// its length. V8 does, and the offset a view had into a buffer it no longer
+// has is not an answer to anything.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The view behind a handle, or a null one if the handle does not name a view
+/// or names one whose buffer is gone.
+[[nodiscard]] JS::ArrayBufferView LiveViewOf(Slot view) noexcept {
+    JSObject* object = UnwrappedObjectOf(view);
+    if (object == nullptr) {
+        return JS::ArrayBufferView::fromObject(nullptr);
+    }
+    JS::ArrayBufferView found = JS::ArrayBufferView::fromObject(object);
+    if (!found || found.isDetached()) {
+        return JS::ArrayBufferView::fromObject(nullptr);
+    }
+    return found;
+}
+
+}  // namespace
+
+std::size_t ArrayBufferViewByteLength(Slot view) noexcept {
+    const JS::ArrayBufferView live = LiveViewOf(view);
+    return live ? JS_GetArrayBufferViewByteLength(live.asObjectUnbarriered()) : 0;
+}
+
+std::size_t ArrayBufferViewByteOffset(Slot view) noexcept {
+    const JS::ArrayBufferView live = LiveViewOf(view);
+    return live ? JS_GetArrayBufferViewByteOffset(live.asObjectUnbarriered()) : 0;
+}
+
+Maybe<Slot> ArrayBufferViewBuffer(const Context& context, Slot view) {
+    JSContext* cx = Raw(context);
+    RealmGuard realm(context);
+    JS::RootedValue raw(cx);
+    if (!ResolveHere(cx, view, &raw) || !raw.isObject()) {
+        return std::nullopt;
+    }
+    JS::RootedObject target(cx, &raw.toObject());
+    if (!JS_IsArrayBufferViewObject(js::UncheckedUnwrap(target))) {
+        return std::nullopt;
+    }
+    bool isShared = false;
+    JSObject* buffer = JS_GetArrayBufferViewBuffer(cx, target, &isShared);
+    if (buffer == nullptr) {
+        JS_ClearPendingException(cx);
+        return std::nullopt;
+    }
+    // A SharedArrayBuffer is not an ArrayBuffer to this API, and the handle
+    // this becomes would say it was one.
+    if (isShared) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), JS::ObjectValue(*buffer));
+}
+
+std::size_t ArrayBufferViewCopyOut(Slot view, std::span<std::byte> out) noexcept {
+    JS::ArrayBufferView live = LiveViewOf(view);
+    if (!live || out.empty()) {
+        return 0;
+    }
+    JS::AutoCheckCannotGC nogc;
+    bool isShared = false;
+    // The view's own range: the span starts at its byte offset into the buffer
+    // and is as long as the view, so nothing has to be added back by hand.
+    const mozilla::Span<uint8_t> data = live.getData(&isShared, nogc);
+    const std::size_t count = data.size() < out.size() ? data.size() : out.size();
+    if (count == 0 || data.data() == nullptr) {
+        return 0;
+    }
+    std::memcpy(out.data(), data.data(), count);
+    return count;
+}
+
+Maybe<Slot> MakeDataView(const Context& context, Slot buffer, std::size_t byteOffset, std::size_t byteLength) {
+    JSContext* cx = Raw(context);
+    RealmGuard realm(context);
+    JS::RootedValue raw(cx);
+    if (!ResolveHere(cx, buffer, &raw) || !raw.isObject()) {
+        return std::nullopt;
+    }
+    JS::RootedObject target(cx, &raw.toObject());
+
+    JSObject* unwrapped = js::UncheckedUnwrap(target);
+    if (unwrapped == nullptr || !JS::IsArrayBufferObject(unwrapped)) {
+        return std::nullopt;
+    }
+    // Checked here for the reason `MakeTypedArray` checks: the engine's answer
+    // to a view that does not fit, or to a detached buffer, is an exception
+    // thrown into script, and this is not script.
+    if (JS::IsDetachedArrayBufferObject(unwrapped)) {
+        return std::nullopt;
+    }
+    const std::size_t available = JS::GetArrayBufferByteLength(unwrapped);
+    if (byteOffset > available || byteLength > available - byteOffset) {
+        return std::nullopt;
+    }
+    JSObject* view = JS_NewDataView(cx, target, byteOffset, byteLength);
+    if (view == nullptr) {
+        JS_ClearPendingException(cx);
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), JS::ObjectValue(*view));
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,6 +1947,13 @@ bool CallbackIsConstruct(const CallbackState& state) noexcept {
 
 CallbackData CallbackDataOf(const CallbackState& state) noexcept {
     return state.data;
+}
+
+Slot CallbackValueData(const CallbackState& state) noexcept {
+    if (!state.hasValue) {
+        return Push(*state.owner, JS::UndefinedValue());
+    }
+    return SlotOrEmpty(*state.frame, state.valueSlot);
 }
 
 void SetReturnSlot(const CallbackState& state, Slot value) noexcept {
@@ -2407,9 +2570,22 @@ RefPtr<JS::Stencil> CompileToStencil(JSContext* cx, std::string_view source, con
     return JS::CompileGlobalScriptToStencil(cx, options, text);
 }
 
+/// The engine's compile options for a unibind one. Eager is "parse everything
+/// eagerly": every function body is parsed and given bytecode in the first
+/// pass, so the stencil - which is what the code cache encodes - holds all of
+/// it rather than a syntax-checked outline of each function. There is no
+/// in-isolate compilation cache on this engine for it to have to be kept apart
+/// from, which is the problem the other backend has.
+void ApplyCompileOptions(JS::CompileOptions& engine, CompileOptions options) {
+    if (options == CompileOptions::EagerCompile) {
+        engine.setEagerDelazificationStrategy(JS::DelazificationOption::ParseEverythingEagerly);
+    }
+}
+
 }  // namespace
 
-ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin) {
+ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin,
+                         CompileOptions compileOptions) {
     JSContext* cx = Raw(context);
     RealmGuard realm(context);
     if (Terminating(context)) {
@@ -2422,11 +2598,12 @@ ScriptRec* CompileScript(const Context& context, std::string_view source, const 
     RetainSource(context, resourceName, source, origin);
     JS::CompileOptions options(cx);
     options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
+    ApplyCompileOptions(options, compileOptions);
     return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false);
 }
 
 ScriptRec* CompileScriptWithCache(const Context& context, std::string_view source, const ScriptOrigin& origin,
-                                  std::span<const std::uint8_t> codeCache) {
+                                  std::span<const std::uint8_t> codeCache, CompileOptions compileOptions) {
     JSContext* cx = Raw(context);
     RealmGuard realm(context);
     if (Terminating(context)) {
@@ -2437,6 +2614,11 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
     RetainSource(context, resourceName, source, origin);
     JS::CompileOptions options(cx);
     options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
+    // Set before the decode as well as the compile, harmlessly: a decoded
+    // stencil is whatever was encoded, and the option only reaches the
+    // fallback below, which is where a refused blob has to be compiled eagerly
+    // if that is what was asked for.
+    ApplyCompileOptions(options, compileOptions);
 
     // The blob is a hint, so every way it can be wrong ends in the same place:
     // compile the source.

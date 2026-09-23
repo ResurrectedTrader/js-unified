@@ -34,6 +34,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -846,6 +847,93 @@ TEST_CASE("ownership: a native function costs its isolate nothing once it is col
 
     INFO("outstanding allocations grew by ", growth, " over ", WINDOW * 100, " functions");
     CHECK(growth < (WINDOW * 100) / 10);
+}
+
+UNIBIND_TEST_CASE(FUNCTION_VALUE_DATA,
+                  "ownership: a function with a value costs nothing once collected, even when the two point at each "
+                  "other") {
+    // The value is kept alive *by* the function. Kept by a root of the
+    // backend's own instead, a value that refers back to its function - the
+    // ordinary shape of a closure - would keep both for the life of the
+    // isolate, one pair per function made, and nothing would report it.
+    ub_test::Fixture fixture;
+
+    int made = 0;
+    const auto cycle = [&] {
+        ub::HandleScope scope(fixture.iso());
+        for (int i = 0; i < 100; ++i) {
+            const auto value = ub::Object::New(fixture.context);
+            const auto function = value ? ub::Function::New(fixture.context, &AnswersSeven, *value) : std::nullopt;
+            if (function && value->Set(fixture.context, "owner", *function).value_or(false)) {
+                ++made;
+            }
+        }
+    };
+
+    constexpr int WINDOW = 20;  // 2000 functions per window
+    for (int i = 0; i < WINDOW; ++i) {
+        cycle();
+    }
+    Churn(fixture.iso(), fixture.context);
+    const long long afterWarmup = ub_test::OutstandingAllocations();
+    for (int i = 0; i < WINDOW; ++i) {
+        cycle();
+    }
+    Churn(fixture.iso(), fixture.context);
+    const long long growth = ub_test::OutstandingAllocations() - afterWarmup;
+
+    CHECK(made == 2 * WINDOW * 100);
+    INFO("outstanding allocations grew by ", growth, " over ", WINDOW * 100, " functions");
+    CHECK(growth < (WINDOW * 100) / 10);
+}
+
+UNIBIND_TEST_CASE2(FUNCTION_VALUE_DATA, OWNERSHIP,
+                   "ownership: a native carried as a function's value goes with the function, exactly once") {
+    Lives::Reset();
+    int keptId = 0;
+    {
+        auto isolate = ub::Isolate::New();
+        REQUIRE(isolate != nullptr);
+        ub::HandleScope scope(*isolate);
+        auto context = ub::Context::New(*isolate);
+        REQUIRE(context.has_value());
+        ub::ContextScope entered(*context);
+
+        const auto cls = DeclareTracked(*isolate);
+        ub::Global<ub::Function> kept;
+        {
+            ub::HandleScope inner(*isolate);
+            auto native = std::make_unique<Tracked>(3);
+            keptId = native->id;
+            const auto instance = cls.Wrap(*context, std::move(native));
+            REQUIRE(instance.has_value());
+            const auto function = ub::Function::New(*context, &AnswersSeven, *instance);
+            REQUIRE(function.has_value());
+            kept = ub::Global<ub::Function>(*isolate, *function);
+
+            // And one dropped at once, whose value points back at it.
+            const auto droppedInstance = cls.Wrap(*context, std::make_unique<Tracked>(4));
+            REQUIRE(droppedInstance.has_value());
+            const auto dropped = ub::Function::New(*context, &AnswersSeven, *droppedInstance);
+            REQUIRE(dropped.has_value());
+            REQUIRE(droppedInstance->Set(*context, "owner", *dropped).value_or(false));
+        }
+
+        Churn(*isolate, *context);
+        // Reachable through the function, so never finalised while it is.
+        CHECK(Lives::Deaths(keptId) == 0);
+        MESSAGE("the dropped function's native was ",
+                std::string(Lives::TotalDeaths() == 1 ? "collected" : "not yet collected"),
+                " while the isolate was alive");
+
+        kept.Reset();
+        Churn(*isolate, *context);
+        CHECK_FALSE(Lives::AnyDestroyedTwice());
+    }
+
+    CHECK(Lives::TotalBorn() == 2);
+    CHECK(Lives::EachDestroyedExactlyOnce());
+    CHECK(Lives::Alive() == 0);
 }
 
 UNIBIND_TEST_CASE(EXTERNALS, "ownership: an external costs its isolate nothing once it is collected") {

@@ -29,7 +29,9 @@ struct Object;
 struct Array;
 struct Function;
 struct ArrayBuffer;
+struct ArrayBufferView;
 struct TypedArray;
+struct DataView;
 struct Promise;
 struct External;
 

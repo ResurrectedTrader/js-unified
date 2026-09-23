@@ -226,3 +226,113 @@ UNIBIND_TEST_CASE(CODE_CACHE, "code cache: a cached compile reaches the realm it
     REQUIRE(here.has_value());
     CHECK(ub_test::TextOf(*here) == "nowhere");
 }
+
+// ---------------------------------------------------------------------------
+// Eager compilation: a blob that covers the whole file
+//
+// Both engines compile a function's body on its first call, so a blob made
+// straight after an ordinary compile covers the top level and nothing inside a
+// function. `CompileOptions::EagerCompile` is how an embedder that keeps blobs
+// gets one that covers everything. What a blob holds is opaque, so the one
+// portable way to see the difference is its size: more compiled code is more
+// bytes, on both engines, by a wide margin for source that is mostly function
+// bodies.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Mostly function bodies, none of which the top level calls.
+[[nodiscard]] std::string ManyFunctions() {
+    std::string source;
+    for (int i = 0; i < 40; ++i) {
+        const std::string n = std::to_string(i);
+        source.append("function f").append(n).append("(a) { var total = a * ").append(n);
+        source.append("; for (var k = 0; k < a; ++k) { total += k % ").append(std::to_string(i + 2));
+        source.append("; } return function () { return total + ").append(n).append("; }; }\n");
+    }
+    source += "40;\n";
+    return source;
+}
+
+/// The blob a compile with these options gives before anything runs. Empty if
+/// the engine declined to make one.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> BlobBeforeRunning(const ub::Context& context,
+                                                                         std::string_view source,
+                                                                         ub::CompileOptions options) {
+    const auto script = ub::Script::Compile(context, source, {.resourceName = "eager.js"}, options);
+    REQUIRE(script.has_value());
+    return script->CreateCodeCache();
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(EAGER_COMPILE, "code cache: an eager compile's blob covers functions that never ran") {
+    ub_test::Fixture fixture;
+    const std::string source = ManyFunctions();
+
+    const auto lazy = BlobBeforeRunning(fixture.context, source, ub::CompileOptions::NoCompileOptions);
+    // The same source, again, in the same isolate: an engine that answers a
+    // repeat compile from its own cache must not answer this one with the lazy
+    // result it kept.
+    const auto eager = BlobBeforeRunning(fixture.context, source, ub::CompileOptions::EagerCompile);
+    if (!lazy || !eager) {
+        ub_test::ReportSkip("this engine declined to produce a code cache for the test source");
+        return;
+    }
+    MESSAGE("lazy blob ", lazy->size(), " bytes, eager blob ", eager->size(), " bytes");
+    CHECK(eager->size() > lazy->size() + (lazy->size() / 2));
+
+    // And the eager compile is an ordinary script.
+    const auto script =
+        ub::Script::Compile(fixture.context, source, {.resourceName = "eager.js"}, ub::CompileOptions::EagerCompile);
+    REQUIRE(script.has_value());
+    CHECK_FALSE(script->UsedCodeCache());
+    CHECK(ResultOf(fixture.context, *script) == 40);
+    CHECK(ub_test::EvalInt(fixture.context, "f3(4)()") == (3 * 4) + (0 + 1 + 2 + 3) + 3);
+}
+
+UNIBIND_TEST_CASE(EAGER_COMPILE, "code cache: an eager blob is consumed by an ordinary compile in another isolate") {
+    const std::string source = ManyFunctions();
+
+    std::optional<std::vector<std::uint8_t>> blob;
+    {
+        ub_test::Fixture writer;
+        blob = BlobBeforeRunning(writer.context, source, ub::CompileOptions::EagerCompile);
+    }
+    if (!blob) {
+        ub_test::ReportSkip("this engine declined to produce a code cache for the test source");
+        return;
+    }
+
+    ub_test::Fixture reader;
+    const auto script = ub::Script::CompileWithCache(reader.context, source, *blob, {.resourceName = "eager.js"});
+    REQUIRE(script.has_value());
+    CHECK(script->UsedCodeCache());
+    CHECK(ResultOf(reader.context, *script) == 40);
+    CHECK(ub_test::EvalInt(reader.context, "f5(2)()") == (5 * 2) + (0 + 1) + 5);
+}
+
+UNIBIND_TEST_CASE(EAGER_COMPILE, "code cache: asking for eager with a refused blob still compiles eagerly") {
+    // The case the option is for: an embedder whose kept blob went stale, and
+    // which is about to make a fresh one. A fallback to a lazy compile would
+    // make the fresh blob cover nothing, which is the silent failure.
+    ub_test::Fixture fixture;
+    const std::string source = ManyFunctions();
+
+    const auto lazy = BlobBeforeRunning(fixture.context, source, ub::CompileOptions::NoCompileOptions);
+    const auto stale = BlobBeforeRunning(fixture.context, "1 + 1;", ub::CompileOptions::NoCompileOptions);
+    if (!lazy || !stale) {
+        ub_test::ReportSkip("this engine declined to produce a code cache for the test source");
+        return;
+    }
+
+    const auto script = ub::Script::CompileWithCache(fixture.context, source, *stale, {.resourceName = "eager.js"},
+                                                     ub::CompileOptions::EagerCompile);
+    REQUIRE(script.has_value());
+    CHECK_FALSE(script->UsedCodeCache());
+    const auto fresh = script->CreateCodeCache();
+    REQUIRE(fresh.has_value());
+    MESSAGE("lazy blob ", lazy->size(), " bytes, blob after a refused-then-eager compile ", fresh->size(), " bytes");
+    CHECK(fresh->size() > lazy->size() + (lazy->size() / 2));
+    CHECK(ResultOf(fixture.context, *script) == 40);
+}

@@ -78,6 +78,19 @@ set(UNIBIND_CAPABILITIES
     "BINARY_DATA|MakeArrayBuffer,ArrayBufferByteLength,ArrayBufferCopyOut,MakeTypedArray,TypedArrayElementType,TypedArrayLength,TypedArrayByteOffset,TypedArrayBuffer,TypedArrayCopyOut"
     "SERIALIZATION|SerializeValue,DeserializeValue"
 
+    # Any view onto a buffer - a typed array or a DataView - asked in bytes,
+    # and a DataView made over a buffer.
+    "ARRAY_BUFFER_VIEWS|ArrayBufferViewByteLength,ArrayBufferViewByteOffset,ArrayBufferViewBuffer,ArrayBufferViewCopyOut,MakeDataView"
+
+    # A native function whose data is a script value, read back as info.Data().
+    "FUNCTION_VALUE_DATA|MakeFunctionWithValue,CallbackValueData"
+
+    # Compiling every function up front. Like STACK_LIMIT it names no new entry
+    # point - the option rides on the two compiles - and it is tested through the
+    # code cache, which is the only place the difference can be seen from
+    # outside, so it lists those too.
+    "EAGER_COMPILE|CompileScript,CompileScriptWithCache,ScriptCreateCodeCache"
+
     # Work that is not a call, in three parts: a promise the embedder settles,
     # the queue a foreign thread posts to, and the interrupt it uses to say
     # "look now". Separate rows because a backend can arrive at them separately.

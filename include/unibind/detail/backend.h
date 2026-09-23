@@ -115,6 +115,15 @@ std::optional<Slot> MakeError(const Context& context, ErrorKind kind, std::strin
 // --- functions and externals ----------------------------------------------
 
 std::optional<Slot> MakeFunction(const Context& context, FunctionCallback callback, CallbackData data);
+/// A native function whose data is a script value rather than an embedder
+/// pointer - V8's `Function::New` with a `Local<Value>` data. The value is kept
+/// alive exactly as long as the function: it must be reachable *through* the
+/// function, as far as the collector can see, and never from a root of the
+/// backend's own, or a value that refers back to its function would keep both
+/// alive until the isolate goes. `CallbackValueData` reads it back; the
+/// callback's `CallbackDataOf` is empty. Callable and not constructable, as
+/// `MakeFunction`.
+std::optional<Slot> MakeFunctionWithValue(const Context& context, FunctionCallback callback, Slot data);
 std::optional<Slot> MakeExternal(Isolate& isolate, CallbackData data);
 CallbackData ExternalData(Slot external) noexcept;
 // --- objects --------------------------------------------------------------
@@ -163,6 +172,22 @@ std::size_t TypedArrayByteOffset(Slot view) noexcept;
 std::optional<Slot> TypedArrayBuffer(const Context& context, Slot view);
 /// Copies the bytes this view covers; returns how many.
 std::size_t TypedArrayCopyOut(Slot view, std::span<std::byte> out) noexcept;
+
+/// The same questions of any view - a typed array or a DataView - in bytes.
+/// A view whose buffer script has detached answers zero to both, as V8 does:
+/// it has no bytes, and the offset it had into nothing is not an answer.
+std::size_t ArrayBufferViewByteLength(Slot view) noexcept;
+std::size_t ArrayBufferViewByteOffset(Slot view) noexcept;
+/// The buffer under a view. Empty when that buffer is a `SharedArrayBuffer`,
+/// which this API does not model: handing one back as an `ArrayBuffer` would
+/// be a handle whose static type is a lie.
+std::optional<Slot> ArrayBufferViewBuffer(const Context& context, Slot view);
+/// Copies min(view's byte length, out.size()) bytes, starting at the view's
+/// own offset into its buffer; returns how many.
+std::size_t ArrayBufferViewCopyOut(Slot view, std::span<std::byte> out) noexcept;
+/// `byteLength` is in bytes. Empty if the view would not fit in the buffer, or
+/// the buffer has been detached.
+std::optional<Slot> MakeDataView(const Context& context, Slot buffer, std::size_t byteOffset, std::size_t byteLength);
 
 // --- promises -------------------------------------------------------------
 //
@@ -286,7 +311,12 @@ void ContextLeave(ContextScopeState& state) noexcept;
 
 // --- scripts --------------------------------------------------------------
 
-ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin);
+/// `options` is a request, and `EagerCompile` a request a backend must honour
+/// even when its engine has already compiled the same source lazily in this
+/// isolate: an engine that answers a repeat compile out of an in-isolate cache
+/// has to be kept from answering an eager one with a lazy result.
+ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin,
+                         CompileOptions options);
 void ReleaseScript(ScriptRec* script) noexcept;
 std::optional<Slot> RunScript(const Context& context, ScriptRec* script);
 
@@ -298,6 +328,14 @@ std::optional<Slot> RunScript(const Context& context, ScriptRec* script);
 /// `codeCache` is a hint: a blob this engine build does not recognise is
 /// rejected and the source compiled normally, which `ScriptUsedCodeCache`
 /// reports. An empty span is not an error.
+///
+/// `options` applies to whatever this call has to compile from source: all of
+/// it when `codeCache` is empty or refused, none of it when the blob is used -
+/// the blob is then what was compiled, and it decides. V8 refuses
+/// `kEagerCompile` together with `kConsumeCodeCache`, so this is the only
+/// meaning both engines can give the combination; what a backend must not do is
+/// let a refused blob fall back to a lazy compile when an eager one was asked
+/// for.
 ///
 /// **A backend does not have to key a blob to its source**: `unibind/script.h`
 /// frames every blob it emits and drops one whose stamp does not match before
@@ -314,7 +352,7 @@ std::optional<Slot> RunScript(const Context& context, ScriptRec* script);
 /// decision 10 (a script sees the globals of the realm it runs in) better than
 /// a per-realm compiled script does.
 ScriptRec* CompileScriptWithCache(const Context& context, std::string_view source, const ScriptOrigin& origin,
-                                  std::span<const std::uint8_t> codeCache);
+                                  std::span<const std::uint8_t> codeCache, CompileOptions options);
 /// Whether the compile got away without parsing. See unibind/script.h for the one
 /// case where the honest answer is true for a reason that has nothing to do
 /// with the blob.

@@ -21,7 +21,7 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting |
 | V8 15.6 | implements all of it |
 | SpiderMonkey 153.3.0esr | implements all of it except the near-heap-limit hook, which its engine does not have - a call to that one does not link there, on purpose |
-| Tests | one suite, written once against `ub::`: 276 cases, green on both backends, every case compared backend against backend with no divergences |
+| Tests | one suite, written once against `ub::`: 297 cases, green on both backends, every case compared backend against backend with no divergences |
 | Not here | a debugger, and cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
@@ -124,16 +124,16 @@ to refuse the fetch outright and be told what to unpack where.
 bump repoints the tag, the asset and the directory together rather than
 silently reusing the old library.
 
-The number `ctest` prints is a little larger than 276 and depends on the tree,
+The number `ctest` prints is a little larger than 297 and depends on the tree,
 because it registers the suite's cases *and* a few things that cannot be cases
 among others: the whole suite again in one process, four checks that each need
 a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **276 cases is the figure that means the same thing everywhere** - it is
+built). **297 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
-different number of times on each engine, so V8 counts 8441 and SpiderMonkey
-8414, and neither number is the one to compare a run against.
+different number of times on each engine, so V8 counts 8906 and SpiderMonkey
+8879, and neither number is the one to compare a run against.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
 engine archives were built with, and therefore the one a consumer links
@@ -374,6 +374,23 @@ A `Script` is an artefact, not a handle: it holds its own root, it outlives any
 scope, and it may be run **in a realm other than the one it was compiled in** -
 where it sees that realm's globals. Compile once, run in every sandbox.
 
+Both engines compile a function's body on its first call. To keep the compiled
+form across runs, compile everything up front and keep the blob:
+
+```cpp
+const auto eager = ub::Script::Compile(*context, source, {.resourceName = "app.js"},
+                                       ub::CompileOptions::EagerCompile);
+const auto blob = eager->CreateCodeCache();          // covers every function, not only those that ran
+// next run:
+const auto cached = ub::Script::CompileWithCache(*context, source, *blob, {.resourceName = "app.js"},
+                                                 ub::CompileOptions::EagerCompile);
+```
+
+A blob made after a lazy compile covers the top level and whatever had run.
+With `EagerCompile`, `CompileWithCache` uses a good blob as it is and compiles
+eagerly when the blob is stale - which is the moment a fresh one is worth
+making.
+
 ### 2. Handles and scopes
 
 This is the part that will bite first, so it is the part to read twice. The
@@ -464,11 +481,19 @@ an engine failure, `TryCatch::HasTerminated()` for a stop from another thread.
 
 ```cpp
 const auto object = ub::Object::New(context);                    // optional<Local<Object>>
-const auto name = ub::String::New(isolate, "widget");            // optional<Local<String>>
+const auto name = ub::String::New(isolate, "widget");            // optional<Local<String>>, strict UTF-8
+const auto line = ub::String::NewFromUtf8(isolate, fromSocket);  // lossy: bad bytes become U+FFFD
 const auto ok = object->Set(context, "name", *name);              // optional<bool>
 const auto back = object->Get(context, "name");                   // optional<Local<Value>>
 const std::string text = back->ToString(context)->Utf8Value();    // "widget"
 ```
+
+`String::New` is strict: bytes that are not UTF-8 make no string, rather than a
+row of replacement characters where the caller thought it had text.
+`String::NewFromUtf8` is V8's lossy decode, for bytes that are meant to be
+repaired - each maximal invalid sequence becomes one U+FFFD, by the WHATWG rule
+V8 follows, and the same string comes out of both engines because the repair is
+done in the header.
 
 Widening is implicit and narrowing is checked:
 
@@ -509,6 +534,17 @@ const auto view = ub::TypedArray::New<float>(context, samples);   // a Float32Ar
 The bytes are copied, in both directions, and `unibind/value.h` says at length why
 there is no borrowing alternative.
 
+A typed array and a `DataView` are both an `ArrayBufferView`, as in V8, and code
+that only moves bytes can take either:
+
+```cpp
+const auto header = ub::DataView::New(context, *buffer, 4, 12);   // no element width of its own
+if (const auto any = value.To<ub::ArrayBufferView>()) {
+    std::vector<std::byte> bytes(ub::ByteLength(*any));
+    (void)ub::CopyBytes(*any, bytes);                              // its own range, not the buffer's
+}
+```
+
 ### 4. Native functions
 
 A callback is a plain function pointer - there is no `std::function` anywhere in
@@ -543,6 +579,25 @@ const auto fn = ub::Function::New(context, &Bump, ub::CallbackData::For(counters
 
 `info[i]` past the end is `undefined`, as script would see. A callback that
 writes nothing to `GetReturnValue()` returns `undefined`.
+
+A function's data can instead be a *script value*, read back as `info.Data()` -
+one native callback behind many functions, each closing over its own value, and
+nothing for the embedder to keep alive: the value lives exactly as long as the
+function.
+
+```cpp
+void Greet(const ub::CallbackInfo& info) {
+    const auto greeting = info.Data().ToString(info.GetContext());  // this function's own string
+    if (greeting) {
+        (void)info.GetReturnValue().Set(greeting->Utf8Value() + ", world");
+    }
+}
+
+for (const char* word : {"hello", "goodbye"}) {
+    const auto fn = ub::Function::New(context, &Greet, *ub::String::New(isolate, word));
+    (void)context.GlobalObject().Set(context, word, *fn);
+}
+```
 
 **A function made this way is callable, not constructable.** `new bump()` is a
 TypeError before the callback runs. Something `new`-able is asked for on purpose,

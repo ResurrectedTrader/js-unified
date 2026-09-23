@@ -59,6 +59,10 @@ Slot CallbackThis(const CallbackState& state) noexcept;
 Slot CallbackHolder(const CallbackState& state) noexcept;
 bool CallbackIsConstruct(const CallbackState& state) noexcept;
 CallbackData CallbackDataOf(const CallbackState& state) noexcept;
+/// The script value a function made by `MakeFunctionWithValue` carries, or
+/// `undefined` for every other callback - V8's `FunctionCallbackInfo::Data()`
+/// for a function declared with no data.
+Slot CallbackValueData(const CallbackState& state) noexcept;
 
 void SetReturnSlot(const CallbackState& state, Slot value) noexcept;
 void SetReturnUndefined(const CallbackState& state) noexcept;
@@ -162,6 +166,20 @@ class CallbackContextBase {
     template <class D>
     [[nodiscard]] D* Data() const noexcept {
         return detail::CallbackDataOf(*state_).template As<D>();
+    }
+
+    /// The script value this function was made with - `Function::New` with a
+    /// `Local<Value>` data - or `undefined` if it was made with none, which is
+    /// every callback declared any other way. V8's `Data()`.
+    ///
+    /// The two kinds of data are separate on purpose, and a function has one
+    /// or the other. An embedder pointer is for state the embedder owns and
+    /// the engine must not see; a script value is for state that is itself a
+    /// value - a name, a configuration object - which the collector keeps alive
+    /// for as long as the function and no longer. One native callback, many
+    /// functions, each closing over its own string, is what this is for.
+    [[nodiscard]] Local<Value> Data() const noexcept {
+        return Local<Value>::FromSlot(detail::CallbackValueData(*state_));
     }
 
     [[nodiscard]] ReturnValue GetReturnValue() const noexcept { return ReturnValue(*state_); }

@@ -12,7 +12,7 @@ backend without one can define none of them.
 
 **Where the two backends are.** Both implement everything the headers declare
 that their engines can do, decisions 1-28, and the suite agrees case for case:
-276 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
+297 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
 harness's own test of the skip path, which exists so that the machinery for
 reporting a missing area is exercised on every backend rather than only on the
 day one falls behind.
@@ -471,6 +471,34 @@ than failing, if `JS::SetProcessBuildIdOp` was never called - process-wide state
 that belongs in `Platform`'s constructor, so that an embedder cannot reach a
 cache API before it exists.
 
+**`CompileOptions::EagerCompile` rides on `Compile` and `CompileWithCache` as a
+parameter**, which is not a contradiction of the paragraph above: it is not a
+capability an engine may lack - both compile lazily by default and both can be
+told not to - so there is no absence for a link error to report. It exists for
+the cache. A blob covers what had been compiled when it was made, and on both
+engines that is the top level and whatever functions had run, so an embedder
+that keeps blobs wants the compile they are made from to be eager.
+
+Two things had to be decided. **V8 will not consume a cache and compile eagerly
+in one call**, so `CompileWithCache` with `EagerCompile` means: the blob decides
+when it is used - it is what was compiled, and a blob made eagerly is already
+eager - and the option decides when the blob is absent or refused. The refused
+case is the one an embedder is relying on, because it is the one about to make a
+fresh blob, and it is the one V8 gets wrong by default: a blob it refuses falls
+back to an ordinary lazy compile. Its backend therefore asks
+`CachedData::CompatibilityCheck` first when eager was asked for, and never
+offers a blob that would be refused. And **V8 answers a repeat compile out of
+its in-isolate cache with whatever it compiled first**, so source compiled
+lazily once and then eagerly came back lazy, with nothing to say so. That cache
+keys on host-defined options, which this library otherwise never sets, so an
+eager compile carries a mark there and is filed apart. SpiderMonkey has no such
+cache and needs neither; its eager compile is `ParseEverythingEagerly`.
+
+The suite holds this by the one thing about a blob that is portable to look at,
+its size - an eager blob of mostly-function source is over twice a lazy one
+on both engines - including for an eager compile of source the same isolate had
+just compiled lazily, and one that followed a refused blob.
+
 ### 20. What belongs to an isolate, what belongs to the process (`unibind/isolate.h`)
 
 `IsolateOptions` gains `stackLimitBytes`, which turns runaway recursion into an
@@ -522,6 +550,17 @@ because `Object` is still exactly the set of *property* operations offered for
 it; the new operations are reached through `Is<ArrayBuffer>()` and
 `To<TypedArray>()`, which answer without a kind of their own - which is what the
 argument for collapsing exotic objects into `Object` predicted.
+
+`ArrayBufferView` and `DataView` follow V8's hierarchy - `TypedArray` and
+`DataView` are both views - and the same two rules. A view's byte-level
+questions (`ByteLength`, `ByteOffset`, `GetBuffer`, and `CopyBytes`, which is
+V8's `CopyContents`) take any view and copy exactly its own range. Two answers
+had to be made the same: **a view whose buffer script has detached answers zero
+for its offset as well as its length**, which is V8's answer and not what
+SpiderMonkey's raw accessors give, and **`GetBuffer` on a view over a
+`SharedArrayBuffer` is empty** rather than a handle typed `ArrayBuffer` over
+something that is not one - V8's `Buffer()` would have handed it back under that
+type.
 
 ### 22. Moving a value between isolates is structured clone (`unibind/value.h`)
 
@@ -940,6 +979,26 @@ to this API.
   `Constant(bool)`: pointer-to-bool is a standard conversion and beats the
   user-defined one to `string_view`, silently. `ReturnValue::Set` has the same
   guard for the same reason.
+- **`String::NewFromUtf8` repairs bytes in the header, not in an engine.** V8's
+  `NewFromUtf8` replaces each maximal invalid subsequence with one U+FFFD, the
+  WHATWG rule; two engine decoders agree about valid UTF-8 and need not agree
+  about how many replacements an overlong form or a cut-short sequence is
+  worth. So the header validates first, copies only when something needs
+  replacing, and hands the engine valid UTF-8 through the strict `String::New`
+  - one scan and no copy for valid input, and the same string on every backend
+  by construction. V8's backend checks `String::New`'s strictness with the same
+  decoder, so the two cannot disagree about which bytes needed repair.
+- **A function's data is an embedder pointer or a script value, never both.**
+  `Function::New` with a `Local<T>` is V8's `Function::New` with a
+  `Local<Value>` data, read back as `info.Data()`. The value must be reachable
+  *through* the function and from no root of the backend's own - a strong root
+  would keep a value that refers back to its function, and so the function,
+  alive until the isolate goes. V8 carries it in an internal field of the
+  function's data object, beside the callback; SpiderMonkey in the second
+  reserved slot of the holder object its function already carries, because a
+  `NewFunctionWithReserved` function has exactly two slots and both are taken.
+  A `CallbackData` function pays nothing for it on V8, which has a trampoline
+  for each kind, and one flag test on SpiderMonkey.
 
 ## What the suite pins, and what it deliberately does not
 
@@ -977,7 +1036,15 @@ skip rather than failing to link:
 "INTERRUPTS|RequestInterrupt@Isolate"
 "WORKER_THREADS|WorkerThreads@Platform"
 "HEAP_LIMIT|SetHeapLimitCallback@Isolate"
+"ARRAY_BUFFER_VIEWS|ArrayBufferViewByteLength,ArrayBufferViewByteOffset,ArrayBufferViewBuffer,ArrayBufferViewCopyOut,MakeDataView"
+"FUNCTION_VALUE_DATA|MakeFunctionWithValue,CallbackValueData"
+"EAGER_COMPILE|CompileScript,CompileScriptWithCache,ScriptCreateCodeCache"
 ```
+
+`EAGER_COMPILE` names no new symbol, like `STACK_LIMIT`: the option rides on the
+two compile entry points, and the row is there so the area is listed.
+`String::NewFromUtf8` has no row at all, because it adds no entry point - it is
+written in the header over `String::New`.
 
 Decision 28 is the clearest case that rule was written for, and it splits in
 two: `HEAP_LIMIT` earns a row because one engine has the hook and the other has

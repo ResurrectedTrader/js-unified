@@ -115,7 +115,11 @@ class Local {
                !(value == 0 && std::signbit(value));
     }
     [[nodiscard]] bool IsArrayBuffer() const noexcept { return detail::IsType(slot_, TypeCode::ArrayBuffer); }
+    /// A typed array or a DataView - anything with a buffer, an offset and a
+    /// length, as in V8.
+    [[nodiscard]] bool IsArrayBufferView() const noexcept { return detail::IsType(slot_, TypeCode::ArrayBufferView); }
     [[nodiscard]] bool IsTypedArray() const noexcept { return detail::IsType(slot_, TypeCode::TypedArray); }
+    [[nodiscard]] bool IsDataView() const noexcept { return detail::IsType(slot_, TypeCode::DataView); }
     [[nodiscard]] bool IsPromise() const noexcept { return detail::IsType(slot_, TypeCode::Promise); }
 
     /// Checked narrowing. Empty if the value is not a `U`.

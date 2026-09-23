@@ -203,9 +203,23 @@ inline constexpr std::uint32_t CODE_CACHE_FORMAT = 1;
 class Script {
    public:
     /// Empty if the source did not compile; the syntax error is pending.
+    ///
+    /// `options` says how much to compile now: by default what both engines
+    /// do by default, which is the top level and no function body until it is
+    /// first called. `CompileOptions::EagerCompile` compiles every function up
+    /// front - what to ask for when the point of compiling is the code cache
+    /// that `CreateCodeCache` makes next, which covers what had been compiled
+    /// when it was made. It costs the compile time a lazy compile defers, and
+    /// the memory for functions that may never run.
+    ///
+    /// It is honoured even for source this isolate has already compiled
+    /// lazily. V8 answers a repeat compile out of an in-isolate cache and would
+    /// otherwise answer an eager request with the lazy result it kept; its
+    /// backend keeps the two apart.
     [[nodiscard]] static std::optional<Script> Compile(const Context& context, std::string_view source,
-                                                       const ScriptOrigin& origin = {}) {
-        detail::ScriptRec* rec = detail::CompileScript(context, source, origin);
+                                                       const ScriptOrigin& origin = {},
+                                                       CompileOptions options = CompileOptions::NoCompileOptions) {
+        detail::ScriptRec* rec = detail::CompileScript(context, source, origin, options);
         if (rec == nullptr) {
             return std::nullopt;
         }
@@ -245,13 +259,22 @@ class Script {
     /// would have paid anyway, and the key is what notices, so the cost is one
     /// compile and not one compile per run forever.
     ///
+    /// `options` is `Compile`'s, and applies to whatever this call compiles
+    /// from source: everything when there is no blob or the blob is refused,
+    /// nothing when it is used - the blob is then what was compiled, and a
+    /// blob made from an eager compile is already eager. V8 will not consume a
+    /// cache and compile eagerly in one call, so this is the only meaning the
+    /// combination can have on both engines. What it guarantees is the case an
+    /// embedder is relying on: asking for `EagerCompile` with a stale blob
+    /// still gets an eager compile, and so a fresh blob worth keeping.
+    ///
     /// Empty only if the source did not compile, exactly as `Compile`.
-    [[nodiscard]] static std::optional<Script> CompileWithCache(const Context& context, std::string_view source,
-                                                                std::span<const std::uint8_t> codeCache,
-                                                                const ScriptOrigin& origin = {}) {
+    [[nodiscard]] static std::optional<Script> CompileWithCache(
+        const Context& context, std::string_view source, std::span<const std::uint8_t> codeCache,
+        const ScriptOrigin& origin = {}, CompileOptions options = CompileOptions::NoCompileOptions) {
         const std::uint64_t key = detail::CodeCacheKey(source, origin, detail::BackendBuildId());
         const std::span<const std::uint8_t> payload = detail::CodeCachePayload(codeCache, key);
-        detail::ScriptRec* rec = detail::CompileScriptWithCache(context, source, origin, payload);
+        detail::ScriptRec* rec = detail::CompileScriptWithCache(context, source, origin, payload, options);
         if (rec == nullptr) {
             return std::nullopt;
         }

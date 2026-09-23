@@ -114,8 +114,10 @@ enum class TypeCode : std::uint8_t {
     Object,
     Array,
     Function,
-    ArrayBuffer,  ///< raw bytes script can share
-    TypedArray,   ///< a view onto an ArrayBuffer, with an element width
+    ArrayBuffer,      ///< raw bytes script can share
+    ArrayBufferView,  ///< a TypedArray or a DataView: any window onto an ArrayBuffer
+    TypedArray,       ///< a view onto an ArrayBuffer, with an element width
+    DataView,         ///< a view onto an ArrayBuffer, with no element width
     Promise,
     External,
 };
@@ -209,6 +211,25 @@ enum class ElementType : std::uint8_t {
     }
     return 0;
 }
+
+/// How much of a script to compile before it runs. V8's
+/// `ScriptCompiler::CompileOptions`, less the members that are about a code
+/// cache - `Script::CompileWithCache` is how a cache is asked for, because a
+/// backend without one has to be able to leave it undefined (see
+/// `unibind/script.h`).
+///
+/// **Both engines compile lazily by default**: a function's body is checked
+/// for syntax and then left alone until the first call. That is the right
+/// default for a script that runs once, and the wrong one for a script whose
+/// compiled form is about to be kept - a code-cache blob covers what had been
+/// compiled when it was made, so a blob made from a lazy compile covers the
+/// top level and whatever functions had happened to run. `EagerCompile`
+/// compiles every function up front, and a blob made from that covers the whole
+/// file.
+enum class CompileOptions : std::uint8_t {
+    NoCompileOptions,
+    EagerCompile,
+};
 
 /// Which own keys to collect.
 struct KeyFilter {

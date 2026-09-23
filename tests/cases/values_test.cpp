@@ -381,6 +381,71 @@ TEST_CASE("values: bytes that are not UTF-8 make no string") {
     }
 }
 
+TEST_CASE("values: NewFromUtf8 of valid bytes is exactly New") {
+    ub_test::Fixture fixture;
+
+    for (const std::string& good :
+         {std::string("plain"), std::string("a\xE2\x82\xAC"), std::string("a\xF0\x9F\x98\x80"),
+          std::string("\xED\x9F\xBF\xEF\xBF\xBF\xF4\x8F\xBF\xBF"), std::string("a\0b", 3), std::string("")}) {
+        CAPTURE(good.size());
+        const auto strict = ub::String::New(fixture.iso(), good);
+        const auto lossy = ub::String::NewFromUtf8(fixture.iso(), good);
+        REQUIRE(strict.has_value());
+        REQUIRE(lossy.has_value());
+        CHECK(lossy->Utf8Value() == good);
+        CHECK(lossy->StrictEquals(*strict));
+    }
+}
+
+TEST_CASE("values: NewFromUtf8 replaces each maximal invalid subsequence with one U+FFFD") {
+    // The WHATWG Encoding Standard's decoder, which is what V8's own
+    // `NewFromUtf8` does - every expectation below is what V8 hands back for
+    // the same bytes. The repair happens in the header, so the other engine
+    // gives the same answer by construction, and this case is what says so.
+    ub_test::Fixture fixture;
+
+    const std::string fffd = "\xEF\xBF\xBD";
+    struct Case {
+        std::string bytes;
+        std::string expected;
+    };
+    const std::vector<Case> cases = {
+        {.bytes = "\x80", .expected = fffd},                                   // a continuation byte on its own
+        {.bytes = "a\x80z", .expected = "a" + fffd + "z"},                     // ... and in the middle
+        {.bytes = "\xC3", .expected = fffd},                                   // a two-byte sequence cut short
+        {.bytes = "\xE2\x82", .expected = fffd},                               // a three-byte one: one fault, not two
+        {.bytes = "\xF0\x9F\x98", .expected = fffd},                           // a four-byte one
+        {.bytes = "x\xE2\x82y", .expected = "x" + fffd + "y"},                 // cut short by an ASCII byte
+        {.bytes = "\xC0\xAF", .expected = fffd + fffd},                        // an overlong '/': C0 is never a lead
+        {.bytes = "\xE0\x80\xAF", .expected = fffd + fffd + fffd},             // an overlong three-byte form
+        {.bytes = "\xF0\x8F\xBF\xBF", .expected = fffd + fffd + fffd + fffd},  // an overlong four-byte form
+        {.bytes = "\xED\xA0\x80", .expected = fffd + fffd + fffd},             // a surrogate, encoded
+        {.bytes = "\xF4\x90\x80\x80", .expected = fffd + fffd + fffd + fffd},  // beyond U+10FFFF
+        {.bytes = "\xF5\x80", .expected = fffd + fffd},                        // a lead byte UTF-8 retired
+        {.bytes = "\xFF", .expected = fffd},                                   // never a byte of UTF-8 at all
+        {.bytes = "\xFE\xFF", .expected = fffd + fffd},
+        {.bytes = "\xF8\x88\x80\x80\x80", .expected = fffd + fffd + fffd + fffd + fffd},  // five bytes
+        {.bytes = "\xE1\x80\xE1\x80", .expected = fffd + fffd},  // two truncated sequences back to back
+        {.bytes = "ok\xE2\x82\xAC\xFFok", .expected = "ok\xE2\x82\xAC" + fffd + "ok"},  // valid on both sides
+    };
+    for (const Case& each : cases) {
+        CAPTURE(each.bytes.size());
+        CHECK_FALSE(ub::String::New(fixture.iso(), each.bytes).has_value());
+        const auto repaired = ub::String::NewFromUtf8(fixture.iso(), each.bytes);
+        REQUIRE(repaired.has_value());
+        CHECK(repaired->Utf8Value() == each.expected);
+    }
+
+    // What script sees: one UTF-16 unit per replacement, and it is U+FFFD.
+    const auto repaired = ub::String::NewFromUtf8(fixture.iso(),
+                                                  "a\xE0\x80\xAF"
+                                                  "b");
+    REQUIRE(repaired.has_value());
+    ub_test::Expose(fixture.context, "repaired", *repaired);
+    CHECK(ub_test::EvalInt(fixture.context, "repaired.length") == 5);
+    CHECK(ub_test::EvalTruth(fixture.context, "repaired === 'a\\uFFFD\\uFFFD\\uFFFDb'"));
+}
+
 TEST_CASE("values: a string script made out of half a surrogate pair still comes out as UTF-8") {
     // JavaScript strings are UTF-16 and script can make one that is not
     // encodable - a lone surrogate. `Utf8Value` promises UTF-8, so the only

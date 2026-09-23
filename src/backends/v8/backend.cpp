@@ -183,6 +183,16 @@ struct Isolate::Impl {
     HeapLimitCallback heapLimitCallback = nullptr;
     CallbackData heapLimitData;
     bool heapLimitArmed = false;
+    /// The shape of the data a `Function::New` with a script value carries:
+    /// an object with two internal fields, the callback and the value. Made
+    /// the first time one is asked for, and kept, because a template is an
+    /// isolate-level thing and making one per function would be a template per
+    /// function.
+    v8::Global<v8::ObjectTemplate> valueDataTemplate;
+    /// What an eager compile's origin carries so that V8's in-isolate
+    /// compilation cache files it apart from a lazy compile of the same source.
+    /// See `CompileInto`.
+    v8::Global<v8::PrimitiveArray> eagerMarker;
 };
 
 namespace detail {
@@ -481,6 +491,11 @@ struct CallbackState {
     const v8::FunctionCallbackInfo<v8::Value>* call = nullptr;
     const void* info = nullptr;
     const ReturnSink* returns = nullptr;
+    /// The script value a `Function::New` with one carries, or empty for every
+    /// other callback. A `Local` is safe to hold here where it would not be on
+    /// the other engine: V8 does not move what a handle names, and the call's
+    /// own handle scope keeps it for as long as this state exists.
+    v8::Local<v8::Value> value;
 };
 
 // ---------------------------------------------------------------------------
@@ -583,49 +598,11 @@ namespace {
 /// the same bytes: a continuation byte where a lead byte belongs, a sequence
 /// cut short, an overlong form, an encoded surrogate, and anything above
 /// U+10FFFF.
+///
+/// The rule is the one `String::NewFromUtf8` repairs by, in `unibind/value.h`,
+/// so that the two cannot disagree about which bytes needed repairing.
 [[nodiscard]] bool IsUtf8(std::string_view text) noexcept {
-    const auto* bytes = reinterpret_cast<const unsigned char*>(text.data());
-    const size_t size = text.size();
-    for (size_t i = 0; i < size;) {
-        const unsigned char lead = bytes[i];
-        size_t length = 0;
-        uint32_t point = 0;
-        if (lead < 0x80) {
-            ++i;
-            continue;
-        }
-        if ((lead & 0xE0) == 0xC0) {
-            length = 2;
-            point = lead & 0x1FU;
-        } else if ((lead & 0xF0) == 0xE0) {
-            length = 3;
-            point = lead & 0x0FU;
-        } else if ((lead & 0xF8) == 0xF0) {
-            length = 4;
-            point = lead & 0x07U;
-        } else {
-            return false;  // a continuation byte, or a five-byte lead
-        }
-        if (size - i < length) {
-            return false;  // cut short
-        }
-        for (size_t k = 1; k < length; ++k) {
-            const unsigned char next = bytes[i + k];
-            if ((next & 0xC0) != 0x80) {
-                return false;
-            }
-            point = (point << 6) | (next & 0x3FU);
-        }
-        static constexpr std::array<uint32_t, 5> SMALLEST{0, 0, 0x80, 0x800, 0x10000};
-        if (point < SMALLEST[length]) {
-            return false;  // an overlong form of something shorter
-        }
-        if (point > 0x10FFFF || (point >= 0xD800 && point <= 0xDFFF)) {
-            return false;  // out of range, or half of a surrogate pair
-        }
-        i += length;
-    }
-    return true;
+    return FirstInvalidUtf8(text) == std::string_view::npos;
 }
 
 /// Every string this backend makes goes through here, for two reasons.
@@ -863,8 +840,12 @@ bool IsType(Slot value, TypeCode type) noexcept {
             return raw->IsFunction();
         case TypeCode::ArrayBuffer:
             return raw->IsArrayBuffer();
+        case TypeCode::ArrayBufferView:
+            return raw->IsArrayBufferView();
         case TypeCode::TypedArray:
             return raw->IsTypedArray();
+        case TypeCode::DataView:
+            return raw->IsDataView();
         case TypeCode::Promise:
             return raw->IsPromise();
         case TypeCode::External:
@@ -1329,6 +1310,50 @@ size_t TypedArrayCopyOut(Slot view, std::span<std::byte> out) noexcept {
     return raw->CopyContents(out.data(), out.size());
 }
 
+// Any view, typed array or DataView: V8's own ArrayBufferView answers every
+// one of these, including zero for a view whose buffer has been detached.
+
+size_t ArrayBufferViewByteLength(Slot view) noexcept {
+    return Resolve(view).As<v8::ArrayBufferView>()->ByteLength();
+}
+
+size_t ArrayBufferViewByteOffset(Slot view) noexcept {
+    return Resolve(view).As<v8::ArrayBufferView>()->ByteOffset();
+}
+
+std::optional<Slot> ArrayBufferViewBuffer(const Context& context, Slot view) {
+    v8::Local<v8::ArrayBufferView> raw = Resolve(view).As<v8::ArrayBufferView>();
+    // `Buffer()` is typed as an ArrayBuffer and hands back a SharedArrayBuffer
+    // regardless when that is what is underneath, which is the lie the header
+    // refuses to pass on.
+    v8::Local<v8::Value> buffer = raw->Buffer();
+    if (buffer.IsEmpty() || !buffer->IsArrayBuffer()) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), buffer);
+}
+
+size_t ArrayBufferViewCopyOut(Slot view, std::span<std::byte> out) noexcept {
+    return Resolve(view).As<v8::ArrayBufferView>()->CopyContents(out.data(), out.size());
+}
+
+std::optional<Slot> MakeDataView(const Context& context, Slot buffer, size_t byteOffset, size_t byteLength) {
+    v8::Local<v8::ArrayBuffer> raw = Resolve(buffer).As<v8::ArrayBuffer>();
+    // Checked here for the reason `MakeTypedArray` checks: V8 enforces the
+    // bounds by aborting, not by failing. A detached buffer is refused too -
+    // `new DataView` over one is a TypeError in script, and V8's API would
+    // otherwise make one without a word.
+    const size_t available = raw->ByteLength();
+    if (raw->WasDetached() || byteOffset > available || byteLength > available - byteOffset) {
+        return std::nullopt;
+    }
+    v8::Local<v8::DataView> view = v8::DataView::New(raw, byteOffset, byteLength);
+    if (view.IsEmpty()) {
+        return std::nullopt;
+    }
+    return PushOrNothing(OwnerOf(context), view);
+}
+
 // ---------------------------------------------------------------------------
 // Promises
 // ---------------------------------------------------------------------------
@@ -1584,6 +1609,47 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     record->callback(CallbackInfo(state));
 }
 
+/// The two internal fields of a value-carrying function's data.
+constexpr int VALUE_DATA_CALLBACK_FIELD = 0;
+constexpr int VALUE_DATA_VALUE_FIELD = 1;
+
+/// A function with a script value for its data.
+///
+/// V8 gives a function one data value, and this needs two things in it: the
+/// callback, and the embedder's value. So the data is an object of the
+/// isolate's `valueDataTemplate` with both in internal fields - an object the
+/// collector traces like any other, reachable from the function and from
+/// nothing else. That is the whole of the lifetime story: no record in the
+/// isolate, no weak root to give one back, and no way for a value that refers
+/// to its own function to pin the pair, which a strong root of ours would do.
+///
+/// A trampoline of its own, so that the `CallbackData` path costs what it
+/// always did.
+void ValueFunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Isolate& isolate = OwnerOf(info.GetIsolate());
+    v8::Local<v8::Object> bundle = info.DataV2().As<v8::Object>();
+    const auto callback = reinterpret_cast<FunctionCallback>(bundle->GetInternalField(VALUE_DATA_CALLBACK_FIELD)
+                                                                 .As<v8::Value>()
+                                                                 .As<v8::External>()
+                                                                 ->Value(v8::kExternalPointerTypeTagDefault));
+
+    CallFrame frame(isolate, &info);
+    CallbackState state = CallState(isolate, frame.frame(), info, {});
+    state.value = bundle->GetInternalField(VALUE_DATA_VALUE_FIELD).As<v8::Value>();
+    callback(CallbackInfo(state));
+}
+
+[[nodiscard]] v8::Local<v8::ObjectTemplate> ValueDataTemplate(Isolate& isolate) {
+    v8::Isolate* raw = Raw(isolate);
+    auto& kept = isolate.impl().valueDataTemplate;
+    if (kept.IsEmpty()) {
+        v8::Local<v8::ObjectTemplate> shape = v8::ObjectTemplate::New(raw);
+        shape->SetInternalFieldCount(2);
+        kept.Reset(raw, shape);
+    }
+    return kept.Get(raw);
+}
+
 }  // namespace
 
 std::optional<Slot> MakeFunction(const Context& context, FunctionCallback callback, CallbackData data) {
@@ -1600,6 +1666,24 @@ std::optional<Slot> MakeFunction(const Context& context, FunctionCallback callba
         return std::nullopt;
     }
     KeepWithValue(owner, record, function);
+    return PushOrNothing(owner, function);
+}
+
+std::optional<Slot> MakeFunctionWithValue(const Context& context, FunctionCallback callback, Slot data) {
+    Isolate& owner = OwnerOf(context);
+    v8::Local<v8::Context> realm = Raw(context);
+    v8::Local<v8::Object> bundle;
+    if (!ValueDataTemplate(owner)->NewInstance(realm).ToLocal(&bundle)) {
+        return std::nullopt;
+    }
+    bundle->SetInternalField(VALUE_DATA_CALLBACK_FIELD, Pointer(owner, reinterpret_cast<void*>(callback)));
+    bundle->SetInternalField(VALUE_DATA_VALUE_FIELD, Resolve(data));
+    v8::Local<v8::Function> function;
+    // Callable, not constructable - exactly as `MakeFunction`.
+    if (!v8::Function::New(realm, &ValueFunctionTrampoline, bundle, 0, v8::ConstructorBehavior::kThrow)
+             .ToLocal(&function)) {
+        return std::nullopt;
+    }
     return PushOrNothing(owner, function);
 }
 
@@ -1658,6 +1742,13 @@ bool CallbackIsConstruct(const CallbackState& state) noexcept {
 
 CallbackData CallbackDataOf(const CallbackState& state) noexcept {
     return state.data;
+}
+
+Slot CallbackValueData(const CallbackState& state) noexcept {
+    if (state.value.IsEmpty()) {
+        return Push(*state.owner, v8::Undefined(Raw(*state.owner)));
+    }
+    return Push(*state.owner, state.value);
 }
 
 void SetReturnSlot(const CallbackState& state, Slot value) noexcept {
@@ -2742,16 +2833,41 @@ void ContextLeave(ContextScopeState& state) noexcept {
 
 namespace {
 
+/// The mark an eager compile's origin carries.
+///
+/// V8 answers a repeat compile of the same source and origin out of an
+/// in-isolate cache, and answers it with whatever it compiled first: source
+/// compiled lazily once and then asked for with `kEagerCompile` comes back
+/// lazy, and a code cache made from it covers a top level and no functions.
+/// Nothing reports that. The cache does tell compiles apart by their
+/// host-defined options, which this library otherwise never sets, so an eager
+/// compile carries a one-element array there and lands in an entry of its own.
+/// Nothing reads the mark back: host-defined options only ever reach a module
+/// loader's callback, and this library installs none.
+[[nodiscard]] v8::Local<v8::PrimitiveArray> EagerMarker(Isolate& isolate) {
+    v8::Isolate* raw = Raw(isolate);
+    auto& kept = isolate.impl().eagerMarker;
+    if (kept.IsEmpty()) {
+        v8::Local<v8::PrimitiveArray> marker = v8::PrimitiveArray::New(raw, 1);
+        marker->Set(raw, 0, v8::True(raw));
+        kept.Reset(raw, marker);
+    }
+    return kept.Get(raw);
+}
+
 /// The one compile. `codeCache` empty means an ordinary compile; otherwise the
 /// blob is offered and V8 says on the way out whether it took it.
 [[nodiscard]] ScriptRec* CompileInto(const Context& context, std::string_view source, const ScriptOrigin& origin,
-                                     std::span<const uint8_t> codeCache) {
+                                     std::span<const uint8_t> codeCache, CompileOptions options) {
     Isolate& owner = OwnerOf(context);
     v8::Local<v8::String> text;
     if (!NewString(owner, source).ToLocal(&text)) {
         return nullptr;
     }
-    v8::ScriptOrigin scriptOrigin(RawString(owner, origin.resourceName), origin.lineOffset, origin.columnOffset);
+    const bool eager = options == CompileOptions::EagerCompile;
+    v8::ScriptOrigin scriptOrigin(RawString(owner, origin.resourceName), origin.lineOffset, origin.columnOffset, false,
+                                  -1, {}, false, false, false,
+                                  eager ? EagerMarker(owner) : v8::Local<v8::PrimitiveArray>());
 
     // v8::ScriptCompiler::Source takes ownership of the CachedData object (not
     // of the buffer, which is the caller's), and `rejected` is only readable
@@ -2760,14 +2876,30 @@ namespace {
                        ? nullptr
                        : new v8::ScriptCompiler::CachedData(codeCache.data(), static_cast<int>(codeCache.size()),
                                                             v8::ScriptCompiler::CachedData::BufferNotOwned);
+    // V8 will not consume a cache and compile eagerly in one call, and when it
+    // refuses a blob it falls back to an ordinary - lazy - compile. So an eager
+    // request asks first whether the blob would be refused, and does not offer
+    // one that would: the embedder asking for eager with a stale blob is the
+    // embedder about to make a fresh one, and a lazy fallback would make it
+    // worthless. What the check cannot see is which source a blob belongs to;
+    // `unibind/script.h` has already refused a blob for any other.
+    if (eager && cached != nullptr &&
+        cached->CompatibilityCheck(Raw(owner)) != v8::ScriptCompiler::CachedData::kSuccess) {
+        delete cached;
+        cached = nullptr;
+    }
     v8::ScriptCompiler::Source compilerSource(text, scriptOrigin, cached);
 
     // Compiling still happens in a realm - that is where a syntax error is
     // reported from - but the result is not tied to it.
     v8::Context::Scope entered(Raw(context));
     v8::Local<v8::UnboundScript> script;
-    const auto option =
-        cached == nullptr ? v8::ScriptCompiler::kNoCompileOptions : v8::ScriptCompiler::kConsumeCodeCache;
+    auto option = v8::ScriptCompiler::kNoCompileOptions;
+    if (cached != nullptr) {
+        option = v8::ScriptCompiler::kConsumeCodeCache;
+    } else if (eager) {
+        option = v8::ScriptCompiler::kEagerCompile;
+    }
     if (!v8::ScriptCompiler::CompileUnboundScript(Raw(owner), &compilerSource, option).ToLocal(&script)) {
         return nullptr;
     }
@@ -2781,13 +2913,14 @@ namespace {
 
 }  // namespace
 
-ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin) {
-    return CompileInto(context, source, origin, {});
+ScriptRec* CompileScript(const Context& context, std::string_view source, const ScriptOrigin& origin,
+                         CompileOptions options) {
+    return CompileInto(context, source, origin, {}, options);
 }
 
 ScriptRec* CompileScriptWithCache(const Context& context, std::string_view source, const ScriptOrigin& origin,
-                                  std::span<const uint8_t> codeCache) {
-    return CompileInto(context, source, origin, codeCache);
+                                  std::span<const uint8_t> codeCache, CompileOptions options) {
+    return CompileInto(context, source, origin, codeCache, options);
 }
 
 bool ScriptUsedCodeCache(const ScriptRec* script) noexcept {
@@ -3151,6 +3284,8 @@ Isolate::~Isolate() {
     impl_->classes.clear();
     impl_->templates.clear();
     impl_->accessors.clear();
+    impl_->valueDataTemplate.Reset();
+    impl_->eagerMarker.Reset();
     // Callback records outlive nothing: the isolate is going, so anything that
     // could still reach them is going too.
     impl_->callbacks.clear();

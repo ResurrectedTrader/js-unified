@@ -344,6 +344,12 @@ was stored - cv-qualifiers aside. A base class, a derived class or a typedef of
 a different type gets you null, which is also what "nothing was stored" looks
 like. And the pointee is yours: it must outlive every callback that can see it.
 
+`info.Data()` with no type is a different thing altogether: the *script value*
+a function was made with (`Function::New` with a `Local<T>`), which is
+`undefined` for every callback made any other way. A function has one kind of
+data or the other, so in a function made with a value `info.Data<D>()` is null,
+and in one made with a pointer `info.Data()` is `undefined`.
+
 ---
 
 ## Callbacks, interceptors and accessors
@@ -756,6 +762,19 @@ payload length and hash settle it without asking the engine anything.
 The other direction is true too: `UsedCodeCache()` can be false for a compile
 that was instant anyway, because that is a different question.
 
+### A blob made after an ordinary compile covers only what had run
+
+**Silent, and it looks like a working cache.** Both engines compile a function's
+body on its first call, so a blob made straight after `Script::Compile` holds
+the top level and nothing inside a function; made after a run, it holds what
+that run happened to call. The next start consumes it, `UsedCodeCache()` says
+true, and every function still compiles on first use. Compile with
+`CompileOptions::EagerCompile` when the point is the blob, and pass it to
+`CompileWithCache` as well, so that a stale blob is replaced by an eager compile
+rather than a lazy one. V8 would otherwise answer an eager compile of source it
+had already compiled lazily in the same isolate with the lazy result; its
+backend files the two apart, so you do not have to avoid that.
+
 ### `JS::EncodeStencil` dereferences a null function pointer
 
 **A crash, not a failure code**, if `JS::SetProcessBuildIdOp` was never called.
@@ -808,7 +827,10 @@ many bytes.
 There is no borrowing a string's bytes on a moving collector, so `Utf8Value()`
 allocates and `String::New` copies out of the view you hand it. An empty result
 means the bytes were not valid UTF-8 **or** the engine could not allocate, and
-the two are indistinguishable. The same applies to the `std::string_view`
+the two are indistinguishable. `String::NewFromUtf8` never refuses bytes - it
+repairs them, one U+FFFD per maximal invalid sequence - so an empty result from
+it means only that the engine could not allocate. Reach for it when repair is
+what you want, and not to make an encoding error go away. The same applies to the `std::string_view`
 overloads of `Get`/`Set`: a key that could not be built and a property access
 that failed both arrive as an empty optional.
 
@@ -821,8 +843,11 @@ borrowed span would be a handle with none of the rules handles have here; and
 the engines' free-callback contracts do not match.
 
 `ByteLength` is zero for a buffer script has detached, which is indistinguishable
-from an empty one. `CopyBytes` and `CopyElements` truncate silently and return
-how much they wrote; ask `ByteLength` first if you mean to take all of it.
+from an empty one - and so is a view over one: its length *and its offset* are
+zero and a copy writes nothing. `CopyBytes` and `CopyElements` truncate silently
+and return how much they wrote; ask `ByteLength` first if you mean to take all of
+it. `GetBuffer` on a view over a `SharedArrayBuffer` is empty, because this API
+has no type for one; `CopyBytes` still reads it.
 
 ### `CopyElements<T>` with the wrong `T` copies nothing and says 0
 

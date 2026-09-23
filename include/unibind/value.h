@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -23,6 +24,90 @@
 #include "unibind/types.h"
 
 namespace ub {
+
+namespace detail {
+
+/// One step of a UTF-8 decoder: how many bytes the sequence at a position
+/// takes, and whether they are a character.
+struct Utf8Step {
+    std::size_t length = 0;
+    bool valid = false;
+};
+
+/// The sequence starting at `bytes[at]`, decoded the way the WHATWG Encoding
+/// Standard decodes it - which is also the way V8 does.
+///
+/// When the bytes are not a character, `length` is the *maximal subpart*: the
+/// longest prefix that could still have begun one. A lead byte whose next byte
+/// is out of range stops there, so `E0 80` is two faults (E0 cannot be followed
+/// by 80) while `E2 82` at the end of the input is one (a good start, cut
+/// short). The narrowed ranges after E0, ED, F0 and F4 are what make an
+/// overlong form, an encoded surrogate and anything above U+10FFFF each fail at
+/// their second byte rather than decode.
+[[nodiscard]] constexpr Utf8Step NextUtf8(std::string_view bytes, std::size_t at) noexcept {
+    const auto lead = static_cast<std::uint8_t>(bytes[at]);
+    if (lead < 0x80) {
+        return {.length = 1, .valid = true};
+    }
+    std::size_t trailing = 0;
+    std::uint8_t lower = 0x80;
+    std::uint8_t upper = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        trailing = 1;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+        trailing = 2;
+        lower = lead == 0xE0 ? 0xA0 : lower;  // below that is an overlong form
+        upper = lead == 0xED ? 0x9F : upper;  // above that is a surrogate
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+        trailing = 3;
+        lower = lead == 0xF0 ? 0x90 : lower;  // below that is an overlong form
+        upper = lead == 0xF4 ? 0x8F : upper;  // above that is past U+10FFFF
+    } else {
+        return {.length = 1, .valid = false};  // a continuation byte, C0, C1, or F5 and up
+    }
+    std::size_t length = 1;
+    for (; length <= trailing; ++length) {
+        if (at + length >= bytes.size()) {
+            return {.length = length, .valid = false};
+        }
+        const auto next = static_cast<std::uint8_t>(bytes[at + length]);
+        if (next < lower || next > upper) {
+            return {.length = length, .valid = false};
+        }
+        lower = 0x80;
+        upper = 0xBF;
+    }
+    return {.length = length, .valid = true};
+}
+
+/// Where the first byte that is not part of a character is, or `npos` if every
+/// byte is.
+[[nodiscard]] constexpr std::size_t FirstInvalidUtf8(std::string_view bytes) noexcept {
+    for (std::size_t at = 0; at < bytes.size();) {
+        const Utf8Step step = NextUtf8(bytes, at);
+        if (!step.valid) {
+            return at;
+        }
+        at += step.length;
+    }
+    return std::string_view::npos;
+}
+
+/// `bytes`, with each maximal subpart `NextUtf8` finds that is not a character
+/// replaced by U+FFFD. `firstInvalid` is where the first one is, so that the
+/// scan that found it is not repeated over the valid prefix.
+[[nodiscard]] inline std::string ReplaceInvalidUtf8(std::string_view bytes, std::size_t firstInvalid) {
+    static constexpr std::string_view REPLACEMENT = "\xEF\xBF\xBD";
+    std::string repaired(bytes.substr(0, firstInvalid));
+    for (std::size_t at = firstInvalid; at < bytes.size();) {
+        const Utf8Step step = NextUtf8(bytes, at);
+        repaired.append(step.valid ? bytes.substr(at, step.length) : REPLACEMENT);
+        at += step.length;
+    }
+    return repaired;
+}
+
+}  // namespace detail
 
 /// Base of every tag. Deleting the constructor makes the whole lattice
 /// uninstantiable, which is the point: these types exist only as parameters.
@@ -60,8 +145,33 @@ struct String : Name {
     /// Empty if the bytes are not valid UTF-8 or the engine could not
     /// allocate. Takes a view, copies out of it - the engine owns its strings
     /// and a moving collector can relocate them, so there is no borrowing.
+    ///
+    /// Strict on purpose: a caller told it handed over text should not find a
+    /// row of replacement characters where its text was. Bytes that are
+    /// *meant* to be repaired - read off a socket, out of a file - are what
+    /// `NewFromUtf8` is for.
     [[nodiscard]] static std::optional<Local<String>> New(Isolate& isolate, std::string_view utf8) {
         return detail::WrapSlot<String>(detail::MakeString(isolate, utf8));
+    }
+
+    /// V8's `NewFromUtf8`: bytes that are not UTF-8 are decoded anyway, each
+    /// maximal invalid subsequence becoming one U+FFFD - the WHATWG Encoding
+    /// Standard's rule, and the one V8 follows. Valid input gives exactly what
+    /// `New` gives. Empty only if the engine could not allocate.
+    ///
+    /// The repair is done here rather than by either engine, and that is what
+    /// makes the answer the same on both: two decoders agree about valid UTF-8
+    /// and are under no obligation to agree about anything else - how many
+    /// U+FFFD an overlong form or a truncated sequence is worth is exactly
+    /// where they could differ. So the bytes are validated first and copied
+    /// only when something in them needs replacing: valid input costs one scan
+    /// and no copy, and what an engine is handed is always valid.
+    [[nodiscard]] static std::optional<Local<String>> NewFromUtf8(Isolate& isolate, std::string_view bytes) {
+        const std::size_t firstInvalid = detail::FirstInvalidUtf8(bytes);
+        if (firstInvalid == std::string_view::npos) {
+            return New(isolate, bytes);
+        }
+        return New(isolate, detail::ReplaceInvalidUtf8(bytes, firstInvalid));
     }
 };
 
@@ -112,6 +222,30 @@ struct Function : Object {
     [[nodiscard]] static std::optional<Local<Function>> New(const Context& context, FunctionCallback callback,
                                                             CallbackData data = {}) {
         return detail::WrapSlot<Function>(detail::MakeFunction(context, callback, data));
+    }
+
+    /// A native function whose closure is a *script value*, which the callback
+    /// reads back as `info.Data()` - V8's `Function::New` with a `Local<Value>`
+    /// data. One native callback, many functions, each carrying its own name
+    /// or configuration, and nothing for the embedder to keep alive.
+    ///
+    /// The value lives exactly as long as the function: the collector reaches
+    /// it through the function and through nothing else, so it is not taken
+    /// while the function is reachable, and a value that refers back to its own
+    /// function does not keep the pair alive. The overload above is for state
+    /// the engine must not see; this one is for state that is already a value.
+    /// A function has one or the other - `info.Data<D>()` is null in one made
+    /// here.
+    ///
+    /// Callable and not constructable, exactly as the overload above.
+    ///
+    /// A template rather than a `Local<Value>` parameter so that `{}` for the
+    /// data still means an empty `CallbackData`, rather than being ambiguous
+    /// between the two.
+    template <class T>
+    [[nodiscard]] static std::optional<Local<Function>> New(const Context& context, FunctionCallback callback,
+                                                            const Local<T>& data) {
+        return detail::WrapSlot<Function>(detail::MakeFunctionWithValue(context, callback, data.slot()));
     }
 };
 
@@ -196,9 +330,18 @@ struct ArrayBuffer : Object {
     }
 };
 
+/// Any window onto an `ArrayBuffer`: a `TypedArray` or a `DataView`. V8's
+/// `ArrayBufferView`, and the static type the byte-level questions below take -
+/// the view's length and offset in bytes, the buffer under it, and a copy of
+/// exactly its range - so that code which only moves bytes need not care which
+/// kind of view script handed it.
+///
+/// Never made as itself: a view is always one of the two kinds.
+struct ArrayBufferView : Object {};
+
 /// A window onto an `ArrayBuffer` with an element width - `Uint8Array`,
 /// `Float64Array` and the rest.
-struct TypedArray : Object {
+struct TypedArray : ArrayBufferView {
     /// A view over `buffer`. `length` is in *elements*; the view must lie
     /// inside the buffer, or this is empty.
     [[nodiscard]] static std::optional<Local<TypedArray>> New(const Context& context, ElementType type,
@@ -216,6 +359,21 @@ struct TypedArray : Object {
             return std::nullopt;
         }
         return New(context, ElementTypeOf<T>, *buffer, 0, elements.size());
+    }
+};
+
+/// A window onto an `ArrayBuffer` with no element width of its own: script
+/// reads and writes it at whatever width and byte order each access names.
+/// What a binary protocol is handed to script as, where a typed array's one
+/// width would be the wrong shape.
+struct DataView : ArrayBufferView {
+    /// A view of `byteLength` bytes of `buffer`, starting `byteOffset` bytes
+    /// in. Empty if that range does not lie inside the buffer, or if script has
+    /// detached the buffer - a view over nothing is not one either engine would
+    /// hand script.
+    [[nodiscard]] static std::optional<Local<DataView>> New(const Context& context, const Local<ArrayBuffer>& buffer,
+                                                            std::size_t byteOffset, std::size_t byteLength) {
+        return detail::WrapSlot<DataView>(detail::MakeDataView(context, buffer.slot(), byteOffset, byteLength));
     }
 };
 
@@ -303,7 +461,11 @@ struct TypeCodeOfTag<Function> : std::integral_constant<TypeCode, TypeCode::Func
 template <>
 struct TypeCodeOfTag<ArrayBuffer> : std::integral_constant<TypeCode, TypeCode::ArrayBuffer> {};
 template <>
+struct TypeCodeOfTag<ArrayBufferView> : std::integral_constant<TypeCode, TypeCode::ArrayBufferView> {};
+template <>
 struct TypeCodeOfTag<TypedArray> : std::integral_constant<TypeCode, TypeCode::TypedArray> {};
+template <>
+struct TypeCodeOfTag<DataView> : std::integral_constant<TypeCode, TypeCode::DataView> {};
 template <>
 struct TypeCodeOfTag<Promise> : std::integral_constant<TypeCode, TypeCode::Promise> {};
 template <>
@@ -401,6 +563,46 @@ template <class T>
         return 0;
     }
     return detail::TypedArrayCopyOut(view.slot(), std::as_writable_bytes(out)) / sizeof(T);
+}
+
+// --- reading any view, in bytes ---------------------------------------------
+//
+// V8's `ArrayBufferView` questions, for a typed array and a DataView alike. A
+// typed array is a view, so these take one too; where a typed-array function
+// above answers the same question in elements, these answer it in bytes.
+//
+// A view whose buffer script has detached has no bytes: its length and its
+// offset are both zero and a copy writes nothing. That is V8's answer, and the
+// other backend is made to give it. Zero is also the length of an empty view,
+// and nothing here tells the two apart.
+
+/// Bytes this view covers.
+[[nodiscard]] inline std::size_t ByteLength(const Local<ArrayBufferView>& view) noexcept {
+    return detail::ArrayBufferViewByteLength(view.slot());
+}
+/// Where this view starts in its buffer, in bytes.
+[[nodiscard]] inline std::size_t ByteOffset(const Local<ArrayBufferView>& view) noexcept {
+    return detail::ArrayBufferViewByteOffset(view.slot());
+}
+/// The buffer this view looks at - V8's `Buffer()`, spelled as the typed-array
+/// overload above already spells it. Empty if the engine could not hand it
+/// over, and empty if it is a `SharedArrayBuffer`: this API has no type for
+/// one, so handing it back as an `ArrayBuffer` would be a handle whose type
+/// lies. `CopyBytes` still reads a view over one.
+[[nodiscard]] inline std::optional<Local<ArrayBuffer>> GetBuffer(const Context& context,
+                                                                 const Local<ArrayBufferView>& view) {
+    return detail::WrapSlot<ArrayBuffer>(detail::ArrayBufferViewBuffer(context, view.slot()));
+}
+
+/// Copy the bytes this view covers - its own range of its buffer, not the
+/// buffer from the start - into `out`, truncating if it does not fit. Returns
+/// how many bytes were written. V8's `CopyContents`.
+///
+/// A copy, always, for the reasons at the top of this section. Over a
+/// `SharedArrayBuffer` it is a snapshot another thread may be writing while it
+/// is taken, which is what shared memory is.
+[[nodiscard]] inline std::size_t CopyBytes(const Local<ArrayBufferView>& view, std::span<std::byte> out) noexcept {
+    return detail::ArrayBufferViewCopyOut(view.slot(), out);
 }
 
 // --- settling a promise ----------------------------------------------------

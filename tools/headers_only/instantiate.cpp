@@ -25,6 +25,11 @@ void Callback(const ub::CallbackInfo& info) {
     if (auto* state = info.Data<EmbedderState>()) {
         ++state->calls;
     }
+    // The value data sits beside the typed pointer, so both have to resolve.
+    if (info.Data().IsString()) {
+        info.GetReturnValue().Set(info.Data());
+        return;
+    }
     info.GetReturnValue().Set(42);
 }
 
@@ -58,6 +63,7 @@ ub::Intercepted Intercept(const ub::Local<ub::Name>& /*name*/, const ub::Propert
     auto object = ub::Object::New(context);
     auto array = ub::Array::New(context, 3);
     auto string = ub::String::New(isolate, "x");
+    (void)ub::String::NewFromUtf8(isolate, "\xC3");
     auto symbol = ub::Symbol::WellKnown(isolate, ub::WellKnownSymbol::Iterator);
     auto number = ub::Number::New(isolate, 1.0);
     (void)symbol;
@@ -92,6 +98,31 @@ ub::Intercepted Intercept(const ub::Local<ub::Name>& /*name*/, const ub::Propert
         (void)function->Call(context, context.GlobalObject(), arguments);
         (void)function->NewInstance(context, arguments);
     }
+    if (string) {
+        (void)ub::Function::New(context, &Callback, *string);
+    }
+    (void)ub::Function::New(context, &Callback, {});
+
+    // The view lattice: a typed array is a view, and so is a DataView.
+    if (auto buffer = ub::ArrayBuffer::New(context, 8)) {
+        if (auto view = ub::DataView::New(context, *buffer, 2, 4)) {
+            std::array<std::byte, 4> bytes{};
+            (void)ub::ByteLength(*view);
+            (void)ub::ByteOffset(*view);
+            (void)ub::GetBuffer(context, *view);
+            (void)ub::CopyBytes(*view, bytes);
+        }
+        if (auto typed = ub::TypedArray::New(context, ub::ElementType::Uint8, *buffer, 0, 8)) {
+            const ub::Local<ub::ArrayBufferView> asView = *typed;
+            (void)ub::ByteOffset(*typed);
+            (void)ub::ByteLength(asView);
+            (void)ub::GetBuffer(context, *typed);
+        }
+    }
+    (void)value.IsArrayBufferView();
+    (void)value.IsDataView();
+    (void)value.To<ub::ArrayBufferView>();
+    (void)value.To<ub::DataView>();
 
     auto objectTemplate = ub::ObjectTemplate::New(isolate);
     objectTemplate.Set("answer", ub::Constant(42));
@@ -128,7 +159,7 @@ ub::Intercepted Intercept(const ub::Local<ub::Name>& /*name*/, const ub::Propert
     (void)global.Get(isolate);
 
     (void)ub::Evaluate(context, "1 + 1", {.resourceName = "test.js"});
-    auto script = ub::Script::Compile(context, "1 + 1");
+    auto script = ub::Script::Compile(context, "1 + 1", {}, ub::CompileOptions::EagerCompile);
     if (script) {
         (void)script->Run(context);
     }

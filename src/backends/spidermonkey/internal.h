@@ -214,15 +214,26 @@ struct CallbackRecord {
     AccessorGetterCallback getter = nullptr;
     AccessorSetterCallback setter = nullptr;
     CallbackData data;
+    /// The function carries a script value for its data, in its holder's
+    /// second reserved slot. A flag here rather than a look at that slot on
+    /// every call, so that a function without one pays nothing for the
+    /// question.
+    bool hasValue = false;
 };
 
 /// Reserved slot 0 of a `NewFunctionWithReserved` function holds the
 /// `CallbackRecord*`.
 inline constexpr std::size_t FUNCTION_RECORD_SLOT = 0;
 /// Slot 1 of a function made by `Function::New` holds the object whose
-/// finalizer gives that record back. An accessor's function uses the same slot
-/// for the property name instead, and needs no holder: a record a template
-/// declared lives as long as the isolate anyway (decision 13).
+/// finalizer gives that record back - and, for a function made with a script
+/// value as its data, the value too, in the holder's second slot. An
+/// accessor's function uses the same slot for the property name instead, and
+/// needs no holder: a record a template declared lives as long as the isolate
+/// anyway (decision 13).
+///
+/// Those are the only two: `js::NewFunctionWithReserved` gives a function
+/// exactly two reserved slots, so anything a function has to carry beyond
+/// them goes in the holder.
 inline constexpr std::size_t FUNCTION_HOLDER_SLOT = 1;
 
 /// Where a frame's spill buffer comes from: the C++ global allocator, not the
@@ -465,6 +476,12 @@ struct CallbackState {
     SlotIndex holderSlot = Frame::NO_SLOT;
     CallbackData data;
     bool isConstruct = false;
+    /// The script value a `Function::New` with one carries, as a slot of
+    /// `frame` for the same reason as the two above. `hasValue` is false for
+    /// every other callback, whose data value is `undefined`; true with
+    /// `NO_SLOT` is a frame that could not grow, which is an empty handle.
+    SlotIndex valueSlot = Frame::NO_SLOT;
+    bool hasValue = false;
 };
 
 // --- slot plumbing, shared by both translation units ------------------------
