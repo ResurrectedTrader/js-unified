@@ -2282,14 +2282,22 @@ Maybe<std::string> TryCatchMessage(const TryCatchState& state, const Context& co
     }
     JSContext* cx = Raw(context);
     RealmGuard realm(context);
+    // The engine's own report of the value, built without side effects - the
+    // text it would print for the exception uncaught. Converting the value
+    // with `ToString` instead ran script's own `toString` - reading the text of
+    // a caught exception is not something script should be able to see, or
+    // throw from - and had no answer at all for a value that will not convert:
+    // a symbol, an object with no `toString`, one whose `toString` throws. V8
+    // runs nothing and answers for each of those.
     JS::RootedValue value(cx, state.exception.get());
-    JSString* text = JS::ToString(cx, value);
-    if (text == nullptr) {
+    JS::RootedObject stack(cx, state.stack.get());
+    const JS::ExceptionStack exception(cx, value, stack);
+    JS::ErrorReportBuilder report(cx);
+    if (!report.init(cx, exception, JS::ErrorReportBuilder::NoSideEffects) || !report.toStringResult()) {
         JS_ClearPendingException(cx);
         return std::nullopt;
     }
-    JS::RootedString rooted(cx, text);
-    return EncodeToStdString(cx, rooted);
+    return std::string(report.toStringResult().c_str());
 }
 
 Maybe<std::string> TryCatchStackTrace(const TryCatchState& state, const Context& context) {

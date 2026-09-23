@@ -117,6 +117,10 @@ class TryCatch {
     /// The message text, without the engine's decoration. Engines word their
     /// built-in errors differently, so a test asserts the shape of this, not
     /// its exact contents.
+    ///
+    /// Reading it runs no script - not even a thrown object's own `toString` -
+    /// and it answers for anything that can be thrown, a symbol or an object
+    /// that will not convert included.
     [[nodiscard]] std::optional<std::string> Message(const Context& context) const {
         return detail::TryCatchMessage(State(), context);
     }

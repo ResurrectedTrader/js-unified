@@ -586,3 +586,33 @@ UNIBIND_TEST_CASE(STACK_FRAMES, "regressions: an anonymous function's frame has 
         0)");
     CHECK(g_probeNames == "[] [] [obj.n] [] [h] [named] ");
 }
+
+UNIBIND_TEST_CASE(EXCEPTIONS, "regressions: a caught value's message is read without running script, whatever it is") {
+    // `TryCatch::Message` is the text of what was caught. Reading it must not
+    // run script - a thrown object's own `toString` is script, and may throw or
+    // do anything else - and it must answer for anything that can be thrown,
+    // including values that will not convert to a string at all.
+    ub_test::Fixture fixture;
+
+    const auto messageOf = [&](std::string_view source) {
+        ub::TryCatch tryCatch(fixture.iso());
+        CHECK_FALSE(ub::Evaluate(fixture.context, source).has_value());
+        REQUIRE(tryCatch.HasCaught());
+        return tryCatch.Message(fixture.context);
+    };
+
+    const auto symbol = messageOf("throw Symbol('thrown symbol')");
+    REQUIRE(symbol.has_value());
+    CHECK(symbol->find("Symbol(thrown symbol)") != std::string::npos);  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK(messageOf("throw Object.create(null)").has_value());
+    CHECK(messageOf("throw { toString() { throw new Error('from toString'); } }").has_value());
+
+    ub_test::Eval(fixture.context, "globalThis.conversions = 0");
+    CHECK(messageOf("throw { toString() { ++conversions; return 'converted'; } }").has_value());
+    CHECK(ub_test::EvalInt(fixture.context, "conversions") == 0);
+
+    // An Error still reads as its name and message.
+    const auto renamed = messageOf("throw Object.assign(new Error('the text'), { name: 'Custom' })");
+    REQUIRE(renamed.has_value());
+    CHECK(renamed->find("Custom: the text") != std::string::npos);  // NOLINT(bugprone-unchecked-optional-access)
+}
