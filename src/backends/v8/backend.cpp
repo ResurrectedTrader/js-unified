@@ -961,7 +961,11 @@ double NumberValue(Slot value) noexcept {
 }
 
 int32_t Int32Value(Slot value) noexcept {
-    return Resolve(value).As<v8::Int32>()->Value();
+    v8::Local<v8::Value> raw = Resolve(value);
+    if (raw->IsInt32()) {
+        return raw.As<v8::Int32>()->Value();
+    }
+    return NumberToInt32(raw.As<v8::Number>()->Value());
 }
 
 size_t Utf8Length(Slot string) noexcept {

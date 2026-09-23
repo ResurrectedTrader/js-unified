@@ -33,6 +33,7 @@
 ///     value, reading one is diagnosed, and nothing mistakes it for success.
 ///     See `Local<T>::IsEmpty` and docs/lifetimes.md rule 9.
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -77,6 +78,19 @@ bool SameValue(Slot lhs, Slot rhs) noexcept;
 bool BooleanValue(Slot value) noexcept;
 double NumberValue(Slot value) noexcept;
 std::int32_t Int32Value(Slot value) noexcept;
+/// ECMAScript's ToInt32 of a number, for `Int32Value` to answer with when the
+/// value is not an int32 - which an `Integer` made by `NewFromUnsigned` above
+/// INT32_MAX is not. Casting such a double to `int32_t` is undefined.
+[[nodiscard]] inline std::int32_t NumberToInt32(double value) noexcept {
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    double wrapped = std::fmod(std::trunc(value), 4294967296.0);
+    if (wrapped < 0) {
+        wrapped += 4294967296.0;
+    }
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(wrapped));
+}
 /// Bytes a UTF-8 encoding of this string needs, excluding any terminator.
 std::size_t Utf8Length(Slot string) noexcept;
 /// Encodes into `out`, truncating at a code point boundary if it does not fit.

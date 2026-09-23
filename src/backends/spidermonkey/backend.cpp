@@ -471,9 +471,11 @@ bool IsType(Slot value, TypeCode type) noexcept {
             // V8's IsInt32 is true for a double that happens to be an exact
             // int32, so ask the same question rather than asking how the
             // engine happens to be storing it.
-            return raw.isInt32() || (raw.isDouble() &&
-                                     raw.toDouble() == static_cast<double>(static_cast<std::int32_t>(raw.toDouble())) &&
-                                     !(raw.toDouble() == 0.0 && std::signbit(raw.toDouble())));
+            // Range first: casting a double outside int32_t is undefined.
+            return raw.isInt32() ||
+                   (raw.isDouble() && raw.toDouble() >= -2147483648.0 && raw.toDouble() <= 2147483647.0 &&
+                    raw.toDouble() == static_cast<double>(static_cast<std::int32_t>(raw.toDouble())) &&
+                    !(raw.toDouble() == 0.0 && std::signbit(raw.toDouble())));
         case TypeCode::Name:
             return raw.isString() || raw.isSymbol();
         case TypeCode::String:
@@ -598,7 +600,7 @@ std::int32_t Int32Value(Slot value) noexcept {
         return raw.toInt32();
     }
     if (raw.isDouble()) {
-        return static_cast<std::int32_t>(raw.toDouble());
+        return NumberToInt32(raw.toDouble());
     }
     return 0;
 }

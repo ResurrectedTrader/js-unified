@@ -149,6 +149,9 @@ struct Integer : Number {
     [[nodiscard]] static Local<Integer> New(Isolate& isolate, std::int32_t value) noexcept {
         return Local<Integer>::FromSlot(detail::MakeInteger(isolate, value));
     }
+    /// V8's factory, typed `Integer` as V8's is - though above INT32_MAX the
+    /// value is not an int32, `Is<Integer>()` says so, and `Int32Value()` reads
+    /// it wrapped. Read one as `NumberValue()` to get it back unchanged.
     [[nodiscard]] static Local<Integer> NewFromUnsigned(Isolate& isolate, std::uint32_t value) noexcept {
         return Local<Integer>::FromSlot(detail::MakeUnsigned(isolate, value));
     }

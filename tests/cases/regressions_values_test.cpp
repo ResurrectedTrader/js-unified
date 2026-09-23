@@ -334,3 +334,20 @@ UNIBIND_TEST_CASE(ARRAYS, "regressions: a proxy over an array is an object, not 
     ub_test::Expose(fixture.context, "proxy", proxy);
     CHECK(ub_test::EvalTruth(fixture.context, "Array.isArray(proxy)"));
 }
+
+TEST_CASE("regressions: an integer made from a large unsigned reads back as its int32 bits") {
+    // `Integer::NewFromUnsigned` spells V8's factory, and like V8's its result
+    // is typed `Integer` above INT32_MAX too - where the value is not an int32.
+    // `Int32Value` on it converted the double with a cast C++ leaves undefined
+    // out of range, which both backends did and which gave INT_MIN; it is the
+    // value's ToInt32, the int32 with the same low 32 bits.
+    ub_test::Fixture fixture;
+
+    for (const std::uint32_t value : {0U, 7U, 2147483647U, 2147483648U, 3000000000U, 4294967295U}) {
+        CAPTURE(value);
+        const auto integer = ub::Integer::NewFromUnsigned(fixture.iso(), value);
+        CHECK(integer.NumberValue() == static_cast<double>(value));
+        CHECK(integer.Int32Value() == static_cast<std::int32_t>(value));
+        CHECK(integer.Int32Value() == integer.ToInt32(fixture.context).value_or(0));
+    }
+}

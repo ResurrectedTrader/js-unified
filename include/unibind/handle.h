@@ -194,6 +194,9 @@ class Local {
     {
         return detail::NumberValue(slot_);
     }
+    /// The int32 this Integer holds. One `Integer::NewFromUnsigned` made above
+    /// INT32_MAX holds none, and reads as its ToInt32 - the int32 with the
+    /// same low 32 bits.
     [[nodiscard]] std::int32_t Int32Value() const noexcept
         requires std::derived_from<T, Integer>
     {
