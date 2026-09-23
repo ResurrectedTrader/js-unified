@@ -41,5 +41,12 @@ int main() {
         std::fprintf(stderr, "fatal_spidermonkey: could not make an isolate\n");
         return 1;
     }
+#ifndef __clang_analyzer__
     MOZ_CRASH("unibind test: a deliberate engine crash");
+#else
+    // The analyzer follows the macro into the engine header's null write - the
+    // crash this test exists to cause - and reports it at the header's line,
+    // where no suppression here reaches.
+    return 1;
+#endif
 }
