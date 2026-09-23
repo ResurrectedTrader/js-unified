@@ -79,11 +79,54 @@ class ReturnValue {
     void Set(const Local<T>& value) const noexcept {
         detail::SetReturnSlot(*state_, value.slot());
     }
+    /// A value held across calls, returned as it is now. V8's `Set(const
+    /// Global<S>&)`; an empty `Global` returns `undefined`.
+    template <class T>
+    void Set(const Global<T>& value) const noexcept {
+        if (value.IsEmpty()) {
+            SetUndefined();
+            return;
+        }
+        Set(value.Get(detail::CallbackIsolate(*state_)));
+    }
     void Set(bool value) const noexcept { detail::SetReturnBoolean(*state_, value); }
     void Set(double value) const noexcept { detail::SetReturnNumber(*state_, value); }
     void Set(std::int32_t value) const noexcept { detail::SetReturnInteger(*state_, value); }
+
+    // V8's other integer widths. Each is the integer it names when it fits in an
+    // `int32_t` and a Number otherwise - which for a 64-bit value beyond 2^53 is
+    // the nearest double, exactly as V8 answers. Without them a `uint32_t` is
+    // ambiguous between the `int32_t` and `double` overloads above.
+    void Set(std::int16_t value) const noexcept { Set(static_cast<std::int32_t>(value)); }
+    void Set(std::uint16_t value) const noexcept { Set(static_cast<std::int32_t>(value)); }
+    void Set(std::uint32_t value) const noexcept {
+        if (value <= static_cast<std::uint32_t>(INT32_MAX)) {
+            Set(static_cast<std::int32_t>(value));
+        } else {
+            Set(static_cast<double>(value));
+        }
+    }
+    void Set(std::int64_t value) const noexcept {
+        if (value >= INT32_MIN && value <= INT32_MAX) {
+            Set(static_cast<std::int32_t>(value));
+        } else {
+            Set(static_cast<double>(value));
+        }
+    }
+    void Set(std::uint64_t value) const noexcept {
+        if (value <= static_cast<std::uint64_t>(INT32_MAX)) {
+            Set(static_cast<std::int32_t>(value));
+        } else {
+            Set(static_cast<double>(value));
+        }
+    }
+
     void SetUndefined() const noexcept { detail::SetReturnUndefined(*state_); }
     void SetNull() const noexcept { detail::SetReturnNull(*state_); }
+    void SetFalse() const noexcept { Set(false); }
+    /// `""`. Empty if the string could not be made, in which case nothing was
+    /// set - as for `Set(std::string_view)`.
+    [[nodiscard]] bool SetEmptyString() const { return Set(std::string_view()); }
 
     /// Convenience for the common case; empty if the string could not be made,
     /// in which case nothing was set.

@@ -66,6 +66,22 @@ void ReturnAKindOf(const ub::CallbackInfo& info) {
         info.GetReturnValue().Set(2.5);
     } else if (kind == "int") {
         info.GetReturnValue().Set(std::int32_t{-7});
+    } else if (kind == "int16") {
+        info.GetReturnValue().Set(std::int16_t{-300});
+    } else if (kind == "uint16") {
+        info.GetReturnValue().Set(std::uint16_t{65535});
+    } else if (kind == "uint32") {
+        info.GetReturnValue().Set(std::uint32_t{4294967295U});
+    } else if (kind == "int64") {
+        info.GetReturnValue().Set(std::int64_t{-9007199254740991LL});
+    } else if (kind == "uint64") {
+        info.GetReturnValue().Set(std::uint64_t{9007199254740991ULL});
+    } else if (kind == "false") {
+        info.GetReturnValue().SetFalse();
+    } else if (kind == "empty") {
+        if (!info.GetReturnValue().SetEmptyString()) {
+            info.ThrowTypeError("could not make the string");
+        }
     } else if (kind == "string") {
         if (!info.GetReturnValue().Set("from native")) {
             info.ThrowTypeError("could not make the string");
@@ -82,6 +98,12 @@ void ReturnAKindOf(const ub::CallbackInfo& info) {
     } else {
         // Nothing set at all: the call must see undefined.
     }
+}
+
+/// Hands back what a `Global` holds, as a callback would return a value it
+/// keeps between calls.
+void ReturnHeld(const ub::CallbackInfo& info) {
+    info.GetReturnValue().Set(*info.Data<ub::Global<ub::Value>>());
 }
 
 /// Records the receiver it was called with, so a test can ask what `this` was.
@@ -188,6 +210,35 @@ TEST_CASE("functions: every way of answering a call works") {
     CHECK(ub_test::EvalText(fixture.context, "answer('string')") == "from native");
     CHECK(ub_test::EvalInt(fixture.context, "answer('handle').made") == 1);
     CHECK(ub_test::Eval(fixture.context, "answer('nothing')").Kind() == ub::ValueKind::Undefined);
+
+    // V8's other widths, each as the integer it names.
+    CHECK(ub_test::EvalInt(fixture.context, "answer('int16')") == -300);
+    CHECK(ub_test::EvalInt(fixture.context, "answer('uint16')") == 65535);
+    CHECK(ub_test::EvalNumber(fixture.context, "answer('uint32')") == 4294967295.0);
+    CHECK(ub_test::EvalTruth(fixture.context, "answer('uint32') === 4294967295"));
+    CHECK(ub_test::EvalTruth(fixture.context, "answer('int64') === -Number.MAX_SAFE_INTEGER"));
+    CHECK(ub_test::EvalTruth(fixture.context, "answer('uint64') === Number.MAX_SAFE_INTEGER"));
+    CHECK(ub_test::EvalTruth(fixture.context, "answer('false') === false"));
+    CHECK(ub_test::EvalTruth(fixture.context, "answer('empty') === ''"));
+}
+
+TEST_CASE("functions: a callback can answer with a value it holds between calls") {
+    ub_test::Fixture fixture;
+
+    const auto held = ub::String::New(fixture.iso(), "kept");
+    REQUIRE(held.has_value());
+    ub::Global<ub::Value> kept(fixture.iso(), *held);
+    ub::Global<ub::Value> nothing;
+
+    const auto answer = ub::Function::New(fixture.context, &ReturnHeld, ub::CallbackData::For(kept));
+    const auto none = ub::Function::New(fixture.context, &ReturnHeld, ub::CallbackData::For(nothing));
+    REQUIRE(answer.has_value());
+    REQUIRE(none.has_value());
+    ub_test::Expose(fixture.context, "held", *answer);
+    ub_test::Expose(fixture.context, "none", *none);
+
+    CHECK(ub_test::EvalText(fixture.context, "held()") == "kept");
+    CHECK(ub_test::EvalTruth(fixture.context, "none() === undefined"));
 }
 
 TEST_CASE("functions: embedder data is typed and cannot be mistaken for another type") {
