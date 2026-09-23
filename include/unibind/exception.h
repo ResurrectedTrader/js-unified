@@ -166,9 +166,14 @@ class TryCatch {
     /// reads the line back from it. SpiderMonkey keeps its own copy but offers
     /// no way to read a line of it back, and quotes the line only for a
     /// compile error - so its backend keeps a second copy of the text of every
-    /// script compiled through `Script`, per isolate, and quotes from that. Code
-    /// that was not compiled through `Script` (`eval`, `new Function`) has a
-    /// line on V8 and none on SpiderMonkey.
+    /// script compiled through `Script`, for as long as the engine keeps that
+    /// script's code, and quotes from that. Code that was not compiled through
+    /// `Script` (`eval`, `new Function`) has a line on V8 and none on
+    /// SpiderMonkey. Nor does a script that shares its resource name with
+    /// another live script of different text - every script compiled with no
+    /// origin shares the default one - because SpiderMonkey names the script
+    /// in an error only by that name, and quoting the wrong one of the two
+    /// would be worse than quoting neither. Name your scripts.
     [[nodiscard]] std::optional<MessageLocation> Location(const Context& context) const {
         std::optional<MessageLocation> location = detail::TryCatchLocation(State(), context);
         // Both engines answer a throw with no script under it with a location

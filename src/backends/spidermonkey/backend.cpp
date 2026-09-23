@@ -32,6 +32,7 @@
 #include <js/MemoryCallbacks.h>
 #include <js/SavedFrameAPI.h>
 #include <js/ScalarType.h>
+#include <js/ScriptPrivate.h>
 #include <js/Stack.h>
 #include <js/String.h>
 #include <js/StructuredClone.h>
@@ -2360,29 +2361,91 @@ std::optional<std::vector<StackFrame>> TryCatchStackFrames(const TryCatchState& 
 
 namespace {
 
-/// Line `lineNumber` of a retained script, without its terminator, or nothing
-/// if the script is not retained or has no such line.
-std::optional<std::string> RetainedLine(const Isolate& isolate, const std::string& scriptName,
-                                        std::int32_t lineNumber) {
-    const auto& sources = isolate.impl().sources;
-    const auto found = sources.find(scriptName);
-    if (found == sources.end() || lineNumber < found->second.firstLine) {
+/// Where the line terminator at `text[at]` ends, or `at` if there is none
+/// there. JavaScript ends a line at LF, CR, CRLF, U+2028 and U+2029, and the
+/// engine numbers lines by exactly that rule, so cutting a line by any other
+/// would quote a line other than the one it numbered.
+template <class Char>
+[[nodiscard]] std::size_t PastTerminator(const Char* text, std::size_t length, std::size_t at) noexcept {
+    const auto unit = static_cast<std::uint32_t>(static_cast<std::make_unsigned_t<Char>>(text[at]));
+    if (unit == '\n') {
+        return at + 1;
+    }
+    if (unit == '\r') {
+        return at + 1 < length && text[at + 1] == Char('\n') ? at + 2 : at + 1;
+    }
+    if constexpr (sizeof(Char) == 1) {
+        // U+2028 and U+2029 in UTF-8: E2 80 A8 and E2 80 A9.
+        if (unit == 0xE2 && at + 2 < length && static_cast<std::uint8_t>(text[at + 1]) == 0x80 &&
+            (static_cast<std::uint8_t>(text[at + 2]) == 0xA8 || static_cast<std::uint8_t>(text[at + 2]) == 0xA9)) {
+            return at + 3;
+        }
+    } else if (unit == 0x2028 || unit == 0x2029) {
+        return at + 1;
+    }
+    return at;
+}
+
+/// Where line `wanted` of `text` starts and how long it is without its
+/// terminator, counting the first line as `firstLine`; nothing if there is no
+/// such line.
+template <class Char>
+[[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> FindLine(const Char* text, std::size_t length,
+                                                                          std::int64_t firstLine,
+                                                                          std::int64_t wanted) noexcept {
+    if (wanted < firstLine) {
         return std::nullopt;
     }
-    const std::string_view text = found->second.text;
+    std::int64_t line = firstLine;
     std::size_t start = 0;
-    for (std::int32_t line = found->second.firstLine; line < lineNumber; ++line) {
-        const std::size_t newline = text.find('\n', start);
-        if (newline == std::string_view::npos) {
+    for (std::size_t at = 0; at < length;) {
+        const std::size_t past = PastTerminator(text, length, at);
+        if (past == at) {
+            ++at;
+            continue;
+        }
+        if (line == wanted) {
+            return std::make_pair(start, at - start);
+        }
+        ++line;
+        start = past;
+        at = past;
+    }
+    if (line == wanted) {
+        return std::make_pair(start, length - start);
+    }
+    return std::nullopt;
+}
+
+/// Line `lineNumber` of the script named `scriptName`, without its terminator,
+/// or nothing if no retained script has that name and that line - or if more
+/// than one live script has that name and they do not all have the same text.
+///
+/// The engine names a script in an error only by its resource name, and two
+/// scripts may share one: every script compiled with no origin shares the
+/// default. Which of them raised the error is then not something this backend
+/// can find out, and quoting any one of them is a wrong answer that looks like
+/// a right one - so it quotes nothing. See `Isolate::Impl::sources`.
+std::optional<std::string> RetainedLine(const Isolate& isolate, const std::string& scriptName,
+                                        std::int32_t lineNumber) {
+    const Isolate::Impl::RetainedSource* found = nullptr;
+    for (const auto& [key, source] : isolate.impl().sources) {
+        if (source->name != scriptName) {
+            continue;
+        }
+        if (found != nullptr && (found->text != source->text || found->firstLine != source->firstLine)) {
             return std::nullopt;
         }
-        start = newline + 1;
+        found = source.get();
     }
-    std::string_view line = text.substr(start, text.find('\n', start) - start);
-    if (!line.empty() && line.back() == '\r') {
-        line.remove_suffix(1);
+    if (found == nullptr) {
+        return std::nullopt;
     }
-    return std::string(line);
+    const auto line = FindLine(found->text.data(), found->text.size(), found->firstLine, lineNumber);
+    if (!line) {
+        return std::nullopt;
+    }
+    return found->text.substr(line->first, line->second);
 }
 
 }  // namespace
@@ -2533,9 +2596,30 @@ void ContextLeave(ContextScopeState& state) noexcept {
 
 namespace {
 
+/// Keep the text `TryCatch::Location` will quote from, for as long as the
+/// engine keeps `script`'s code; see `Isolate::Impl::sources`. Quoting is a
+/// convenience, so failing to keep it costs the quote and nothing else.
+void RetainSource(Isolate& isolate, JSScript* script, std::string_view source, const ScriptOrigin& origin) noexcept {
+    try {
+        auto kept = std::make_unique<Isolate::Impl::RetainedSource>(
+            Isolate::Impl::RetainedSource{.owner = &isolate.impl(),
+                                          .name = std::string(origin.resourceName),
+                                          .text = std::string(source),
+                                          .firstLine = std::int64_t{origin.lineOffset} + 1});
+        Isolate::Impl::RetainedSource* raw = kept.get();
+        isolate.impl().sources.emplace(raw, std::move(kept));
+        // The engine calls the add-reference hook from inside this, which is
+        // what makes the count one.
+        JS::SetScriptPrivate(script, JS::PrivateValue(raw));
+    } catch (const std::bad_alloc&) {
+        return;
+    }
+}
+
 /// Turn a stencil into the rec the API hands back, instantiating it into the
-/// realm that asked.
-ScriptRec* RecFromStencil(JSContext* cx, const Context& context, RefPtr<JS::Stencil> stencil, bool usedCache) {
+/// realm that asked, and keep `source` for `TryCatch::Location`.
+ScriptRec* RecFromStencil(JSContext* cx, const Context& context, RefPtr<JS::Stencil> stencil, bool usedCache,
+                          std::string_view source, const ScriptOrigin& origin) {
     if (stencil == nullptr) {
         return nullptr;
     }
@@ -2544,6 +2628,7 @@ ScriptRec* RecFromStencil(JSContext* cx, const Context& context, RefPtr<JS::Sten
     if (script == nullptr) {
         return nullptr;
     }
+    RetainSource(OwnerOf(context), script, source, origin);
     auto* rec = new ScriptRec{.owner = &OwnerOf(context),
                               .stencil = std::move(stencil),
                               .script = JS::PersistentRooted<JSScript*>(cx),
@@ -2552,14 +2637,6 @@ ScriptRec* RecFromStencil(JSContext* cx, const Context& context, RefPtr<JS::Sten
     ++rec->owner->impl().embedderRefs;
     rec->script = script;
     return rec;
-}
-
-/// Keep the text `TryCatch::Location` will quote from; see
-/// `Isolate::Impl::sources`.
-void RetainSource(const Context& context, const std::string& resourceName, std::string_view source,
-                  const ScriptOrigin& origin) {
-    OwnerOf(context).impl().sources[resourceName] =
-        Isolate::Impl::RetainedSource{.text = std::string(source), .firstLine = origin.lineOffset + 1};
 }
 
 RefPtr<JS::Stencil> CompileToStencil(JSContext* cx, std::string_view source, const JS::CompileOptions& options) {
@@ -2593,13 +2670,10 @@ ScriptRec* CompileScript(const Context& context, std::string_view source, const 
     }
 
     const std::string resourceName(origin.resourceName);
-    // Before compiling, so that a syntax error can be quoted too - although the
-    // engine quotes that one itself.
-    RetainSource(context, resourceName, source, origin);
     JS::CompileOptions options(cx);
     options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
     ApplyCompileOptions(options, compileOptions);
-    return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false);
+    return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false, source, origin);
 }
 
 ScriptRec* CompileScriptWithCache(const Context& context, std::string_view source, const ScriptOrigin& origin,
@@ -2611,7 +2685,6 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
     }
 
     const std::string resourceName(origin.resourceName);
-    RetainSource(context, resourceName, source, origin);
     JS::CompileOptions options(cx);
     options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
     // Set before the decode as well as the compile, harmlessly: a decoded
@@ -2640,8 +2713,8 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
         JS::Stencil* decoded = nullptr;
         const JS::TranscodeRange range(codeCache.data(), codeCache.size());
         if (JS::DecodeStencil(cx, decodeOptions, range, &decoded) == JS::TranscodeResult::Ok && decoded != nullptr) {
-            ScriptRec* rec =
-                RecFromStencil(cx, context, RefPtr<JS::Stencil>(already_AddRefed<JS::Stencil>(decoded)), true);
+            ScriptRec* rec = RecFromStencil(cx, context, RefPtr<JS::Stencil>(already_AddRefed<JS::Stencil>(decoded)),
+                                            true, source, origin);
             if (rec != nullptr) {
                 return rec;
             }
@@ -2649,7 +2722,7 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
         JS_ClearPendingException(cx);
     }
 
-    return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false);
+    return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false, source, origin);
 }
 
 bool ScriptUsedCodeCache(const ScriptRec* script) noexcept {
@@ -2975,6 +3048,28 @@ std::size_t UsableStackBytes(std::size_t wanted) noexcept {
 /// checkpoint. Once `CancelTerminateExecution` clears our flag the leftover bit
 /// fires one last time and this returns true, which costs one interrupt and
 /// changes nothing.
+/// A script's retained text gaining a reference: the engine's source object
+/// for it took the text as its private.
+void AddSourceReference(const JS::Value& value) {
+    if (value.isUndefined()) {
+        return;
+    }
+    ++static_cast<Isolate::Impl::RetainedSource*>(value.toPrivate())->refs;
+}
+
+/// ... and losing one, which is the source object being finalized. The last
+/// one lets the text go. Called from a finalizer, so it touches nothing the
+/// collector owns.
+void ReleaseSourceReference(const JS::Value& value) {
+    if (value.isUndefined()) {
+        return;
+    }
+    auto* source = static_cast<Isolate::Impl::RetainedSource*>(value.toPrivate());
+    if (--source->refs == 0) {
+        source->owner->sources.erase(source);
+    }
+}
+
 bool OnInterrupt(JSContext* cx) {
     auto* isolate = static_cast<Isolate*>(JS_GetContextPrivate(cx));
     if (isolate == nullptr) {
@@ -3216,6 +3311,9 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
     // runaway script did not stop, which is the moment it can least afford to.
     // `~Isolate` is not in play yet - nothing has been handed out - so the
     // context is unwound here.
+    // What keeps a script's text for `TryCatch::Location` exactly as long as the
+    // engine keeps its code. See `Isolate::Impl::sources`.
+    JS::SetScriptPrivateReferenceHooks(JS_GetRuntime(isolate->impl().cx), &AddSourceReference, &ReleaseSourceReference);
     if (!JS_AddInterruptCallback(isolate->impl().cx, &OnInterrupt)) {
         JS_DestroyContext(isolate->impl().cx);
         isolate->impl().cx = nullptr;

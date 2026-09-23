@@ -185,16 +185,26 @@ struct Isolate::Impl {
     /// diagnoses breaking it, in a checked build, where it happens.
     std::int32_t embedderRefs = 0;
 
-    /// The text of every script compiled through `Script`, by resource name,
-    /// and the line number its first line was compiled as. SpiderMonkey keeps a
-    /// copy of its own but offers no way to read a line of it back, and
-    /// `TryCatch::Location` promises the line a runtime error came from, as V8
-    /// gives it. The latest compile under a name is the one quoted.
+    /// The text of every live script compiled through `Script`, which
+    /// `TryCatch::Location` quotes a runtime error's line from. SpiderMonkey
+    /// keeps a copy of its own but offers no way to read a line of it back, and
+    /// V8 gives the line.
+    ///
+    /// Each entry is the script private of the engine's source object for one
+    /// compile, and lives exactly as long as that object: the reference hooks
+    /// installed in `Isolate::New` count it up and down, and the last release
+    /// removes it. So a script's text goes when its code does - its `Script`
+    /// and every function it made - and not before, which is what lets an
+    /// error raised by a function outlive the `Script` that defined it and
+    /// still be quoted. Keyed by the entry's own address.
     struct RetainedSource {
+        Impl* owner = nullptr;
+        std::string name;
         std::string text;
-        std::int32_t firstLine = 1;
+        std::int64_t firstLine = 1;
+        std::uint32_t refs = 0;
     };
-    std::unordered_map<std::string, RetainedSource> sources;
+    std::unordered_map<const RetainedSource*, std::unique_ptr<RetainedSource>> sources;
 };
 
 namespace detail {
