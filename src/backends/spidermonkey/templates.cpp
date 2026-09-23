@@ -515,7 +515,9 @@ bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::Mu
     }
 
     JS::RootedValue prototypeValue(cx, JS::ObjectValue(*prototype));
-    if (!JS_DefineProperty(cx, function, "prototype", prototypeValue, JSPROP_PERMANENT | JSPROP_READONLY)) {
+    // Writable, and neither enumerable nor configurable: the `prototype` every
+    // ordinary function has, and what V8 gives a function made from a template.
+    if (!JS_DefineProperty(cx, function, "prototype", prototypeValue, JSPROP_PERMANENT)) {
         return false;
     }
     JS::RootedValue functionValue(cx, JS::ObjectValue(*function));

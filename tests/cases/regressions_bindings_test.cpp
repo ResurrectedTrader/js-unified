@@ -575,3 +575,30 @@ UNIBIND_TEST_CASE2(CLASSES, INTERCEPTORS, "regressions: a template's shape is fi
     parent.PrototypeTemplate().Set("addedLate", ub::Constant(2));
     CHECK(inSecond("Parent", parent.GetFunction(*second), "String(new Parent().addedLate)") == "2");  // NOLINT
 }
+
+UNIBIND_TEST_CASE2(TEMPLATES, CLASSES, "regressions: a template's prototype property is writable, as a function's is") {
+    // V8 gives the function a template or a class makes the `prototype`
+    // property every ordinary function has: writable, neither enumerable nor
+    // configurable. SpiderMonkey's backend made it read-only as well, so
+    // assigning one - which script and older libraries still do to set up
+    // inheritance - worked on one engine and was ignored on the other, or
+    // threw in strict code.
+    ub_test::Fixture fixture;
+    const auto tpl = ub::FunctionTemplate::New(fixture.iso());
+    const auto function = tpl.GetFunction(fixture.context);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "F", *function);  // NOLINT(bugprone-unchecked-optional-access)
+    ExposeGadgetClass<&MakeGadgetStamping>(fixture, "Stamped");
+
+    for (const std::string_view name : {"F", "Stamped"}) {
+        CAPTURE(name);
+        const std::string descriptor = "Object.getOwnPropertyDescriptor(" + std::string(name) + ", 'prototype')";
+        CHECK(ub_test::EvalText(fixture.context,
+                                "(() => { const d = " + descriptor +
+                                    "; return [d.writable, d.enumerable, d.configurable].join(); })()") ==
+              "true,false,false");
+        CHECK(ub_test::EvalTruth(fixture.context, "(() => { 'use strict'; const p = {}; " + std::string(name) +
+                                                      ".prototype = p; return " + std::string(name) +
+                                                      ".prototype === p; })()"));
+    }
+}
