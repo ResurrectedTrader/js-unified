@@ -151,7 +151,10 @@ class InspectorSession {
     /// and it may run script to produce them, so a `Runtime.evaluate` can
     /// throw, loop or pause like any other script. Still answered after
     /// `Stop`, but nothing a stopped session asks for pauses script:
-    /// `Debugger.enable` is refused.
+    /// `Debugger.enable` is refused. Still answered on a stopped isolate too -
+    /// one `Isolate::TerminateExecution` has stopped and nothing has cancelled
+    /// - but what it would run is stopped at once, as any other script there
+    /// is, and the answer is the error saying so.
     void DispatchProtocolMessage(std::string_view message);
 
     /// Leave a pause from outside the protocol - on the embedder's own

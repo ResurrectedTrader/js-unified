@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "support/harness.h"
@@ -274,4 +275,65 @@ UNIBIND_TEST_CASE(STACK_LIMIT, "regressions: a stack limit larger than the threa
     CloseHandle(thread);
     REQUIRE(result.isolateMade);
     CHECK(result.caught);
+}
+
+namespace {
+
+/// A DevTools connection that keeps what it is told.
+struct DevTools final : ub::InspectorClient {
+    void SendProtocolMessage(std::string_view message) override { messages.emplace_back(message); }
+    void RunMessageLoopOnPause() override {}
+    void QuitMessageLoopOnPause() override {}
+
+    /// The response to request `id`, or empty if there was none.
+    [[nodiscard]] std::string ResponseTo(int id) const {
+        const std::string prefix = "{\"id\":" + std::to_string(id) + ",";
+        for (const std::string& message : messages) {
+            if (message.starts_with(prefix)) {
+                return message;
+            }
+        }
+        return {};
+    }
+
+    std::vector<std::string> messages;
+};
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(INSPECTOR, TERMINATION, "regressions: a stopped isolate runs no script for DevTools either") {
+    // A stop holds until it is cancelled, whatever the engine would allow -
+    // and a Runtime.evaluate goes to the engine directly, past the gates that
+    // hold it everywhere else. V8 forgets a stop once its unwind is done, so
+    // DevTools could run script in an isolate its embedder had stopped.
+    if (!ub::Inspector::Supported()) {
+        ub_test::ReportSkip("this backend has no inspector");
+        return;
+    }
+    ub_test::Fixture fixture;
+    DevTools client;
+    auto inspector = ub::Inspector::New(fixture.iso(), client);
+    REQUIRE(inspector != nullptr);
+    inspector->ContextCreated(fixture.context, "main");
+    auto session = inspector->Connect();
+    REQUIRE(session != nullptr);
+
+    fixture.iso().TerminateExecution();
+    CHECK_FALSE(ub::Evaluate(fixture.context, "for (;;) {}").has_value());
+    REQUIRE(fixture.iso().IsExecutionTerminating());
+
+    session->DispatchProtocolMessage(
+        R"({"id":1,"method":"Runtime.evaluate","params":{"expression":"globalThis.ranWhileStopped = true"}})");
+    INFO("answered: ", client.ResponseTo(1));
+    CHECK(client.ResponseTo(1).find("\"error\"") != std::string::npos);
+    session->DispatchProtocolMessage(R"({"id":2,"method":"Runtime.enable"})");
+    CHECK_FALSE(client.ResponseTo(2).empty());
+
+    fixture.iso().CancelTerminateExecution();
+    CHECK(ub_test::EvalText(fixture.context, "typeof globalThis.ranWhileStopped") == "undefined");
+    session->DispatchProtocolMessage(R"({"id":3,"method":"Runtime.evaluate","params":{"expression":"6 * 7"}})");
+    CHECK(client.ResponseTo(3).find("\"value\":42") != std::string::npos);
+
+    session.reset();
+    inspector->ContextDestroyed(fixture.context);
 }

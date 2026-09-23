@@ -4236,7 +4236,17 @@ InspectorSession::~InspectorSession() {
 }
 
 void InspectorSession::DispatchProtocolMessage(std::string_view message) {
-    const v8::HandleScope scope(impl_->owner->impl().isolate);
+    Isolate& owner = *impl_->owner;
+    const v8::HandleScope scope(owner.impl().isolate);
+    // A stopped isolate runs no script until the stop is cancelled, and a
+    // `Runtime.evaluate` is script like any other - but it goes straight to
+    // V8, past every gate this backend keeps, and V8 forgot the stop the moment
+    // its unwind finished. Arming V8's own termination again makes whatever
+    // the dispatch runs stop at its first check, and the answer DevTools gets
+    // says so; `CancelTerminateExecution` disarms it with the rest.
+    if (owner.impl().terminating.load(std::memory_order_acquire)) {
+        owner.impl().isolate->TerminateExecution();
+    }
     // Nothing of `this` is touched once the dispatch has started: a callback
     // inside it may destroy the session.
     impl_->session->dispatchProtocolMessage(
