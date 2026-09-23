@@ -36,9 +36,9 @@
 
 name: v8
 
+# Run by hand (Actions -> this workflow -> Run workflow): the engine jobs are
+# long, and every push paying for them burned Actions minutes for nothing.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 permissions:

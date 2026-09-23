@@ -54,8 +54,9 @@
 
 name: lint
 
+# The formatter on every pull request - it is seconds - and clang-tidy only by
+# hand, since each tidy job fetches an engine and compiles.
 on:
-  push:
   pull_request:
   workflow_dispatch:
 
@@ -93,6 +94,7 @@ jobs:
 
   tidy:
     name: clang-tidy against ${{ matrix.backend }}
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     timeout-minutes: 120
     strategy:
