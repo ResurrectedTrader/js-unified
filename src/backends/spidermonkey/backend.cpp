@@ -2190,6 +2190,9 @@ void Drain(TryCatchState& state) noexcept {
     if (!JS_IsExceptionPending(cx)) {
         return;
     }
+    // Taking an exception off the context wraps it into the current realm,
+    // and a handler may be open with none entered - in a posted job, say.
+    const IsolateRealm realm(*state.owner);
     JS::ExceptionStack captured(cx);
     if (JS::StealPendingExceptionStack(cx, &captured)) {
         state.exception = captured.exception();
@@ -2249,6 +2252,7 @@ void TryCatchOpen(Isolate& isolate, TryCatchState& storage) noexcept {
     // Anything already pending was thrown before this handler existed, so it
     // is not ours to catch. Park it and put it back when we close.
     if (JS_IsExceptionPending(cx)) {
+        const IsolateRealm realm(isolate);
         JS::RootedValue pending(cx);
         if (JS_GetPendingException(cx, &pending)) {
             state->outer = pending;
@@ -2277,6 +2281,7 @@ void TryCatchClose(TryCatchState& state) noexcept {
     // V8's rule, which is what parity means here: a caught exception is
     // consumed by the handler that caught it unless the handler asked for it
     // to continue outwards.
+    const IsolateRealm realm(*state.owner);
     if (state.caught && state.rethrow) {
         JS::RootedValue value(cx, state.exception.get());
         JS::RootedObject stack(cx, state.stack.get());

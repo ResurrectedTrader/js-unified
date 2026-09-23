@@ -519,7 +519,9 @@ class Isolate {
     /// Throw from native code. The throw takes effect when control returns to
     /// the engine; the calling code should stop and return promptly. `message`
     /// is decoded as `ub::Throw` decodes it: bytes that are not UTF-8 become
-    /// U+FFFD rather than costing the error.
+    /// U+FFFD rather than costing the error. It needs no `ContextScope`: with no
+    /// realm entered - in a posted job, say - the error is made in one of the
+    /// backend's own, and a `TryCatch` opened there catches it.
     void ThrowError(ErrorKind kind, std::string_view message);
 
     [[nodiscard]] HeapStatistics GetHeapStatistics() const noexcept;

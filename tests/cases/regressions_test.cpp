@@ -864,3 +864,30 @@ UNIBIND_TEST_CASE(PROMISES, "regressions: settling a settled promise is false, a
     // NOLINTEND(bugprone-unchecked-optional-access)
     isolate.PumpJobs();
 }
+
+UNIBIND_TEST_CASE2(JOBS, EXCEPTIONS, "regressions: native code throws and catches with no realm entered") {
+    // `Isolate::ThrowError` and `TryCatch` need no `ContextScope`: a posted
+    // job runs with no realm current, and an embedder may throw from one and
+    // catch there. One engine made the error in the current realm, which was
+    // none; the other took a caught exception off the context the same way.
+    // Both ended the process.
+    auto isolate = ub_test::Fixture::MakeIsolate();
+    static int caught = -1;
+    static int pendingAfter = -1;
+    caught = -1;
+    pendingAfter = -1;
+    isolate->PostJob(
+        [](ub::Isolate& owner, ub::CallbackData /*data*/) {
+            const ub::HandleScope scope(owner);
+            {
+                ub::TryCatch tryCatch(owner);
+                owner.ThrowError(ub::ErrorKind::TypeError, "thrown with no realm");
+                caught = tryCatch.HasCaught() && !tryCatch.Exception().IsEmpty() ? 1 : 0;
+            }
+            pendingAfter = owner.HasPendingException() ? 1 : 0;
+        },
+        {});
+    isolate->PumpJobs();
+    CHECK(caught == 1);
+    CHECK(pendingAfter == 0);
+}

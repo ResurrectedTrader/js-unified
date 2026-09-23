@@ -196,6 +196,12 @@ struct Isolate::Impl {
     /// compilation cache files it apart from a lazy compile of the same source.
     /// See `CompileInto`.
     v8::Global<v8::PrimitiveArray> eagerMarker;
+    /// A realm of the backend's own, made the first time something needs one
+    /// and none is entered: an error thrown from native code with no
+    /// `ContextScope` open - from a posted job, say - has to be made in some
+    /// realm, and V8 makes it in the current one or crashes. SpiderMonkey's
+    /// backend has the same thing for the same reason.
+    v8::Global<v8::Context> utility;
     /// The isolate's inspector, if it has one - there is at most one - and the
     /// work `Inspector::RequestDispatch` has queued for it. The queue is here
     /// rather than in the inspector because what a V8 interrupt and a posted
@@ -2665,6 +2671,23 @@ void ThrowValue(Isolate& isolate, Slot value) {
 }
 
 void ThrowError(Isolate& isolate, ErrorKind kind, std::string_view message) {
+    // An error is an object and V8 makes it in the current realm; with none
+    // entered it would dereference nothing. `unibind/isolate.h` lets an
+    // embedder throw with no `ContextScope` open, so the backend's own realm
+    // stands in.
+    v8::Isolate* raw = Raw(isolate);
+    std::optional<v8::Context::Scope> entered;
+    if (!raw->InContext()) {
+        auto& utility = isolate.impl().utility;
+        if (utility.IsEmpty()) {
+            v8::Local<v8::Context> made = v8::Context::New(raw);
+            if (made.IsEmpty()) {
+                return;
+            }
+            utility.Reset(raw, made);
+        }
+        entered.emplace(utility.Get(raw));
+    }
     v8::Local<v8::String> text = RawString(isolate, message);
     v8::Local<v8::Value> error;
     switch (kind) {
@@ -3378,6 +3401,7 @@ Isolate::~Isolate() {
     impl_->accessors.clear();
     impl_->valueDataTemplate.Reset();
     impl_->eagerMarker.Reset();
+    impl_->utility.Reset();
     assert(impl_->inspector == nullptr && "an Inspector outlived its Isolate");
     // Callback records outlive nothing: the isolate is going, so anything that
     // could still reach them is going too.
