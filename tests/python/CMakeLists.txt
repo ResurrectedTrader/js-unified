@@ -10,7 +10,10 @@
 add_executable(unibind_python_tests
     main.cpp
     support.cpp
-    smoke_test.cpp)
+    smoke_test.cpp
+    binary_test.cpp
+    serialization_test.cpp
+    codecache_test.cpp)
 
 target_include_directories(unibind_python_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(unibind_python_tests PRIVATE unibind::unibind doctest::doctest)
