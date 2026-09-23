@@ -64,6 +64,7 @@ set_property(CACHE UNIBIND_ENGINE_FLAVOR PROPERTY STRINGS release debug)
 option(UNIBIND_FETCH_ENGINES "Fetch a published engine build when there is not one already" ON)
 
 option(UNIBIND_BUILD_TESTS "Build the test suite" ON)
+option(UNIBIND_BUILD_EXAMPLES "Build the examples that live in this tree (examples/python_repl, python backend only)" ON)
 option(UNIBIND_HANDLE_CHECKS_ENABLED "Diagnose use of a handle after its scope closed (costs 4 bytes per handle)" ON)
 option(UNIBIND_LTO "Link-time optimization, which is what inlines the backend into callers" OFF)
 
@@ -322,6 +323,13 @@ endif()
 if(UNIBIND_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# examples/embed is built against an *installed* prefix and is not part of this
+# tree. The python REPL is: it needs the python backend and is registered as a
+# test of it (label "example").
+if(UNIBIND_BUILD_EXAMPLES AND UNIBIND_BACKEND STREQUAL "python")
+    add_subdirectory(examples/python_repl)
 endif()
 
 # --------------------------------------------------------------------------
