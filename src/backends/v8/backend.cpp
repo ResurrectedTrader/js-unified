@@ -41,6 +41,7 @@
 #include "unibind/exception.h"
 #include "unibind/function.h"
 #include "unibind/handle.h"
+#include "unibind/interop/v8.h"
 #include "unibind/isolate.h"
 #include "unibind/script.h"
 #include "unibind/value.h"
@@ -3230,5 +3231,20 @@ std::optional<Context> Context::New(Isolate& isolate) {
     }
     return Context(rec);
 }
+
+namespace interop {
+
+v8::Isolate* V8Isolate(Isolate& isolate) noexcept {
+    return detail::Raw(isolate);
+}
+
+v8::Local<v8::Context> V8Context(const Context& context) noexcept {
+    if (context.IsEmpty()) {
+        return {};
+    }
+    return detail::Raw(context);
+}
+
+}  // namespace interop
 
 }  // namespace ub

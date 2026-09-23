@@ -1050,7 +1050,12 @@ SpiderMonkey's is the `Debugger` object, a JavaScript API installed into a
 debuggee realm. They do not share a shape, a vocabulary or even a language. The
 only common C++ surface would be "ask the backend whether it has a debugger",
 which is a string, not an abstraction. A debugger belongs to a per-engine
-frontend built *on* unibind.
+frontend built *on* unibind - and for V8 that frontend needs the engine objects,
+which [`unibind/interop/v8.h`](include/unibind/interop/v8.h) hands out
+(`ub::interop::V8Isolate`, `ub::interop::V8Context`). It is the one header whose
+functions only one backend defines: put the code that calls it in a library
+linked only into the V8 build, and link something else in its place for
+SpiderMonkey.
 
 **Cross-realm access control is not expressible.** Two realms cannot be told to
 trust each other (V8 spells that as a shared security token; SpiderMonkey has

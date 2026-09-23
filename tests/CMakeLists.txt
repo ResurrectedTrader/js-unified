@@ -110,6 +110,21 @@ add_executable(unibind_bench bench/bench_main.cpp)
 target_link_libraries(unibind_bench PRIVATE unibind::unibind)
 
 # ---------------------------------------------------------------------------
+# unibind/interop/v8.h - defined by one backend, so tested outside the suite
+# ---------------------------------------------------------------------------
+if(UNIBIND_BACKEND STREQUAL "v8")
+    add_executable(unibind_interop_v8 interop_v8.cpp)
+    target_link_libraries(unibind_interop_v8 PRIVATE unibind::unibind)
+    target_include_directories(unibind_interop_v8 SYSTEM PRIVATE "${UNIBIND_V8_DIR}/include")
+    target_compile_definitions(unibind_interop_v8 PRIVATE V8_GN_HEADER NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(unibindEngineOwnsOperators)
+        target_link_options(unibind_interop_v8 PRIVATE "/FORCE:MULTIPLE")
+    endif()
+    add_test(NAME v8.interop COMMAND unibind_interop_v8)
+    set_tests_properties(v8.interop PROPERTIES TIMEOUT 120 LABELS "suite")
+endif()
+
+# ---------------------------------------------------------------------------
 # CTest: one test per case, so a failure names the case and not the binary
 # ---------------------------------------------------------------------------
 if(EXISTS "${doctest_DIR}/doctest.cmake")
