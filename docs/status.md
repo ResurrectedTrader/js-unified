@@ -643,10 +643,11 @@ a worker-thread count it is made uniform rather than left as a hint - decision
 11's principle, applied to the case it was written for.
 
 `PostJob` queues work from any thread and `PumpJobs` runs it, engine jobs first,
-then posted work, then round again, so work that settles a promise sees its
-continuations in the same pump. Ordered, never coalesced; whatever is queued when
-the isolate is destroyed is **dropped, not run**, said out loud because "it will
-run eventually" is what a caller would otherwise assume.
+then one piece of posted work, then round again, so work that settles a promise
+sees its continuations in the same pump, before the next piece of work. Ordered,
+never coalesced; whatever is queued when the isolate is destroyed is **dropped,
+not run**, said out loud because "it will run eventually" is what a caller would
+otherwise assume.
 
 And posting does not wake anything: work runs when the script thread next pumps,
 and **nothing accelerates that** short of terminating what is running. The

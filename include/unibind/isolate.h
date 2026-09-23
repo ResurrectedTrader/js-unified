@@ -847,10 +847,11 @@ class Isolate {
     /// native frame on the stack - after a `Script::Run`, at the bottom of your
     /// event loop.
     ///
-    /// Order: engine jobs first, then posted work, then round again, until both
-    /// are empty. Posted work that settles a promise therefore sees its
-    /// continuations run in the same pump, which is the behaviour that makes
-    /// one drain better than two.
+    /// Order: engine jobs first, then one piece of posted work, then round
+    /// again, until both are empty - an event loop's microtask checkpoint after
+    /// every task. Posted work that settles a promise therefore sees its
+    /// continuations run in the same pump, and before the next piece of posted
+    /// work does, which is the behaviour that makes one drain better than two.
     ///
     /// Both engines *can* drain their own job queue at moments of their
     /// choosing, and V8's default policy does exactly that when a call returns.
@@ -863,7 +864,10 @@ class Isolate {
     /// Anything a job throws is caught and discarded here: a pump is not a call
     /// and has nowhere to put an exception. A job that can fail should say so
     /// to the embedder. Nothing runs while a termination is pending, and the
-    /// queues survive it - cancel the termination and pump again.
+    /// queues survive it - cancel the termination and pump again. A stop that
+    /// lands during the pump, in a continuation or in a piece of posted work,
+    /// ends it there: the posted work behind it waits for the next pump after
+    /// the cancel.
     void PumpJobs();
 
     /// One typed embedder pointer per isolate, recovered as its real type or

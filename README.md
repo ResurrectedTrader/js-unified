@@ -902,10 +902,11 @@ isolate.PumpJobs();                                   // and its continuations r
 ```
 
 `PostJob` queues work from any thread, and the same pump runs it - engine jobs
-first, then posted work, then round again, so work that settles a promise sees
-its continuations in the same pump. Posting does not wake anything: **posted work
-runs when the script thread next pumps, and nothing accelerates that.** Whatever
-is still queued when the isolate is destroyed is dropped, not run.
+first, then one piece of posted work, then round again, so work that settles a
+promise sees its continuations in the same pump, before the next piece of work.
+Posting does not wake anything: **posted work runs when the script thread next
+pumps, and nothing accelerates that.** Whatever is still queued when the isolate
+is destroyed is dropped, not run.
 
 `PostDelayedJob(callback, data, delayInSeconds)` is the same with a floor on
 when: V8's `PostDelayedTask`, for the timer you would otherwise keep beside the

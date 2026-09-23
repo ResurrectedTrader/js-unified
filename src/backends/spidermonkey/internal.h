@@ -46,6 +46,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -134,7 +135,7 @@ struct Isolate::Impl {
         CallbackData data;
     };
     std::mutex jobMutex;
-    std::vector<PostedJob> jobs;
+    std::deque<PostedJob> jobs;
     /// `PostDelayedJob`'s work, keyed on when it falls due. A multimap keeps
     /// jobs that fall due together in the order they were posted, which is
     /// the order the header promises. Moved into `jobs` by `PumpJobs`.

@@ -3422,18 +3422,14 @@ void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double del
 }
 
 void Isolate::PumpJobs() {
-    // Nothing runs while a stop is in force, and the queues survive it: cancel
-    // the termination and pump again. Draining here would run work the embedder
-    // has just said it does not want run.
-    if (impl_->terminating.load(std::memory_order_acquire)) {
-        return;
-    }
-
-    // Engine jobs first, then posted work, then round again until both are
-    // empty - so a posted job that settles a promise sees its continuations run
-    // in the same pump, which is the behaviour that makes one drain better than
-    // two.
-    while (true) {
+    // Engine jobs, then one piece of posted work, then round again until both
+    // are empty - so the continuations a posted job queues run before the next
+    // job does, as they do on V8 and as an event loop's microtask checkpoint
+    // after every task has them. A stop ends the pump where it lands and leaves
+    // the posted work that has not run where it was: cancel the termination
+    // and pump again. Draining here would run work the embedder has just said
+    // it does not want run.
+    while (!impl_->terminating.load(std::memory_order_acquire)) {
         // SpiderMonkey never drains on its own: `js::UseInternalJobQueues` in
         // `Isolate::New` makes the engine queue promise jobs instead of having
         // nowhere to put them, and this is the only thing that runs them. What
@@ -3443,8 +3439,13 @@ void Isolate::PumpJobs() {
         if (JS_IsExceptionPending(impl_->cx)) {
             JS_ClearPendingException(impl_->cx);
         }
+        // A continuation may have been what was stopped, and then the posted
+        // work behind it waits for the cancel like everything else.
+        if (impl_->terminating.load(std::memory_order_acquire)) {
+            return;
+        }
 
-        std::vector<Impl::PostedJob> batch;
+        Impl::PostedJob job;
         {
             const std::lock_guard<std::mutex> lock(impl_->jobMutex);
             // Whatever has fallen due joins the queue first, in the order it
@@ -3455,25 +3456,20 @@ void Isolate::PumpJobs() {
                 impl_->jobs.push_back(delayed.begin()->second);
                 delayed.erase(delayed.begin());
             }
-            batch.swap(impl_->jobs);
-        }
-        if (batch.empty()) {
-            return;
-        }
-        for (const Impl::PostedJob& job : batch) {
-            // The lock is not held here on purpose: a job is allowed to post
-            // more work, and that work is drained by the next turn of this
-            // loop.
-            job.callback(*this, job.data);
-            // A pump is not a call and has nowhere to put an exception, so
-            // whatever a job throws stops here. A job that can fail says so to
-            // the embedder itself.
-            if (JS_IsExceptionPending(impl_->cx)) {
-                JS_ClearPendingException(impl_->cx);
-            }
-            if (impl_->terminating.load(std::memory_order_acquire)) {
+            if (impl_->jobs.empty()) {
                 return;
             }
+            job = impl_->jobs.front();
+            impl_->jobs.pop_front();
+        }
+        // The lock is not held here on purpose: a job is allowed to post more
+        // work, and that work is drained by a later turn of this loop.
+        job.callback(*this, job.data);
+        // A pump is not a call and has nowhere to put an exception, so whatever
+        // a job throws stops here. A job that can fail says so to the embedder
+        // itself.
+        if (JS_IsExceptionPending(impl_->cx)) {
+            JS_ClearPendingException(impl_->cx);
         }
     }
 }

@@ -3723,6 +3723,11 @@ void Isolate::PumpJobs() {
     // whole thing without emptying either queue: cancel it and pump again.
     while (!IsExecutionTerminating()) {
         impl_->isolate->PerformMicrotaskCheckpoint();
+        // A continuation may have been what was stopped, and then the posted
+        // work behind it waits for the cancel like everything else.
+        if (IsExecutionTerminating()) {
+            return;
+        }
 
         JobCallback callback = nullptr;
         CallbackData payload;
