@@ -1263,18 +1263,78 @@ std::optional<bool> DeleteProperty(const Context& context, Slot object, Slot key
 // Asking whether it exists first is one extra lookup on a cold path, and it is
 // the only way an absent property can answer "no attributes" rather than "the
 // default ones".
+//
+// And V8's own attribute query answers `None` for a proxy that reports no
+// descriptor, so the attributes are read from the descriptor itself, one
+// object up the chain at a time - `Object.getOwnPropertyDescriptor` at each,
+// prototypes as `GetPrototype` reads them, traps included - which is how the
+// other engine finds them. No descriptor anywhere, whatever `has` said, is no
+// attributes.
 std::optional<PropertyAttribute> GetPropertyAttributes(const Context& context, Slot object, Slot key) {
-    v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
-    v8::Local<v8::Value> name = Resolve(key);
-    v8::Maybe<bool> present = target->Has(Raw(context), name);
+    v8::Local<v8::Context> realm = Raw(context);
+    v8::Isolate* raw = Raw(OwnerOf(context));
+    v8::Local<v8::Object> holder = Resolve(object).As<v8::Object>();
+    v8::Local<v8::Name> name = Resolve(key).As<v8::Name>();
+    v8::Maybe<bool> present = holder->Has(realm, name);
     if (present.IsNothing() || !present.FromJust()) {
         return std::nullopt;
     }
-    v8::Maybe<v8::PropertyAttribute> attributes = target->GetPropertyAttributes(Raw(context), name);
-    if (attributes.IsNothing()) {
-        return std::nullopt;
+    while (true) {
+        v8::Local<v8::Value> found;
+        if (!holder->GetOwnPropertyDescriptor(realm, name).ToLocal(&found)) {
+            return std::nullopt;
+        }
+        if (found->IsObject()) {
+            v8::Local<v8::Object> descriptor = found.As<v8::Object>();
+            const auto flag = [&](const char* field) -> std::optional<bool> {
+                v8::Local<v8::Value> value;
+                if (!descriptor->Get(realm, v8::String::NewFromUtf8(raw, field).ToLocalChecked()).ToLocal(&value)) {
+                    return std::nullopt;
+                }
+                return value->BooleanValue(raw);
+            };
+            const std::optional<bool> enumerable = flag("enumerable");
+            const std::optional<bool> configurable = flag("configurable");
+            const v8::Maybe<bool> isData =
+                descriptor->HasOwnProperty(realm, v8::String::NewFromUtf8Literal(raw, "value"));
+            if (!enumerable || !configurable || isData.IsNothing()) {
+                return std::nullopt;
+            }
+            // Only a data descriptor has one; an accessor's lookup would reach
+            // `Object.prototype`, which script may have given a `writable`.
+            const std::optional<bool> writable = isData.FromJust() ? flag("writable") : std::optional<bool>(true);
+            if (!writable) {
+                return std::nullopt;
+            }
+            PropertyAttribute attributes = PropertyAttribute::None;
+            if (!*enumerable) {
+                attributes = attributes | PropertyAttribute::DontEnum;
+            }
+            if (!*configurable) {
+                attributes = attributes | PropertyAttribute::DontDelete;
+            }
+            if (!*writable) {
+                attributes = attributes | PropertyAttribute::ReadOnly;
+            }
+            return attributes;
+        }
+        v8::Local<v8::Value> next;
+        if (holder->IsProxy()) {
+            std::array<v8::Local<v8::Value>, 1> arguments{holder};
+            if (!RecOf(context)
+                     ->getPrototypeOf.Get(raw)
+                     ->Call(realm, v8::Undefined(raw), 1, arguments.data())
+                     .ToLocal(&next)) {
+                return std::nullopt;
+            }
+        } else {
+            next = holder->GetPrototype();
+        }
+        if (!next->IsObject()) {
+            return std::nullopt;
+        }
+        holder = next.As<v8::Object>();
     }
-    return static_cast<PropertyAttribute>(static_cast<uint8_t>(attributes.FromJust()));
 }
 
 std::optional<Slot> GetOwnPropertyNames(const Context& context, Slot object, KeyFilter filter) {

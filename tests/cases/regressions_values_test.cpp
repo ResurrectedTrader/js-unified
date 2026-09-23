@@ -351,3 +351,54 @@ TEST_CASE("regressions: an integer made from a large unsigned reads back as its 
         CHECK(integer.Int32Value() == integer.ToInt32(fixture.context).value_or(0));
     }
 }
+
+UNIBIND_TEST_CASE(PROPERTY_ATTRIBUTES,
+                  "regressions: a property with no descriptor has no attributes, even behind a proxy") {
+    // An absent property answers empty, not `None` - `None` is what an
+    // ordinary writable, enumerable, configurable property has. A proxy whose
+    // `has` says yes and whose `getOwnPropertyDescriptor` says nothing has no
+    // such property anywhere, and V8's attribute query answered `None` for it.
+    // The attributes come from the descriptor on both engines now, a proxy's
+    // trap included, one object up the chain at a time.
+    ub_test::Fixture fixture;
+    const auto name = ub_test::Str(fixture.iso(), "x");
+
+    const auto claiming = ub_test::Eval(fixture.context, R"(
+        new Proxy({}, { has() { return true; }, getOwnPropertyDescriptor() { return undefined; } }))")
+                              .To<ub::Object>();
+    REQUIRE(claiming.has_value());
+    {
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(claiming->GetPropertyAttributes(fixture.context, name).has_value());
+        CHECK_FALSE(handler.HasCaught());
+    }
+
+    // What a trap describes is what is reported - here, and inherited through
+    // a proxy on the chain.
+    const auto described = ub_test::Eval(fixture.context, R"(
+        new Proxy({}, {
+            has() { return true; },
+            getOwnPropertyDescriptor() { return { value: 1, writable: false, enumerable: false, configurable: true }; },
+        }))")
+                               .To<ub::Object>();
+    REQUIRE(described.has_value());
+    ub_test::Expose(fixture.context, "described", *described);
+    const auto inheriting = ub_test::Eval(fixture.context, "Object.create(described)").To<ub::Object>();
+    REQUIRE(inheriting.has_value());
+    for (const auto& object : {*described, *inheriting}) {
+        const auto attributes = object.GetPropertyAttributes(fixture.context, name);
+        REQUIRE(attributes.has_value());
+        CHECK(*attributes == (ub::PropertyAttribute::ReadOnly | ub::PropertyAttribute::DontEnum));
+    }
+
+    // An accessor has no ReadOnly, whatever `Object.prototype` says.
+    const auto accessor = ub_test::Eval(fixture.context, R"(
+        const made = Object.defineProperty({}, 'x', { get() { return 1; }, enumerable: true, configurable: true });
+        Object.prototype.writable = false;
+        made)")
+                              .To<ub::Object>();
+    REQUIRE(accessor.has_value());
+    const auto attributes = accessor->GetPropertyAttributes(fixture.context, name);
+    REQUIRE(attributes.has_value());
+    CHECK(*attributes == ub::PropertyAttribute::None);
+}
