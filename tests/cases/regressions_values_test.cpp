@@ -314,3 +314,23 @@ UNIBIND_TEST_CASE(SCRIPTS, "regressions: source that is not UTF-8 is a syntax er
         CHECK(handler.HasCaught());
     }
 }
+
+UNIBIND_TEST_CASE(ARRAYS, "regressions: a proxy over an array is an object, not an array") {
+    // An `Array` handle is one `Length()` can answer without running script -
+    // it is noexcept - so it is a real array, as V8's `IsArray` says. A proxy
+    // over one answers its length through a trap, which is script. One backend
+    // asked the language's `Array.isArray`, which sees through proxies, and
+    // called a proxy an Array.
+    ub_test::Fixture fixture;
+
+    const auto proxy = ub_test::Eval(fixture.context, "new Proxy([1, 2, 3], {})");
+    CHECK(proxy.Kind() == ub::ValueKind::Object);
+    CHECK_FALSE(proxy.IsArray());
+    CHECK_FALSE(proxy.Is<ub::Array>());
+    CHECK_FALSE(proxy.To<ub::Array>().has_value());
+    CHECK(proxy.Is<ub::Object>());
+
+    // Script still sees what the language says it sees.
+    ub_test::Expose(fixture.context, "proxy", proxy);
+    CHECK(ub_test::EvalTruth(fixture.context, "Array.isArray(proxy)"));
+}

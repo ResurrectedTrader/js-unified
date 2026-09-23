@@ -426,6 +426,13 @@ ValueKind KindOf(Slot value) noexcept {
         if (JS::IsCallable(object)) {
             return ValueKind::Function;
         }
+        // A proxy is not an Array, whatever it stands for: an `Array` handle is
+        // one `Length()` answers without running script, and a proxy answers
+        // it through a trap. That is V8's `IsArray`; the language's
+        // `Array.isArray` below looks through proxies.
+        if (js::IsProxy(object)) {
+            return ValueKind::Object;
+        }
         JSContext* cx = Raw(IsolateFor(value));
         // The object behind any wrapper, asked in its own realm: a question
         // about what it is belongs to it, and a wrapper's realm is not one the
@@ -478,7 +485,8 @@ bool IsType(Slot value, TypeCode type) noexcept {
         case TypeCode::Object:
             return raw.isObject() && !IsExternalObject(raw);
         case TypeCode::Array: {
-            if (!raw.isObject()) {
+            // Not a proxy, for the reason `KindOf` gives.
+            if (!raw.isObject() || js::IsProxy(Unwrapped(raw))) {
                 return false;
             }
             JSContext* cx = Raw(IsolateFor(value));

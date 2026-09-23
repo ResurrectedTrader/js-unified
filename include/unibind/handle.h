@@ -102,6 +102,8 @@ class Local {
     /// not: an External is a value with no properties, and `Is<Object>()` says
     /// the same.
     [[nodiscard]] bool IsObject() const noexcept { return detail::IsType(slot_, TypeCode::Object); }
+    /// An array itself, as V8 answers: a proxy over one is an Object, because
+    /// its length is a trap and `Length()` runs no script.
     [[nodiscard]] bool IsArray() const noexcept { return Kind() == ValueKind::Array; }
     [[nodiscard]] bool IsFunction() const noexcept { return Kind() == ValueKind::Function; }
     [[nodiscard]] bool IsExternal() const noexcept { return Kind() == ValueKind::External; }
