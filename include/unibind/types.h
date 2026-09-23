@@ -175,11 +175,15 @@ enum class WellKnownSymbol : std::uint8_t {
     ToStringTag,
 };
 
-/// The element types every engine's typed arrays have in common. See the
-/// "Binary data" section of `unibind/value.h` for what an embedder does with them.
+/// The element types of a typed array. See the "Binary data" section of
+/// `unibind/value.h` for what an embedder does with them.
 ///
-/// `BigInt64Array` and `BigUint64Array` are absent because this API has no way
-/// to make a BigInt, so an element of one could be read but never written.
+/// The last three are the kinds script has that a plain C++ array does not
+/// map onto one to one: `BigInt64` and `BigUint64` hold 64-bit integers that
+/// script reads as BigInts, and `Float16` has no standard C++ type here, so a
+/// `Float16Array` is made and read through its bytes. They are named because
+/// script can hand native any of them, and a view reported as some other kind
+/// would be read as that kind's bytes - which `CopyElements` exists to refuse.
 enum class ElementType : std::uint8_t {
     Int8,
     Uint8,
@@ -190,6 +194,9 @@ enum class ElementType : std::uint8_t {
     Uint32,
     Float32,
     Float64,
+    BigInt64,
+    BigUint64,
+    Float16,
 };
 
 /// Bytes per element of a typed array of this type.
@@ -201,12 +208,15 @@ enum class ElementType : std::uint8_t {
             return 1;
         case ElementType::Int16:
         case ElementType::Uint16:
+        case ElementType::Float16:
             return 2;
         case ElementType::Int32:
         case ElementType::Uint32:
         case ElementType::Float32:
             return 4;
         case ElementType::Float64:
+        case ElementType::BigInt64:
+        case ElementType::BigUint64:
             return 8;
     }
     return 0;

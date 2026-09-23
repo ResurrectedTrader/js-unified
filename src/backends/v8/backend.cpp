@@ -1247,6 +1247,12 @@ template <class View>
             return NewView<v8::Float32Array>(buffer, byteOffset, length);
         case ElementType::Float64:
             return NewView<v8::Float64Array>(buffer, byteOffset, length);
+        case ElementType::BigInt64:
+            return NewView<v8::BigInt64Array>(buffer, byteOffset, length);
+        case ElementType::BigUint64:
+            return NewView<v8::BigUint64Array>(buffer, byteOffset, length);
+        case ElementType::Float16:
+            return NewView<v8::Float16Array>(buffer, byteOffset, length);
     }
     return {};
 }
@@ -1309,6 +1315,15 @@ ElementType TypedArrayElementType(Slot view) noexcept {
     }
     if (raw->IsFloat32Array()) {
         return ElementType::Float32;
+    }
+    if (raw->IsBigInt64Array()) {
+        return ElementType::BigInt64;
+    }
+    if (raw->IsBigUint64Array()) {
+        return ElementType::BigUint64;
+    }
+    if (raw->IsFloat16Array()) {
+        return ElementType::Float16;
     }
     return ElementType::Float64;
 }

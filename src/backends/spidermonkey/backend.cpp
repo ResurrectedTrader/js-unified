@@ -1020,6 +1020,12 @@ namespace {
             return JS::Scalar::Uint32;
         case ElementType::Float32:
             return JS::Scalar::Float32;
+        case ElementType::BigInt64:
+            return JS::Scalar::BigInt64;
+        case ElementType::BigUint64:
+            return JS::Scalar::BigUint64;
+        case ElementType::Float16:
+            return JS::Scalar::Float16;
         case ElementType::Float64:
             break;
     }
@@ -1044,12 +1050,15 @@ namespace {
             return ElementType::Uint32;
         case JS::Scalar::Float32:
             return ElementType::Float32;
+        case JS::Scalar::BigInt64:
+            return ElementType::BigInt64;
+        case JS::Scalar::BigUint64:
+            return ElementType::BigUint64;
+        case JS::Scalar::Float16:
+            return ElementType::Float16;
         default:
             break;
     }
-    // BigInt64, BigUint64 and Float16 exist on this engine and not in the API's
-    // list. A view of one can only have come from script, and `Float64` is the
-    // least surprising thing to call it: it is the widest kind the API knows.
     return ElementType::Float64;
 }
 
@@ -1177,6 +1186,15 @@ Maybe<Slot> MakeTypedArray(const Context& context, ElementType type, Slot buffer
             break;
         case ElementType::Float64:
             view = JS_NewFloat64ArrayWithBuffer(cx, target, byteOffset, count);
+            break;
+        case ElementType::BigInt64:
+            view = JS_NewBigInt64ArrayWithBuffer(cx, target, byteOffset, count);
+            break;
+        case ElementType::BigUint64:
+            view = JS_NewBigUint64ArrayWithBuffer(cx, target, byteOffset, count);
+            break;
+        case ElementType::Float16:
+            view = JS_NewFloat16ArrayWithBuffer(cx, target, byteOffset, count);
             break;
     }
     if (view == nullptr) {

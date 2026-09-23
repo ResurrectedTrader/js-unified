@@ -1211,8 +1211,9 @@ section 7: enter the realm that owns the object. It is a line per hook, and it i
 not a workaround for something you could otherwise ask for - you cannot ask.
 
 **No BigInt factory.** The type is recognised (`ValueKind::BigInt`,
-`Is<BigInt>()`) but native cannot make one, so `BigInt64Array` and
-`BigUint64Array` are absent too: an element could be read and never written.
+`Is<BigInt>()`) but native cannot make one. A `BigInt64Array` or
+`BigUint64Array` is still made and read in bulk, as `std::int64_t` and
+`std::uint64_t`, because that goes through its bytes and not through a BigInt.
 
 **A heap about to hit its ceiling can only be *asked about* on one engine.**
 `Isolate::SetHeapLimitCallback` is V8's near-heap-limit hook and SpiderMonkey

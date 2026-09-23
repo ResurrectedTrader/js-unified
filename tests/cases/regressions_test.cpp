@@ -3,6 +3,7 @@
 /// here failed - or crashed - on the code before its fix, and passes on every
 /// backend after it. The comment on each says what it caught.
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -311,4 +312,46 @@ UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array over a detached buffe
     CHECK_FALSE(ub::TypedArray::New(fixture.context, ub::ElementType::Uint8, *buffer, 0, 0).has_value());
     // NOLINTEND(bugprone-unchecked-optional-access)
     CHECK_FALSE(fixture.iso().HasPendingException());
+}
+
+UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array of a kind the API had no name for is not read as doubles") {
+    // Script can make a `BigInt64Array`, a `BigUint64Array` and a
+    // `Float16Array`. Reporting any of them as `Float64` turned
+    // `CopyElements<double>` into a reinterpretation of their bytes - exactly
+    // the conversion it promises never to make.
+    ub_test::Fixture fixture;
+
+    struct Kind {
+        std::string_view source;
+        ub::ElementType type;
+    };
+    for (const Kind kind :
+         {Kind{.source = "new BigInt64Array([1n, -2n])", .type = ub::ElementType::BigInt64},
+          Kind{.source = "new BigUint64Array([1n, 2n])", .type = ub::ElementType::BigUint64},
+          Kind{.source = "new Float16Array([1.5, 2.5, 3.5, 4.5])", .type = ub::ElementType::Float16}}) {
+        CAPTURE(kind.source);
+        const auto view = ub_test::Eval(fixture.context, kind.source).To<ub::TypedArray>();
+        REQUIRE(view.has_value());
+        std::array<double, 4> out{};
+        // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+        CHECK(ub::GetElementType(*view) == kind.type);
+        CHECK(ub::CopyElements(*view, std::span<double>(out)) == 0);
+        // NOLINTEND(bugprone-unchecked-optional-access)
+    }
+
+    // And each kind has a name now, so it reads at its own width and can be
+    // made from native data like any other.
+    const auto bigs = ub_test::Eval(fixture.context, "new BigInt64Array([1n, -2n])").To<ub::TypedArray>();
+    REQUIRE(bigs.has_value());
+    std::array<std::int64_t, 2> read{};
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(ub::CopyElements(*bigs, std::span<std::int64_t>(read)) == 2);
+    CHECK(read == std::array<std::int64_t, 2>{1, -2});
+
+    const std::array<std::uint64_t, 2> written{7, 18446744073709551615ULL};
+    const auto made = ub::TypedArray::New(fixture.context, std::span<const std::uint64_t>(written));
+    REQUIRE(made.has_value());
+    ub_test::Expose(fixture.context, "made", *made);  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK(ub_test::EvalTruth(fixture.context,
+                             "made instanceof BigUint64Array && made[0] === 7n && made[1] === 2n ** 64n - 1n"));
 }

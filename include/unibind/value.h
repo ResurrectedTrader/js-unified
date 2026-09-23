@@ -331,6 +331,10 @@ template <>
 struct ElementTypeOfTag<float> : std::integral_constant<ElementType, ElementType::Float32> {};
 template <>
 struct ElementTypeOfTag<double> : std::integral_constant<ElementType, ElementType::Float64> {};
+template <>
+struct ElementTypeOfTag<std::int64_t> : std::integral_constant<ElementType, ElementType::BigInt64> {};
+template <>
+struct ElementTypeOfTag<std::uint64_t> : std::integral_constant<ElementType, ElementType::BigUint64> {};
 
 /// Raw bytes script can share. An `ArrayBuffer` has no elements of its own; a
 /// `TypedArray` is the view that gives it a width.
