@@ -219,9 +219,10 @@ class InspectorDispatcher {
     /// on a socket thread reaches a session.
     ///
     /// **A pause is not a safe point.** Script paused in
-    /// `InspectorClient::RunMessageLoopOnPause` checks for nothing, so a
-    /// request made then waits until script runs again - after the pause, or
-    /// inside an evaluation made in it. A pause loop therefore takes its
+    /// `InspectorClient::RunMessageLoopOnPause` checks for nothing - the engine
+    /// holds interrupts off for the whole pause, evaluations made in it
+    /// included - so a request made then waits for the pause to be over. A
+    /// pause loop therefore takes its
     /// messages from wherever the socket thread puts them, not from here: a
     /// `Debugger.resume` that could only arrive through a request would never
     /// arrive.

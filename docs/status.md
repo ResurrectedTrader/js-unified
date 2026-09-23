@@ -1076,8 +1076,12 @@ These had to be decided on top of V8's shape:
   `RunMessageLoopOnPause` and inside a callback of its own dispatch included:
   that is `Stop`, and the client hears nothing more from it. V8 supports that
   by design - it reaches a session through weak pointers across exactly those
-  calls - so nothing is deferred, and the suite holds each of these on every
-  backend that has an inspector.
+  calls - so nothing is deferred there. A notification is the exception: it is
+  sent from inside the agent that raised it, which V8 goes on using, so a
+  session destroyed or stopped inside one detaches at once and leaves the
+  engine's half for the next call into the inspector, the next pause, or a
+  wake-up. The suite holds each of these on every backend that has an
+  inspector.
 - **The default realm** - where an evaluation naming no context runs - is the
   one announced most recently and not yet withdrawn. The inspector holds realms
   weakly: DevTools seeing one is no reason for it to live.

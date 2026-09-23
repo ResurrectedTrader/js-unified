@@ -1064,9 +1064,9 @@ std::thread reader([dispatcher = inspector->Dispatcher(), &socket, &devTools] {
 point - inside a running script, which is how a busy isolate still answers, or
 at the next `PumpJobs` if it is idle - and that callback may dispatch. **A
 pause is neither**, which is why the pause loop above reads the inbox itself: a
-request made while script is paused waits until script runs again - after the
-pause, or inside an evaluation made in it - so a `Debugger.resume` that only
-reached the isolate through one would never arrive.
+request made while script is paused waits for the pause to be over - the engine
+holds interrupts off for the whole of it, evaluations made in it included - so a
+`Debugger.resume` that only reached the isolate through one would never arrive.
 The callback finds the inbox empty afterwards, which is what one queue read by
 both costs. `RequestDispatch` is safe from any thread at any time, including
 while the isolate's thread is destroying the inspector and after: no mutex of
