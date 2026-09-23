@@ -1649,10 +1649,20 @@ Maybe<bool> DefineProperty(const Context& context, Slot object, Slot key, Slot v
         return std::nullopt;
     }
     JS::RootedValue raw(op.cx);
-    if (!op.Value(value, &raw) || !JS_DefinePropertyById(op.cx, op.target, id, raw, ToNativeAttributes(attributes))) {
+    if (!op.Value(value, &raw)) {
         return std::nullopt;
     }
-    return true;
+    // The form that reports a refusal rather than throwing one: V8's
+    // `DefineOwnProperty` answers as `Reflect.defineProperty` does - false for
+    // a frozen object or a property that is not configurable - and is empty
+    // only when something threw.
+    JS::Rooted<JS::PropertyDescriptor> descriptor(op.cx,
+                                                  JS::PropertyDescriptor::Data(raw, ToNativeAttributes(attributes)));
+    JS::ObjectOpResult result;
+    if (!JS_DefinePropertyById(op.cx, op.target, id, descriptor, result)) {
+        return std::nullopt;
+    }
+    return result.ok();
 }
 
 Maybe<bool> SetAccessorProperty(const Context& context, Slot object, std::string_view name,

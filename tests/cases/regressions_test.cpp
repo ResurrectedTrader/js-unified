@@ -165,3 +165,28 @@ UNIBIND_TEST_CASE(DELAYED_JOBS, "regressions: a delay too long for the clock is 
     isolate.PumpJobs();
     CHECK(g_delayedRuns.load() == 0);
 }
+
+UNIBIND_TEST_CASE(OBJECTS, "regressions: defining a property an object refuses is false, not a throw") {
+    // V8's `DefineOwnProperty` answers the way `Reflect.defineProperty` does:
+    // a definition the object refuses - it is frozen, or the property is not
+    // configurable - is `false`, with nothing thrown. Empty would mean script
+    // threw, and nothing did.
+    ub_test::Fixture fixture;
+
+    const auto frozen = ub_test::Eval(fixture.context, "Object.freeze({ kept: 1 })").To<ub::Object>();
+    REQUIRE(frozen.has_value());
+
+    ub::TryCatch tryCatch(fixture.iso());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    const auto added = frozen->DefineOwnProperty(fixture.context, ub_test::Str(fixture.iso(), "added"),
+                                                 ub::Integer::New(fixture.iso(), 2));
+    CHECK(added == std::optional<bool>(false));
+    CHECK_FALSE(tryCatch.HasCaught());
+    tryCatch.Reset();
+
+    const auto changed = frozen->DefineOwnProperty(fixture.context, ub_test::Str(fixture.iso(), "kept"),
+                                                   ub::Integer::New(fixture.iso(), 3));
+    CHECK(changed == std::optional<bool>(false));
+    CHECK_FALSE(tryCatch.HasCaught());
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}

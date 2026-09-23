@@ -265,7 +265,10 @@ class Local {
     }
 
     /// Data property with explicit attributes; ignores setters on the
-    /// prototype chain, unlike `Set`.
+    /// prototype chain, unlike `Set`. False if the object refuses the
+    /// definition - it is frozen, or the property exists and is not
+    /// configurable - as `Reflect.defineProperty` answers; empty only if
+    /// something threw, such as a proxy's trap.
     template <class U>
     [[nodiscard]] std::optional<bool> DefineOwnProperty(const Context& context, const Local<Name>& key,
                                                         const Local<U>& value,
