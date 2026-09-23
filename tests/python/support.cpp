@@ -1,5 +1,7 @@
 #include "support.h"
 
+#include <atomic>
+
 namespace py_test {
 
 namespace {
@@ -81,6 +83,24 @@ std::string TextOf(const ub::Context& context, const ub::Local<ub::Value>& value
     auto converted = value.ToString(context);
     REQUIRE(converted.has_value());
     return converted->Utf8Value();
+}
+
+}  // namespace py_test
+
+namespace py_test {
+
+namespace {
+std::atomic<std::uint64_t> gOutOfMemoryReports{0};
+}  // namespace
+
+void OnEngineFault(const ub::EngineFaultReport& report, ub::CallbackData /*data*/) {
+    if (report.fault == ub::EngineFault::OutOfMemory) {
+        gOutOfMemoryReports.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::uint64_t OutOfMemoryReports() noexcept {
+    return gOutOfMemoryReports.load(std::memory_order_relaxed);
 }
 
 }  // namespace py_test
