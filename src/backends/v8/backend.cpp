@@ -3997,8 +3997,15 @@ void Isolate::SetHeapLimitCallback(HeapLimitCallback callback, CallbackData data
 }
 
 void Isolate::TerminateExecution() noexcept {
-    impl_->terminating.store(true, std::memory_order_release);
+    // The engine first and the flag second, the reverse of the cancel below,
+    // and the order is what makes a stop and a cancel racing from two threads
+    // end as one or the other. Flag first, a cancel landing between the two
+    // cleared the flag and then the engine, and the stop armed the engine again
+    // after it: an isolate that said it was not stopped, whose next script
+    // failed anyway. This way round, whenever the engine is left armed the
+    // flag is left set.
     impl_->isolate->TerminateExecution();
+    impl_->terminating.store(true, std::memory_order_release);
 }
 
 bool Isolate::IsExecutionTerminating() const noexcept {

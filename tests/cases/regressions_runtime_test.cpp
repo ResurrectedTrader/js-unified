@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -870,4 +871,55 @@ UNIBIND_TEST_CASE(TERMINATION, "regressions: a stopped isolate runs no getter, t
 
     fixture.iso().CancelTerminateExecution();
     CHECK(ub_test::EvalText(fixture.context, "ran.join(', ')").empty());
+}
+
+UNIBIND_TEST_CASE(TERMINATION, "regressions: a stop racing a cancel ends as one or the other, never as neither") {
+    // TerminateExecution from another thread, CancelTerminateExecution on the
+    // isolate's, at the same moment: either order is an answer - stopped, or
+    // not - but V8's backend could end with its own flag saying "not stopped"
+    // and the engine's termination still armed, when the cancel landed between
+    // the two halves of the stop. The next script then failed with no
+    // exception, while the isolate said it had not been stopped. Other threads
+    // keep the cores busy, which is what widens that gap enough to hit.
+    ub_test::Fixture fixture;
+    std::atomic<bool> done{false};
+    std::vector<std::thread> busy;
+    busy.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        busy.emplace_back([&done] {
+            std::uint32_t spin = 0;
+            while (!done.load(std::memory_order_relaxed)) {
+                spin = (spin * 1664525U) + 1013904223U;
+            }
+            (void)spin;
+        });
+    }
+    constexpr int ROUNDS = 100000;
+    std::atomic<int> phase{0};
+    std::thread stopper([&fixture, &phase] {
+        for (int round = 0; round < ROUNDS; ++round) {
+            while (phase.load(std::memory_order_acquire) != (2 * round) + 1) {
+            }
+            fixture.iso().TerminateExecution();
+            phase.store((2 * round) + 2, std::memory_order_release);
+        }
+    });
+    int neither = 0;
+    for (int round = 0; round < ROUNDS; ++round) {
+        phase.store((2 * round) + 1, std::memory_order_release);
+        fixture.iso().CancelTerminateExecution();
+        while (phase.load(std::memory_order_acquire) != (2 * round) + 2) {
+        }
+        if (!fixture.iso().IsExecutionTerminating()) {
+            const ub::TryCatch caught(fixture.iso());
+            neither += ub::Evaluate(fixture.context, "1").has_value() ? 0 : 1;
+        }
+        fixture.iso().CancelTerminateExecution();
+    }
+    stopper.join();
+    done = true;
+    for (std::thread& thread : busy) {
+        thread.join();
+    }
+    CHECK(neither == 0);
 }
