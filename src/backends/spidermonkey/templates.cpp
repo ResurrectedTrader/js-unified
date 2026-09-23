@@ -247,7 +247,7 @@ bool AccessorSetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
 }  // namespace
 
 bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& name, CallbackRecord* record,
-                    PropertyAttribute attributes) {
+                    PropertyAttribute attributes, JS::ObjectOpResult* result) {
     JS::RootedObject getter(cx);
     JS::RootedObject setter(cx);
     if (record->getter != nullptr) {
@@ -270,7 +270,11 @@ bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& n
     // JSPROP_READONLY is meaningless on an accessor, and SpiderMonkey rejects
     // it, so the ReadOnly bit is carried by the absence of a setter instead.
     const unsigned native = ToNativeAttributes(attributes) & ~static_cast<unsigned>(JSPROP_READONLY);
-    return JS_DefinePropertyById(cx, target, id, getter, setter, native);
+    if (result == nullptr) {
+        return JS_DefinePropertyById(cx, target, id, getter, setter, native);
+    }
+    JS::Rooted<JS::PropertyDescriptor> descriptor(cx, JS::PropertyDescriptor::Accessor(getter, setter, native));
+    return JS_DefinePropertyById(cx, target, id, descriptor, *result);
 }
 
 // ---------------------------------------------------------------------------

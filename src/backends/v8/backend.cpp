@@ -1987,9 +1987,16 @@ std::optional<bool> SetAccessorProperty(const Context& context, Slot object, std
              .ToLocal(&write)) {
         return std::nullopt;
     }
-    Resolve(object).As<v8::Object>()->SetAccessorProperty(key, read, write,
-                                                          RawAttributes(AccessorAttributes(attributes)));
-    return true;
+    // `DefineProperty` rather than `SetAccessorProperty`, which returns nothing
+    // and does nothing on a proxy, and which adds the property to a frozen
+    // object without a word: this reports a refusal as false, as
+    // `DefineOwnProperty` does, and goes through a proxy's trap.
+    v8::PropertyDescriptor descriptor(
+        read.IsEmpty() ? v8::Undefined(Raw(owner)).As<v8::Value>() : read.As<v8::Value>(),
+        write.IsEmpty() ? v8::Undefined(Raw(owner)).As<v8::Value>() : write.As<v8::Value>());
+    descriptor.set_enumerable(!HasAttribute(attributes, PropertyAttribute::DontEnum));
+    descriptor.set_configurable(!HasAttribute(attributes, PropertyAttribute::DontDelete));
+    return FromV8(Resolve(object).As<v8::Object>()->DefineProperty(raw, key, descriptor));
 }
 
 void TemplateSetTemplate(TemplateRec* tpl, std::string_view name, TemplateRec* value, PropertyAttribute attributes) {

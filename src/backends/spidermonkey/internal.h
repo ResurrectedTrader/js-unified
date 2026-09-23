@@ -754,8 +754,13 @@ class RealmGuard {
 /// whichever `record` has - are native functions carrying `record`. What a
 /// template's accessor declaration becomes on each instance, and what
 /// `Object::SetAccessor` makes on one object.
+///
+/// With `result` null a refusal - a frozen target, say - throws a TypeError, as
+/// it should for an instance being built. With one, a refusal is written there
+/// and nothing is thrown, which is `Object::SetAccessor`'s answer.
 [[nodiscard]] bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& name,
-                                  CallbackRecord* record, PropertyAttribute attributes);
+                                  CallbackRecord* record, PropertyAttribute attributes,
+                                  JS::ObjectOpResult* result = nullptr);
 
 /// The trampoline every native function declared through this API goes
 /// through. Recovers its `CallbackRecord` from the callee's reserved slot.

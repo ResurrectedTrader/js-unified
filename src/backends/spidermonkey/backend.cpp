@@ -1674,10 +1674,12 @@ Maybe<bool> SetAccessorProperty(const Context& context, Slot object, std::string
     }
     CallbackRecord* record =
         StoreCallback(context.GetIsolate(), CallbackRecord{.getter = getter, .setter = setter, .data = data});
-    if (record == nullptr || !DefineAccessor(op.cx, op.target, std::string(name), record, attributes)) {
+    // Refused is false, as for `DefineProperty` above.
+    JS::ObjectOpResult result;
+    if (record == nullptr || !DefineAccessor(op.cx, op.target, std::string(name), record, attributes, &result)) {
         return std::nullopt;
     }
-    return true;
+    return result.ok();
 }
 
 Maybe<bool> HasProperty(const Context& context, Slot object, Slot key) {

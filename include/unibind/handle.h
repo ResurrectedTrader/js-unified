@@ -288,6 +288,9 @@ class Local {
     /// `Object.getOwnPropertyDescriptor` reports `get` and `set` on both
     /// engines. With no setter it is read-only and `ReadOnly` adds nothing.
     ///
+    /// False if the object refuses the property, as for `DefineOwnProperty`;
+    /// on a proxy it goes through the `defineProperty` trap.
+    ///
     /// The callbacks are recorded for the life of the isolate, as a template's
     /// declarations are, so this is for objects made a bounded number of times
     /// - once per realm, say - and not for something made on every call.

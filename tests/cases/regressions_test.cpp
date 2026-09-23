@@ -4,6 +4,7 @@
 /// backend after it. The comment on each says what it caught.
 
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
@@ -189,4 +190,45 @@ UNIBIND_TEST_CASE(OBJECTS, "regressions: defining a property an object refuses i
     CHECK(changed == std::optional<bool>(false));
     CHECK_FALSE(tryCatch.HasCaught());
     // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+namespace {
+
+void ReadSeven(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
+    info.GetReturnValue().Set(std::int32_t{7});
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(OBJECT_ACCESSORS, "regressions: an accessor an object refuses is false, not a throw or a lie") {
+    // `SetAccessor` on an object that cannot take the property must say so the
+    // way `DefineOwnProperty` does, and must not have installed anything.
+    ub_test::Fixture fixture;
+
+    const auto frozen = ub_test::Eval(fixture.context, "Object.freeze({})").To<ub::Object>();
+    REQUIRE(frozen.has_value());
+
+    ub::TryCatch tryCatch(fixture.iso());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(frozen->SetAccessor(fixture.context, "seven", &ReadSeven) == std::optional<bool>(false));
+    CHECK_FALSE(tryCatch.HasCaught());
+    ub_test::Expose(fixture.context, "frozen", *frozen);
+    // NOLINTEND(bugprone-unchecked-optional-access)
+    CHECK(ub_test::EvalTruth(fixture.context, "!('seven' in frozen) && Object.isFrozen(frozen)"));
+}
+
+UNIBIND_TEST_CASE(OBJECT_ACCESSORS, "regressions: an accessor set on a proxy is defined through it") {
+    // A proxy is an object like any other to this API, and defining a property
+    // on one goes through its `defineProperty` trap - or, with none, onto its
+    // target. Answering true and installing nothing is the one wrong answer.
+    ub_test::Fixture fixture;
+
+    const auto proxy = ub_test::Eval(fixture.context, "globalThis.target = {}; new Proxy(target, {})").To<ub::Object>();
+    REQUIRE(proxy.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(proxy->SetAccessor(fixture.context, "seven", &ReadSeven) == std::optional<bool>(true));
+    ub_test::Expose(fixture.context, "proxy", *proxy);
+    // NOLINTEND(bugprone-unchecked-optional-access)
+    CHECK(ub_test::EvalInt(fixture.context, "proxy.seven") == 7);
+    CHECK(ub_test::EvalInt(fixture.context, "target.seven") == 7);
 }
