@@ -810,3 +810,21 @@ UNIBIND_TEST_CASE(REALMS, "regressions: a value made for a realm belongs to that
     CHECK(ub_test::EvalTruth(b, "madeCopy.buffer instanceof ArrayBuffer"));
     // NOLINTEND(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE(TEMPLATES, "regressions: a template member named like an array index is declared and named") {
+    // A name such as "1" is a property key like any other, and a function
+    // declared under it is named "1". On one engine the name is an integer
+    // key rather than a string, and making a function named by it crashed.
+    ub_test::Fixture fixture;
+
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.Set("1", &NamedMethod);
+    shape.SetAccessor("2", &NamedGetter);
+    shape.Set("3", ub::Constant(std::int32_t{9}));
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "indexed", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalText(fixture.context, "String([indexed[1](), indexed[1].name, indexed[2], indexed[3]])") ==
+          "2,1,3,9");
+}

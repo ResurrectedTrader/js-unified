@@ -218,6 +218,13 @@ JSFunction* NewNamedFunction(JSContext* cx, JSNative native, unsigned nargs, uns
     if (!NameToId(cx, name, &id)) {
         return nullptr;
     }
+    // A name that reads as an array index - "1" - is an integer key, not the
+    // atom the by-id factory takes. It is ASCII digits, which the `const char*`
+    // factory reads correctly.
+    if (!id.isAtom()) {
+        const std::string digits(name);
+        return js::NewFunctionWithReserved(cx, native, nargs, flags, digits.c_str());
+    }
     return js::NewFunctionByIdWithReserved(cx, native, nargs, flags, id);
 }
 
