@@ -57,6 +57,15 @@ if(NOT WIN32)
     message(FATAL_ERROR "unibind: the prebuilt engines are Windows static libraries; this tree is Windows-only.")
 endif()
 
+# The engines are MSVC-ABI libraries, so MinGW (an IDE's bundled default, often)
+# cannot link them. clang-cl and cl both set MSVC; refuse anything else here
+# rather than at a missing package or a link error much further on.
+if(NOT MSVC)
+    message(FATAL_ERROR
+        "unibind: ${CMAKE_CXX_COMPILER_ID} (${CMAKE_CXX_COMPILER}) is not an MSVC-ABI compiler. "
+        "The prebuilt engines link only with cl or clang-cl: use a Visual Studio toolchain.")
+endif()
+
 # x86 and x64 are both built and tested; anything else has no published engine
 # to link and no backend that has ever been compiled for it.
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
