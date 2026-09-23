@@ -12,22 +12,24 @@ backend without one can define none of them.
 
 **Where the two backends are.** Both implement everything the headers declare
 that their engines can do, decisions 1-29, and the suite agrees case for case:
-365 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
+398 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
 harness's own test of the skip path, which exists so that the machinery for
 reporting a missing area is exercised on every backend rather than only on the
 day one falls behind.
 
-Fourteen rows are `SKIPPED | PASSED`, and none of them is a backend falling
+Twenty-three rows are `SKIPPED | PASSED`, and none of them is a backend falling
 behind. Two are `HEAP_LIMIT`, decision 28's near-heap-limit hook: SpiderMonkey
 has no such thing to implement, so it defines nothing, a call does not link, and
 the two cases report a skip. That is the shape decision 19 designed for an
 absent operation, working as designed - it is a gap in the *engines*, and the
-report saying so is the point rather than a defect in it. Eleven are cases that
+report saying so is the point rather than a defect in it. Eighteen are cases that
 drive the inspector's protocol (decision 29), which ask `Inspector::Supported()`
 and report a skip where it says no - the same gap, reported the way decision 29
-says this one is. The last is a view over a `SharedArrayBuffer`, which a
-SpiderMonkey realm made here does not define, so the case asks script whether
-the constructor exists and reports a skip when it does not (`docs/testing.md`).
+says this one is. Two are views over a `SharedArrayBuffer`, which a SpiderMonkey
+realm made here does not define, so each case asks script whether the
+constructor exists and reports a skip when it does not (`docs/testing.md`). The
+last posts work until the queue cannot grow, and reports a skip where no
+allocation under it ever failed.
 
 - V8 15.6: `src/backends/v8/`.
 - SpiderMonkey 153.3.0esr: `src/backends/spidermonkey/`. Its own notes - what
