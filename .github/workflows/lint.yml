@@ -162,9 +162,18 @@ jobs:
         run: cmake --build build/tidy-${{ matrix.backend }} --target tests/generated/unibind_test_capabilities.h
 
       - name: clang-tidy
-        run: >
-          python "${env:UNIBIND_RUN_CLANG_TIDY}"
-          -clang-tidy-binary "${env:UNIBIND_CLANG_TIDY}"
-          -p build/tidy-${{ matrix.backend }}
-          -quiet
-          -warnings-as-errors='*'
+        run: |
+          # Read the next few hundred lines correctly. clang prints
+          # "N warnings generated." per translation unit, and N counts every
+          # diagnostic its engine raised *before* clang-tidy's header filter
+          # decided which ones concern us. Six figures is normal and appears on
+          # a run that reports nothing: it is the cost of parsing an engine
+          # header, not a finding about one. What this job fails on is the
+          # lines that name a file and a check. Read those.
+          "note: 'N warnings generated.' below is clang's pre-filter tally, not findings."
+          python "${env:UNIBIND_RUN_CLANG_TIDY}" `
+            -clang-tidy-binary "${env:UNIBIND_CLANG_TIDY}" `
+            -p build/tidy-${{ matrix.backend }} `
+            -quiet `
+            -warnings-as-errors='*'
+          if ($LASTEXITCODE -ne 0) { throw "clang-tidy reported findings" }
