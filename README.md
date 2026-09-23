@@ -21,7 +21,7 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting, a Chrome DevTools inspector |
 | V8 15.6 | implements all of it |
 | SpiderMonkey 153.3.0esr | implements all of it except two things its engine does not have: the near-heap-limit hook - a call to that one does not link, on purpose - and the inspector, which links and answers `Supported()` with false |
-| Tests | one suite, written once against `ub::`: 413 cases, green on both backends, every case compared backend against backend with no divergences |
+| Tests | one suite, written once against `ub::`: 418 cases, green on both backends, every case compared backend against backend with no divergences |
 | Not here | cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
@@ -125,13 +125,13 @@ to refuse the fetch outright and be told what to unpack where.
 bump repoints the tag, the asset and the directory together rather than
 silently reusing the old library.
 
-The number `ctest` prints is a little larger than 413 and depends on the tree,
+The number `ctest` prints is a little larger than 418 and depends on the tree,
 because it registers the suite's cases *and* a few things that cannot be cases
 among others: the whole suite again in one process, four checks that each need
 a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **413 cases is the figure that means the same thing everywhere** - it is
+built). **418 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
 different number of times on each engine, so V8 counts 10999 and SpiderMonkey
 10472, and neither number is the one to compare a run against.
@@ -697,7 +697,8 @@ counterClass.InstanceTemplate().SetAccessor("value", &ReadValueUntyped, &WriteVa
 ```
 
 That costs per instance on SpiderMonkey, which defines the member on each
-object as it is made.
+object as it is made - the getter and setter themselves are made once per
+realm and shared, as V8 shares a template's functions.
 
 Recovering the native is checked, and cannot lie:
 

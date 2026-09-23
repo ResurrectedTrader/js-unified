@@ -448,12 +448,126 @@ bool ApplyEntry(JSContext* cx, const Context& context, JS::HandleObject target, 
     return false;
 }
 
+// A template's function members, made once per realm and shared by every
+// object the template stamps - as V8 makes a template's functions once per
+// context. Replaying an instance template used to make a getter, a setter and
+// a name string per accessor per instance, which is most of what wrapping an
+// object with many members cost.
+//
+// Cached per realm as an array beside the materialised constructors: for entry
+// i, element 3i is its method or getter, 3i+1 its setter, and 3i+2 its name as
+// a property key. The array's length is the entry count it was built for, so
+// entries declared after it was built make it be built again.
+constexpr std::uint32_t SHARED_STRIDE = 3;
+
+[[nodiscard]] bool HasSharedFunctions(const TemplateRec* tpl) {
+    for (const TemplateEntry& entry : tpl->entries) {
+        if (entry.kind == TemplateEntry::Kind::Accessor || entry.kind == TemplateEntry::Kind::Method) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SharedFunctions(JSContext* cx, const Context& context, TemplateRec* tpl, JS::MutableHandleObject out) {
+    const auto wanted = static_cast<std::uint32_t>(tpl->entries.size() * SHARED_STRIDE);
+    if (CacheLookup(cx, context, 'f', tpl->id, out)) {
+        std::uint32_t length = 0;
+        if (!JS::GetArrayLength(cx, out, &length)) {
+            return false;
+        }
+        if (length == wanted) {
+            return true;
+        }
+    }
+    JS::RootedObject shared(cx, JS::NewArrayObject(cx, wanted));
+    if (shared == nullptr) {
+        return false;
+    }
+    JS::RootedValue first(cx);
+    JS::RootedValue second(cx);
+    JS::RootedValue key(cx);
+    JS::RootedId id(cx);
+    for (std::uint32_t i = 0; i < tpl->entries.size(); ++i) {
+        const TemplateEntry& entry = tpl->entries[i];
+        first.setUndefined();
+        second.setUndefined();
+        key.setUndefined();
+        if (entry.kind == TemplateEntry::Kind::Accessor) {
+            if (entry.record->getter != nullptr) {
+                JSObject* getter = NewAccessorFunction(cx, &AccessorGetterTrampoline, entry.record, entry.name);
+                if (getter == nullptr) {
+                    return false;
+                }
+                first.setObject(*getter);
+            }
+            if (entry.record->setter != nullptr) {
+                JSObject* setter = NewAccessorFunction(cx, &AccessorSetterTrampoline, entry.record, entry.name);
+                if (setter == nullptr) {
+                    return false;
+                }
+                second.setObject(*setter);
+            }
+        } else if (entry.kind == TemplateEntry::Kind::Method) {
+            JSObject* function = NewNativeFunction(cx, entry.record, entry.name);
+            if (function == nullptr) {
+                return false;
+            }
+            first.setObject(*function);
+        }
+        if (entry.kind == TemplateEntry::Kind::Accessor || entry.kind == TemplateEntry::Kind::Method) {
+            if (!NameToId(cx, entry.name, &id) || !JS_IdToValue(cx, id, &key)) {
+                return false;
+            }
+        }
+        if (!JS_SetElement(cx, shared, (i * SHARED_STRIDE), first) ||
+            !JS_SetElement(cx, shared, (i * SHARED_STRIDE) + 1, second) ||
+            !JS_SetElement(cx, shared, (i * SHARED_STRIDE) + 2, key)) {
+            return false;
+        }
+    }
+    if (!CacheStore(cx, context, 'f', tpl->id, shared)) {
+        return false;
+    }
+    out.set(shared);
+    return true;
+}
+
+/// Define entry `index` of `tpl` - an accessor or a method - on `target` from
+/// the realm's shared functions.
+bool ApplySharedEntry(JSContext* cx, JS::HandleObject target, JS::HandleObject shared, std::uint32_t index,
+                      const TemplateEntry& entry) {
+    JS::RootedValue first(cx);
+    JS::RootedValue second(cx);
+    JS::RootedValue key(cx);
+    JS::RootedId id(cx);
+    if (!JS_GetElement(cx, shared, (index * SHARED_STRIDE), &first) ||
+        !JS_GetElement(cx, shared, (index * SHARED_STRIDE) + 1, &second) ||
+        !JS_GetElement(cx, shared, (index * SHARED_STRIDE) + 2, &key) || !JS_ValueToId(cx, key, &id)) {
+        return false;
+    }
+    if (entry.kind == TemplateEntry::Kind::Method) {
+        return JS_DefinePropertyById(cx, target, id, first, ToNativeAttributes(entry.attributes));
+    }
+    JS::RootedObject getter(cx, first.isObject() ? &first.toObject() : nullptr);
+    JS::RootedObject setter(cx, second.isObject() ? &second.toObject() : nullptr);
+    // As DefineAccessor: no JSPROP_READONLY on an accessor.
+    const unsigned native = ToNativeAttributes(entry.attributes) & ~static_cast<unsigned>(JSPROP_READONLY);
+    return JS_DefinePropertyById(cx, target, id, getter, setter, native);
+}
+
 bool ApplyEntries(JSContext* cx, const Context& context, JS::HandleObject target, TemplateRec* tpl) {
     if (tpl == nullptr) {
         return true;
     }
-    for (const TemplateEntry& entry : tpl->entries) {
-        if (!ApplyEntry(cx, context, target, entry)) {
+    JS::RootedObject shared(cx);
+    if (HasSharedFunctions(tpl) && !SharedFunctions(cx, context, tpl, &shared)) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < tpl->entries.size(); ++i) {
+        const TemplateEntry& entry = tpl->entries[i];
+        const bool isShared = entry.kind == TemplateEntry::Kind::Accessor || entry.kind == TemplateEntry::Kind::Method;
+        if (isShared ? !ApplySharedEntry(cx, target, shared, i, entry) : !ApplyEntry(cx, context, target, entry)) {
             return false;
         }
     }

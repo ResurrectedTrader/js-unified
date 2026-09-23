@@ -837,3 +837,27 @@ UNIBIND_TEST_CASE(CALLABLE_CLASS, "classes: a class that did not opt in still re
     CHECK(CallShape::calls == 1);
     CHECK(Counter::alive == 1);
 }
+
+UNIBIND_TEST_CASE(CLASSES, "classes: instances share their instance template's accessor functions") {
+    // Every instance carries the accessors as own properties, but they are the
+    // same getter and setter each time, made once per realm - as V8 makes a
+    // template's functions once per context. Making them per instance is what
+    // made a wrapper with many members expensive.
+    Counter::Reset();
+    ub_test::Fixture fixture;
+
+    const auto cls = ub::Class<Counter>::New(fixture.iso(), "Many");
+    constexpr int MEMBERS = 50;
+    for (int i = 0; i < MEMBERS; ++i) {
+        cls.InstanceTemplate().SetAccessor("p" + std::to_string(i), &ReadValueOwn, &WriteValueOwn);
+    }
+    ub_test::Expose(fixture.context, "Many", *cls.GetConstructor(fixture.context));
+
+    ub_test::Expose(fixture.context, "a", *cls.Wrap(fixture.context, std::make_shared<Counter>(1)));
+    ub_test::Expose(fixture.context, "b", *cls.Wrap(fixture.context, std::make_shared<Counter>(2)));
+    CHECK(ub_test::EvalInt(fixture.context, "a.p7 + b.p7") == 3);
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        const da = Object.getOwnPropertyDescriptor(a, 'p7');
+        const db = Object.getOwnPropertyDescriptor(b, 'p7');
+        da.get === db.get && da.set === db.set)"));
+}
