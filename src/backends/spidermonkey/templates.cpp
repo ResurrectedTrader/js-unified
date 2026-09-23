@@ -1077,6 +1077,15 @@ JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl,
     if (owner != nullptr) {
         instance = JS_NewObjectWithGivenProto(cx, &owner->klass, prototype);
     } else if (intercepted) {
+        // A shape of no constructor makes an ordinary object, and an ordinary
+        // object inherits from `Object.prototype` - the plain branch below gets
+        // that from `JS_NewPlainObject`, and this one has to ask for it.
+        if (prototype == nullptr) {
+            prototype = JS::GetRealmObjectPrototype(cx);
+            if (prototype == nullptr) {
+                return nullptr;
+            }
+        }
         instance = JS_NewObjectWithGivenProto(cx, &TARGET_CLASS, prototype);
     } else if (prototype != nullptr) {
         instance = JS_NewObjectWithGivenProto(cx, nullptr, prototype);

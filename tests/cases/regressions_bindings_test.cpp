@@ -388,3 +388,30 @@ UNIBIND_TEST_CASE(TEMPLATES, "regressions: HasInstance asks what made an object,
         CHECK(child.HasInstance(*second, instance) == yes);   // NOLINT(bugprone-unchecked-optional-access)
     }
 }
+
+namespace {
+
+ub::Intercepted DeclineRead(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& /*info*/) {
+    return ub::Intercepted::No;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INTERCEPTORS, "regressions: an intercepted object from a plain template inherits from Object") {
+    // An object template that belongs to no function template makes ordinary
+    // objects, which inherit from `Object.prototype` - with a handler or
+    // without. SpiderMonkey's backend gave one with a handler no prototype at
+    // all, so it had no `toString`, `String(o)` threw, and it was not an
+    // `Object` to `instanceof`.
+    ub_test::Fixture fixture;
+    const auto shape = ub::ObjectTemplate::New(fixture.iso());
+    shape.SetHandler(ub::NamedPropertyHandler{.getter = &DeclineRead});
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "o", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalTruth(fixture.context, "Object.prototype.isPrototypeOf(o)"));
+    CHECK(ub_test::EvalTruth(fixture.context, "o instanceof Object"));
+    CHECK(ub_test::EvalText(fixture.context, "typeof o.hasOwnProperty") == "function");
+    CHECK(ub_test::EvalText(fixture.context, "String(o)") == "[object Object]");
+}
