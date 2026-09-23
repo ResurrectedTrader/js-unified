@@ -1188,8 +1188,24 @@ std::optional<Slot> GetProperty(const Context& context, Slot object, Slot key) {
     return PushMaybe(OwnerOf(context), Resolve(object).As<v8::Object>()->Get(Raw(context), Resolve(key)));
 }
 
+namespace {
+
+/// The largest array index, 2^32 - 2. The one `uint32_t` above it is an
+/// ordinary property name, and V8 cannot be handed it as an index: its by-index
+/// calls look the index up as a `size_t`, and on a 32-bit build 2^32 - 1 is
+/// `size_t(-1)` - the lookup's own "not an index" marker - so it goes looking
+/// for a name that is not there and crashes. As a key it is what script
+/// spells `o[4294967295]`, which V8 reads correctly everywhere.
+constexpr uint32_t MAX_ARRAY_INDEX = 0xFFFFFFFEU;
+
+}  // namespace
+
 std::optional<Slot> GetIndex(const Context& context, Slot object, uint32_t index) {
-    return PushMaybe(OwnerOf(context), Resolve(object).As<v8::Object>()->Get(Raw(context), index));
+    v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
+    if (index > MAX_ARRAY_INDEX) {
+        return PushMaybe(OwnerOf(context), target->Get(Raw(context), v8::Number::New(Raw(OwnerOf(context)), index)));
+    }
+    return PushMaybe(OwnerOf(context), target->Get(Raw(context), index));
 }
 
 std::optional<bool> SetProperty(const Context& context, Slot object, Slot key, Slot value) {
@@ -1197,7 +1213,11 @@ std::optional<bool> SetProperty(const Context& context, Slot object, Slot key, S
 }
 
 std::optional<bool> SetIndex(const Context& context, Slot object, uint32_t index, Slot value) {
-    return FromV8(Resolve(object).As<v8::Object>()->Set(Raw(context), index, Resolve(value)));
+    v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
+    if (index > MAX_ARRAY_INDEX) {
+        return FromV8(target->Set(Raw(context), v8::Number::New(Raw(OwnerOf(context)), index), Resolve(value)));
+    }
+    return FromV8(target->Set(Raw(context), index, Resolve(value)));
 }
 
 std::optional<bool> DefineProperty(const Context& context, Slot object, Slot key, Slot value,
