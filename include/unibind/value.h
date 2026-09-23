@@ -697,6 +697,9 @@ template <class T>
 /// once per value and decides for itself what an unserialisable one becomes,
 /// which keeps the list's shape and puts the decision where the caller can see
 /// it.
+///
+/// Why it failed is pending, as for any operation that threw: a DataCloneError
+/// for a value that will not clone, or whatever a getter met on the way threw.
 [[nodiscard]] inline std::optional<std::vector<std::uint8_t>> Serialize(const Context& context,
                                                                         const Local<Value>& value) {
     return detail::SerializeValue(context, value.slot());
@@ -708,6 +711,7 @@ template <class T>
 /// Empty if the blob is not one this engine build wrote, or is damaged. A blob
 /// is self-describing enough for both engines to refuse rather than misread
 /// one, which is the safety property the opacity above is paying for.
+/// What the engine threw on refusing it is pending.
 [[nodiscard]] inline std::optional<Local<Value>> Deserialize(const Context& context,
                                                              std::span<const std::uint8_t> blob) {
     return detail::WrapSlot<Value>(detail::DeserializeValue(context, blob));

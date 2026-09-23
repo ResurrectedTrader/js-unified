@@ -259,3 +259,34 @@ UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array over shared memory ha
     CHECK(ub::CopyElements<std::uint8_t>(*view, out) == 4);
     CHECK(out == std::array<std::uint8_t, 4>{7, 7, 7, 7});
 }
+
+UNIBIND_TEST_CASE(SERIALIZATION, "regressions: a value that will not clone says why, as a caught exception") {
+    // The failure convention: an operation that produced no value because
+    // something threw leaves the exception for the caller's `TryCatch`. Both
+    // engines throw here - a DataCloneError for a value that will not clone, a
+    // getter's own error for a getter that throws, an error for a blob that is
+    // not one. One backend caught and discarded all three, so a getter's
+    // exception vanished and the caller could not tell why nothing came back.
+    ub_test::Fixture fixture;
+
+    const auto function = ub_test::Eval(fixture.context, "(function () {})");
+    {
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(ub::Serialize(fixture.context, function).has_value());
+        CHECK(handler.HasCaught());
+    }
+    const auto getter = ub_test::Eval(fixture.context, "({ get x() { throw new Error('mine'); } })");
+    {
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(ub::Serialize(fixture.context, getter).has_value());
+        REQUIRE(handler.HasCaught());
+        CHECK(handler.Message(fixture.context).value_or("").find("mine") != std::string::npos);
+    }
+    {
+        ub::TryCatch handler(fixture.iso());
+        const std::vector<std::uint8_t> garbage{1, 2, 3, 4, 5};
+        CHECK_FALSE(ub::Deserialize(fixture.context, garbage).has_value());
+        CHECK(handler.HasCaught());
+    }
+    CHECK(ub_test::EvalInt(fixture.context, "6 * 7") == 42);
+}

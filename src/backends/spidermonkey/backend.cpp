@@ -1583,10 +1583,9 @@ Maybe<std::vector<std::uint8_t>> SerializeValue(const Context& context, Slot val
     if (!JS_WriteStructuredClone(cx, raw, &data, CLONE_SCOPE, policy, nullptr, nullptr, transferable)) {
         // A function, a class instance carrying a native, a proxy, or anything
         // holding one of those: the engine throws DataCloneError and the whole
-        // operation fails, which is what the header asks for. The throw is the
-        // engine telling us, not something the caller asked for, so it does not
-        // travel any further.
-        JS_ClearPendingException(cx);
+        // operation fails, which is what the header asks for. The throw stays
+        // pending, as V8's does - it is the only thing that says why, and a
+        // getter's own exception arrives the same way.
         return std::nullopt;
     }
 
@@ -1622,7 +1621,7 @@ Maybe<Slot> DeserializeValue(const Context& context, std::span<const std::uint8_
     // refused rather than misread. That is the safety the opacity is paying
     // for, and it is the engine's own check rather than one added here.
     if (!JS_ReadStructuredClone(cx, data, JS_STRUCTURED_CLONE_VERSION, CLONE_SCOPE, &out, policy, nullptr, nullptr)) {
-        JS_ClearPendingException(cx);
+        // Left pending, as the writer's is.
         return std::nullopt;
     }
     return PushOrNothing(OwnerOf(context), out);
