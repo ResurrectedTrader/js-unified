@@ -115,3 +115,24 @@ UNIBIND_TEST_CASE2(MESSAGE_LOCATION, CODE_CACHE,
     CHECK(location->sourceLine == std::optional<std::string>("null.property;"));
     // NOLINTEND(bugprone-unchecked-optional-access)
 }
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "regressions: a column offset moves the first line's columns and no other's") {
+    // `ScriptOrigin::columnOffset` says the source began that far into its
+    // first line - an inline script in a page, a template's expression. Every
+    // column on that line moves by it, and no column on any later line does.
+    ub_test::Fixture fixture;
+
+    const auto firstPlain = LocationOfThrow(fixture, "null.property;", {.resourceName = "col.js"});
+    const auto firstMoved = LocationOfThrow(fixture, "null.property;", {.resourceName = "col.js", .columnOffset = 10});
+    const auto secondPlain = LocationOfThrow(fixture, "var a = 1;\nnull.property;", {.resourceName = "col.js"});
+    const auto secondMoved =
+        LocationOfThrow(fixture, "var a = 1;\nnull.property;", {.resourceName = "col.js", .columnOffset = 10});
+    REQUIRE(firstPlain.has_value());
+    REQUIRE(firstMoved.has_value());
+    REQUIRE(secondPlain.has_value());
+    REQUIRE(secondMoved.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(firstMoved->columnNumber == firstPlain->columnNumber + 10);
+    CHECK(secondMoved->columnNumber == secondPlain->columnNumber);
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}

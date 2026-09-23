@@ -2647,6 +2647,16 @@ RefPtr<JS::Stencil> CompileToStencil(JSContext* cx, std::string_view source, con
     return JS::CompileGlobalScriptToStencil(cx, options, text);
 }
 
+/// Where the source says it came from. The column offset moves the columns of
+/// the first line only, as it does on V8 - it is where in its first line the
+/// source began. A negative one is taken as none: the engine counts columns
+/// from one and has no column before the first.
+void ApplyOrigin(JS::CompileOptions& engine, const std::string& resourceName, const ScriptOrigin& origin) {
+    engine.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
+    const auto columnOffset = static_cast<std::uint32_t>(origin.columnOffset > 0 ? origin.columnOffset : 0);
+    engine.setColumn(JS::ColumnNumberOneOrigin(columnOffset + 1));
+}
+
 /// The engine's compile options for a unibind one. Eager is "parse everything
 /// eagerly": every function body is parsed and given bytecode in the first
 /// pass, so the stencil - which is what the code cache encodes - holds all of
@@ -2671,7 +2681,7 @@ ScriptRec* CompileScript(const Context& context, std::string_view source, const 
 
     const std::string resourceName(origin.resourceName);
     JS::CompileOptions options(cx);
-    options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
+    ApplyOrigin(options, resourceName, origin);
     ApplyCompileOptions(options, compileOptions);
     return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false, source, origin);
 }
@@ -2686,7 +2696,7 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
 
     const std::string resourceName(origin.resourceName);
     JS::CompileOptions options(cx);
-    options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
+    ApplyOrigin(options, resourceName, origin);
     // Set before the decode as well as the compile, harmlessly: a decoded
     // stencil is whatever was encoded, and the option only reaches the
     // fallback below, which is where a refused blob has to be compiled eagerly
