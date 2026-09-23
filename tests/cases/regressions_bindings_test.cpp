@@ -771,3 +771,16 @@ UNIBIND_TEST_CASE(TEMPLATES, "regressions: Inherit chains the prototypes, not th
     CHECK(ub_test::EvalTruth(fixture.context, "Object.getPrototypeOf(Child) === Function.prototype"));
     CHECK(ub_test::EvalText(fixture.context, "typeof Child.parentStatic") == "undefined");
 }
+
+TEST_CASE("regressions: runaway recursion is an exception with the default stack limit too") {
+    // `IsolateOptions::stackLimitBytes` of 0 means the engine's default, and
+    // SpiderMonkey's default is no limit at all: nothing stops recursion but
+    // the end of the thread's stack. On x86 the frames were small enough that
+    // something else gave out first; on x64 plain script recursion took the
+    // process down. Every isolate is now held to the stack its thread has.
+    ub_test::Fixture fixture;
+    ub::TryCatch tryCatch(fixture.iso());
+    CHECK_FALSE(ub::Evaluate(fixture.context, "(function down() { return down() + 1; })()").has_value());
+    CHECK(tryCatch.HasCaught());
+    CHECK_FALSE(tryCatch.HasTerminated());
+}

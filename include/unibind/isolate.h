@@ -406,7 +406,8 @@ struct IsolateOptions {
 
     /// Native stack the engine may use before it stops recursing, in bytes,
     /// measured from wherever `Isolate::New` was called. 0 means the engine's
-    /// default.
+    /// default, held to the thread's real stack: one engine's default is no limit
+    /// at all, which is the limit a runaway recursion never reaches.
     ///
     /// This is the knob that turns runaway recursion in script into an
     /// exception the script can catch instead of a stack overflow in the host
@@ -781,7 +782,10 @@ class Isolate {
     /// lock is not one of them, and runs to completion first.
     ///
     /// Requests are ordered and each one runs once. What has not fired when the
-    /// isolate is destroyed is dropped.
+    /// isolate is destroyed is dropped. **An interrupt waits out a stop**:
+    /// one that meets a `TerminateExecution` at the same check, or is asked for
+    /// while one is in force, runs at the first check after the cancel - V8
+    /// takes a termination alone and cannot be made not to.
     ///
     /// **A pass runs until nothing is waiting**, so an interrupt asked for from
     /// inside a callback runs in the same pass, before the script moves on - on

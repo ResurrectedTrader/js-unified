@@ -3346,6 +3346,15 @@ bool OnInterrupt(JSContext* cx) {
         return true;
     }
 
+    // A stop goes first and alone, and the interrupts wait for the cancel -
+    // what V8 does when both are waiting at one check, and cannot be made not
+    // to: it takes the termination by itself and keeps the rest for the next
+    // script. Re-armed, so the leftover request brings this back for them.
+    if (isolate->impl().terminating.load(std::memory_order_acquire)) {
+        JS_RequestInterruptCallback(cx);
+        return false;
+    }
+
     // Whatever `RequestInterrupt` asked for, once each, in the order it was
     // asked - and round again until nothing is waiting, so an interrupt a
     // callback asks for runs in this pass, before the script moves on. That is
@@ -3611,9 +3620,13 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
     // opinion and will set whatever it is given. `StackQuotaFor` then
     // takes off the margin the engine needs to still be able to build and throw
     // the error once it has decided it is out of stack.
-    if (options.stackLimitBytes != 0) {
-        JS_SetNativeStackQuota(impl->cx, StackQuotaFor(UsableStackBytes(options.stackLimitBytes)));
-    }
+    //
+    // And set when none was asked for, too: this engine's own default is no
+    // quota at all, which is exactly the limit nothing reaches. So 0 is the
+    // thread's whole stack, less the same margin.
+    const std::size_t wantedStack =
+        options.stackLimitBytes != 0 ? options.stackLimitBytes : std::numeric_limits<std::size_t>::max();
+    JS_SetNativeStackQuota(impl->cx, StackQuotaFor(UsableStackBytes(wantedStack)));
     // Without a job queue the engine has nowhere to put a promise continuation.
     // The internal one queues them and runs nothing until `js::RunJobs`, which
     // is exactly what decision 23 asks for - `PumpJobs` the single point where
