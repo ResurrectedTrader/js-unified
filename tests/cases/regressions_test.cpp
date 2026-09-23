@@ -457,3 +457,43 @@ UNIBIND_TEST_CASE(INSPECTOR, "regressions: a realm announced twice is withdrawn 
     }
     CHECK(offered == 1);
 }
+
+namespace {
+
+struct Declined {
+    int value = 0;
+};
+
+std::unique_ptr<Declined> DeclineQuietly(const ub::CallbackInfo& /*info*/) {
+    return nullptr;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(CLASSES, "regressions: a constructor that declines without throwing still makes no instance") {
+    // A `Class<T>` promises that what comes out of it carries a `T`. A
+    // constructor that hands back null has declined to make one, whether or
+    // not it threw first - and `new` must then fail, rather than hand script
+    // an object with no native behind it that every method will refuse.
+    ub_test::Fixture fixture;
+
+    const auto cls = ub::Class<Declined>::New(fixture.iso(), "Declined");
+    cls.Construct<&DeclineQuietly>();
+    const auto constructor = cls.GetConstructor(fixture.context);
+    REQUIRE(constructor.has_value());
+    ub_test::Expose(fixture.context, "Declined", *constructor);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalText(fixture.context,
+                            "(() => { try { new Declined(); return 'made'; } "
+                            "catch (e) { return e instanceof Error ? 'refused' : 'odd'; } })()") == "refused");
+
+    // The same for a class that also answers to a plain call.
+    const auto callable = ub::Class<Declined>::New(fixture.iso(), "DeclinedToo");
+    callable.ConstructOrCall<&DeclineQuietly>();
+    const auto function = callable.GetConstructor(fixture.context);
+    REQUIRE(function.has_value());
+    ub_test::Expose(fixture.context, "DeclinedToo", *function);  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK(ub_test::EvalText(fixture.context,
+                            "(() => { try { DeclinedToo(); return 'made'; } "
+                            "catch (e) { return e instanceof Error ? 'refused' : 'odd'; } })()") == "refused");
+}

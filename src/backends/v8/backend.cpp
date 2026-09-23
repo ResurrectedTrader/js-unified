@@ -2399,7 +2399,13 @@ void ClassConstructTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
         box = rec->constructor(CallbackInfo(state));
     }
     if (box == nullptr) {
-        return;  // the callback threw, or declined
+        // The callback threw, or declined. Declining without a word must
+        // still fail the construction: returning here would hand script the
+        // receiver V8 made, an instance of the class with no native behind it.
+        if (!Raw(isolate)->HasPendingException()) {
+            ThrowError(isolate, ErrorKind::Error, "constructor declined to make an instance");
+        }
+        return;
     }
 
     if (constructing) {

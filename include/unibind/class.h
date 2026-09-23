@@ -249,7 +249,9 @@ template <class T>
 class Class {
    public:
     /// Makes the native for a `new Foo(...)` call. Return null after throwing
-    /// to reject the construction.
+    /// to reject the construction; null without a throw rejects it too, with
+    /// an `Error` saying the constructor declined - no instance without a
+    /// native ever reaches script.
     ///
     /// A *fresh* native, which is why this is a `std::unique_ptr` while a
     /// wrapper holds a share: `new` means a new instance, and the instance's
