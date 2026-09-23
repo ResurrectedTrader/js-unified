@@ -1141,8 +1141,9 @@ needs it.
   physical, external, malloced and global-handle figures are `std::optional`
   and empty on SpiderMonkey, whose only source for them is a full memory report
   that walks the heap. Empty rather than zero, because zero would be a claim.
-  SpiderMonkey's `totalBytes` is the chunks its collector has reserved, so it is
-  not a repeat of `usedBytes`; only `usedBytes` compares across engines, and
+  SpiderMonkey's `totalBytes` is the chunks its collector has reserved for the
+  heap, less the empty ones it keeps cached for reuse, so it is not a repeat of
+  `usedBytes`; only `usedBytes` compares across engines, and
   only as a trend.
 - **`ReturnValue` and `Local`'s predicates are header-only.** V8's integer
   setters (`int16_t` to `uint64_t`, each the integer when it fits in an

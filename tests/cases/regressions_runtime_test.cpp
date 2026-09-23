@@ -6,6 +6,7 @@
 /// fix, and passes on every backend after it. The comment on each says what it
 /// caught.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -520,4 +521,101 @@ UNIBIND_TEST_CASE(INSPECTOR, "regressions: a session may go, or stop, inside a n
 
     session.reset();
     inspector->ContextDestroyed(fixture.context);
+}
+
+namespace {
+
+/// Isolates on threads of their own, making garbage at the same time and
+/// posting to each other while they do.
+struct Crowd {
+    static constexpr int MEMBERS = 6;
+    static constexpr int ROUNDS = 30;
+    std::array<std::atomic<ub::Isolate*>, MEMBERS> isolates{};
+    std::atomic<int> arrived{0};
+    std::atomic<int> finished{0};
+    std::atomic<int> departed{0};
+    std::atomic<int> failures{0};
+    std::atomic<int> disagreements{0};
+    std::atomic<int> jobsRun{0};
+};
+
+void CrowdJob(ub::Isolate& /*isolate*/, ub::CallbackData data) {
+    data.As<Crowd>()->jobsRun.fetch_add(1);
+}
+
+void WaitFor(const std::atomic<int>& count, int target, ub::Isolate* pumping) {
+    while (count.load() < target) {
+        if (pumping != nullptr) {
+            pumping->PumpJobs();
+        }
+        std::this_thread::yield();
+    }
+}
+
+void CrowdMember(Crowd& crowd, int index) {
+    const auto isolate = ub::Isolate::New({.heapLimitBytes = std::size_t{64} * 1024 * 1024});
+    if (isolate == nullptr) {
+        crowd.failures.fetch_add(1);
+    }
+    crowd.isolates[static_cast<size_t>(index)] = isolate.get();
+    crowd.arrived.fetch_add(1);
+    WaitFor(crowd.arrived, Crowd::MEMBERS, nullptr);
+    if (isolate != nullptr) {
+        const ub::HandleScope scope(*isolate);
+        const auto context = ub::Context::New(*isolate);
+        REQUIRE(context.has_value());
+        const ub::ContextScope entered(*context);
+        for (int round = 0; round < Crowd::ROUNDS; ++round) {
+            for (const auto& other : crowd.isolates) {
+                if (ub::Isolate* target = other.load()) {
+                    (void)target->PostJob(&CrowdJob, ub::CallbackData::For(crowd));
+                }
+            }
+            const ub::TryCatch caught(*isolate);
+            if (!ub::Evaluate(*context, R"(
+                    (async () => {
+                        const kept = [];
+                        for (let i = 0; i < 20000; ++i) { kept.push({ i, s: 'x' + i }); if (i % 1000 == 0) await null; }
+                        return kept.length;
+                    })();
+                    var kept = new Array(50000).fill(0).map((_, i) => [i]); kept.length)")) {
+                crowd.failures.fetch_add(1);
+            }
+            isolate->PumpJobs();
+            const ub::HeapStatistics stats = isolate->GetHeapStatistics();
+            if (stats.usedBytes == 0 || stats.totalBytes < stats.usedBytes || stats.limitBytes < stats.totalBytes) {
+                crowd.disagreements.fetch_add(1);
+            }
+        }
+    }
+    crowd.finished.fetch_add(1);
+    WaitFor(crowd.finished, Crowd::MEMBERS, isolate.get());
+    // Nobody posts to an isolate once it has said it is going.
+    crowd.isolates[static_cast<size_t>(index)] = nullptr;
+    crowd.departed.fetch_add(1);
+    WaitFor(crowd.departed, Crowd::MEMBERS, isolate.get());
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(HEAP, JOBS, "regressions: heap figures agree with each other while isolates work side by side") {
+    // "Reserved space holds what is in use, under a ceiling that is above
+    // both" - what `isolate: the heap figures an engine reports agree with
+    // each other` asserts of a quiet heap. SpiderMonkey's reserved figure
+    // counted the empty chunks its collector keeps cached for reuse, and with
+    // several isolates collecting at once that cache alone outgrew the
+    // ceiling: a heap of five megabytes reported eighty reserved under a
+    // limit of sixty-four.
+    Crowd crowd;
+    std::vector<std::thread> members;
+    members.reserve(Crowd::MEMBERS);
+    for (int index = 0; index < Crowd::MEMBERS; ++index) {
+        members.emplace_back([&crowd, index] { CrowdMember(crowd, index); });
+    }
+    for (std::thread& member : members) {
+        member.join();
+    }
+    CHECK(crowd.failures.load() == 0);
+    CHECK(crowd.disagreements.load() == 0);
+    CHECK(crowd.jobsRun.load() == Crowd::MEMBERS * Crowd::MEMBERS * Crowd::ROUNDS);
 }

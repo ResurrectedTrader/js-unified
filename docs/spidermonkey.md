@@ -389,8 +389,11 @@ SpiderMonkey gives a native no closure pointer of its own. The realm's
 `Context` is recovered from a reserved slot on the current global.
 
 `GetHeapStatistics` reports `JSGC_BYTES` as `usedBytes` and, as `totalBytes`,
-the chunks the collector holds (`JSGC_TOTAL_CHUNKS` times `JSGC_CHUNK_BYTES`):
-the heap is reserved in chunks, so that is what has been reserved, used or not.
+the chunks the collector holds for the heap (`JSGC_TOTAL_CHUNKS` less
+`JSGC_UNUSED_CHUNKS`, times `JSGC_CHUNK_BYTES`): the heap is reserved in chunks,
+so that is what has been reserved, used or not. The empty chunks the collector
+keeps cached for reuse are left out, as V8 leaves its pooled pages out - with
+several isolates collecting at once that cache alone outgrew the heap's ceiling.
 The six figures V8 adds - physical, external, malloced and its peak, and the
 global-handle pool - are left empty. The engine's only source for them is a
 full memory report that walks the heap, which is not what a statistics call

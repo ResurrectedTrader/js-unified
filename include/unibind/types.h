@@ -271,7 +271,9 @@ struct HeapStatistics {
     std::uint64_t usedBytes = 0;
     /// Bytes the collector has reserved for the heap, used or not.
     std::uint64_t totalBytes = 0;
-    /// The ceiling the heap may grow to.
+    /// The ceiling the heap may grow to. It bounds `usedBytes`; `totalBytes`
+    /// sits under it too, except at the ceiling itself, where an engine that
+    /// reserves in whole chunks can hold a chunk or two more than it.
     std::uint64_t limitBytes = 0;
 
     /// Of `totalBytes`, how much is backed by physical memory.

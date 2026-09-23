@@ -3760,11 +3760,22 @@ void Isolate::ThrowError(ErrorKind kind, std::string_view message) {
 
 HeapStatistics Isolate::GetHeapStatistics() const noexcept {
     // The collector reserves its heap in chunks, so the chunks it holds are
-    // what it has reserved - used or not, which is what `totalBytes` asks.
-    const std::uint64_t chunks = JS_GetGCParameter(impl_->cx, JSGC_TOTAL_CHUNKS);
+    // what it has reserved - used or not, which is what `totalBytes` asks. Less
+    // the empty ones it keeps cached for reuse: those are the collector's spare
+    // pool rather than this heap's reservation - V8 leaves its pooled pages
+    // out of the same figure - and with several isolates collecting at once
+    // the cache alone outgrew the heap's ceiling.
+    //
+    // The figures are read one at a time while the collector's helper threads
+    // may be moving chunks between the two counts, so the difference is kept
+    // from going below zero or below what is in use.
+    const std::uint64_t all = JS_GetGCParameter(impl_->cx, JSGC_TOTAL_CHUNKS);
+    const std::uint64_t cached = JS_GetGCParameter(impl_->cx, JSGC_UNUSED_CHUNKS);
     const std::uint64_t chunkBytes = JS_GetGCParameter(impl_->cx, JSGC_CHUNK_BYTES);
-    return HeapStatistics{.usedBytes = JS_GetGCParameter(impl_->cx, JSGC_BYTES),
-                          .totalBytes = chunks * chunkBytes,
+    const std::uint64_t used = JS_GetGCParameter(impl_->cx, JSGC_BYTES);
+    const std::uint64_t reserved = (all > cached ? all - cached : 0) * chunkBytes;
+    return HeapStatistics{.usedBytes = used,
+                          .totalBytes = reserved > used ? reserved : used,
                           .limitBytes = JS_GetGCParameter(impl_->cx, JSGC_MAX_BYTES)};
 }
 
