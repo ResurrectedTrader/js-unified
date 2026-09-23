@@ -45,6 +45,41 @@
       "host": true,
       "platform": "windows"
     },
+    {
+      "name": "bzip2",
+      "default-features": false,
+      "platform": "windows & static"
+    },
+    {
+      "name": "expat",
+      "default-features": false,
+      "platform": "windows & static"
+    },
+    {
+      "name": "libffi",
+      "default-features": false,
+      "platform": "windows & static"
+    },
+    {
+      "name": "liblzma",
+      "default-features": false,
+      "platform": "windows & static"
+    },
+    {
+      "name": "openssl",
+      "default-features": false,
+      "platform": "windows & static"
+    },
+    {
+      "name": "sqlite3",
+      "default-features": false,
+      "platform": "windows & static"
+    },
+    {
+      "name": "vcpkg-pkgconfig-get-modules",
+      "host": true,
+      "platform": "windows & static"
+    },
     "zlib"
   ],
   "default-features": [
