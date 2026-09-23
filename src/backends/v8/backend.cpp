@@ -1637,7 +1637,7 @@ constexpr int VALUE_DATA_VALUE_FIELD = 1;
 /// always did.
 void ValueFunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Isolate& isolate = OwnerOf(info.GetIsolate());
-    v8::Local<v8::Object> bundle = info.DataV2().As<v8::Object>();
+    v8::Local<v8::Object> bundle = info.DataV2().As<v8::Value>().As<v8::Object>();
     const auto callback = reinterpret_cast<FunctionCallback>(bundle->GetInternalField(VALUE_DATA_CALLBACK_FIELD)
                                                                  .As<v8::Value>()
                                                                  .As<v8::External>()
@@ -3322,7 +3322,7 @@ bool Isolate::HasPendingException() const noexcept {
 }
 
 void Isolate::ThrowError(ErrorKind kind, std::string_view message) {
-    detail::ThrowError(*this, kind, message);
+    detail::ThrowErrorLossy(*this, kind, message);
 }
 
 HeapStatistics Isolate::GetHeapStatistics() const noexcept {

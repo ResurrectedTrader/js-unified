@@ -3311,7 +3311,7 @@ bool Isolate::HasPendingException() const noexcept {
 }
 
 void Isolate::ThrowError(ErrorKind kind, std::string_view message) {
-    detail::ThrowError(*this, kind, message);
+    detail::ThrowErrorLossy(*this, kind, message);
 }
 
 HeapStatistics Isolate::GetHeapStatistics() const noexcept {

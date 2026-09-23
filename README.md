@@ -21,7 +21,7 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting, a Chrome DevTools inspector |
 | V8 15.6 | implements all of it |
 | SpiderMonkey 153.3.0esr | implements all of it except two things its engine does not have: the near-heap-limit hook - a call to that one does not link, on purpose - and the inspector, which links and answers `Supported()` with false |
-| Tests | one suite, written once against `ub::`: 304 cases, green on both backends, every case compared backend against backend with no divergences |
+| Tests | one suite, written once against `ub::`: 305 cases, green on both backends, every case compared backend against backend with no divergences |
 | Not here | cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
@@ -131,10 +131,10 @@ among others: the whole suite again in one process, four checks that each need
 a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **304 cases is the figure that means the same thing everywhere** - it is
+built). **305 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
-different number of times on each engine, so V8 counts 8980 and SpiderMonkey
-8894, and neither number is the one to compare a run against.
+different number of times on each engine, so V8 counts 9000 and SpiderMonkey
+8914, and neither number is the one to compare a run against.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
 engine archives were built with, and therefore the one a consumer links
@@ -494,7 +494,11 @@ row of replacement characters where the caller thought it had text.
 `String::NewFromUtf8` is V8's lossy decode, for bytes that are meant to be
 repaired - each maximal invalid sequence becomes one U+FFFD, by the WHATWG rule
 V8 follows, and the same string comes out of both engines because the repair is
-done in the header.
+done in the header. The conveniences that take text an embedder usually did not
+write - `ReturnValue::Set(std::string_view)` and every way of throwing a fresh
+error (`ub::Throw`, `CallbackInfo::Throw`, `Isolate::ThrowError`, `MakeError`) -
+decode the same lossy way, as V8's do, so a stray byte in a file name costs a
+U+FFFD and not the whole return value or error.
 
 Widening is implicit and narrowing is checked:
 

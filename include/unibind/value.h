@@ -107,6 +107,22 @@ struct Utf8Step {
     return repaired;
 }
 
+/// Throw an error whose message is `NewFromUtf8`'s decode of `message`.
+///
+/// A message is diagnostic text an embedder builds from whatever it has to
+/// hand - a file path, a header, the text of something that failed - and V8
+/// makes one with its lossy decoder. So every public way of throwing a fresh
+/// error comes through here: one byte that is not UTF-8 costs a U+FFFD, not the
+/// error, and the backends are handed valid text as they are everywhere else.
+inline void ThrowErrorLossy(Isolate& isolate, ErrorKind kind, std::string_view message) {
+    const std::size_t firstInvalid = FirstInvalidUtf8(message);
+    if (firstInvalid == std::string_view::npos) {
+        ThrowError(isolate, kind, message);
+        return;
+    }
+    ThrowError(isolate, kind, ReplaceInvalidUtf8(message, firstInvalid));
+}
+
 }  // namespace detail
 
 /// Base of every tag. Deleting the constructor makes the whole lattice

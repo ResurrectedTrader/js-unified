@@ -22,8 +22,11 @@ namespace ub {
 
 /// Throw a fresh error. Takes effect when control returns to the engine; the
 /// caller should return promptly and not call further into the engine.
+///
+/// `message` is decoded as `String::NewFromUtf8` decodes: bytes that are not
+/// UTF-8 become U+FFFD rather than costing the error.
 inline void Throw(Isolate& isolate, ErrorKind kind, std::string_view message) {
-    detail::ThrowError(isolate, kind, message);
+    detail::ThrowErrorLossy(isolate, kind, message);
 }
 
 /// Throw an arbitrary value, as `throw x` does.
@@ -32,10 +35,16 @@ inline void Throw(Isolate& isolate, const Local<T>& value) {
     detail::ThrowValue(isolate, value.slot());
 }
 
-/// Make an Error object without throwing it.
+/// Make an Error object without throwing it. `message` is decoded as `Throw`
+/// decodes it.
 [[nodiscard]] inline std::optional<Local<Object>> MakeError(const Context& context, ErrorKind kind,
                                                             std::string_view message) {
-    return detail::WrapSlot<Object>(detail::MakeError(context, kind, message));
+    const std::size_t firstInvalid = detail::FirstInvalidUtf8(message);
+    if (firstInvalid == std::string_view::npos) {
+        return detail::WrapSlot<Object>(detail::MakeError(context, kind, message));
+    }
+    return detail::WrapSlot<Object>(
+        detail::MakeError(context, kind, detail::ReplaceInvalidUtf8(message, firstInvalid)));
 }
 
 /// Where the code running right now came from: the JavaScript frames below

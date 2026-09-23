@@ -100,6 +100,20 @@ void ReturnAKindOf(const ub::CallbackInfo& info) {
     }
 }
 
+/// Answers with, or throws, text that is not valid UTF-8 - what a callback
+/// reading a file or a socket is handed as often as not.
+void ReturnInvalidUtf8(const ub::CallbackInfo& info) {
+    if (!info.GetReturnValue().Set(std::string_view("a\xFF"
+                                                    "b"))) {
+        info.ThrowTypeError("could not make the string");
+    }
+}
+
+void ThrowInvalidUtf8(const ub::CallbackInfo& info) {
+    info.Throw(ub::ErrorKind::Error, std::string_view("bad \xC3("
+                                                      "name"));
+}
+
 /// Hands back what a `Global` holds, as a callback would return a value it
 /// keeps between calls.
 void ReturnHeld(const ub::CallbackInfo& info) {
@@ -255,6 +269,42 @@ TEST_CASE("functions: every way of answering a call works") {
     CHECK(ub_test::EvalTruth(fixture.context, "answer('uint64') === Number.MAX_SAFE_INTEGER"));
     CHECK(ub_test::EvalTruth(fixture.context, "answer('false') === false"));
     CHECK(ub_test::EvalTruth(fixture.context, "answer('empty') === ''"));
+}
+
+TEST_CASE("functions: text a callback returns or throws is decoded lossily, as V8 does") {
+    ub_test::Fixture fixture;
+
+    const auto answer = ub::Function::New(fixture.context, &ReturnInvalidUtf8);
+    const auto fail = ub::Function::New(fixture.context, &ThrowInvalidUtf8);
+    REQUIRE(answer.has_value());
+    REQUIRE(fail.has_value());
+    ub_test::Expose(fixture.context, "answer", *answer);
+    ub_test::Expose(fixture.context, "fail", *fail);
+
+    // One U+FFFD per invalid byte, not a missing value.
+    CHECK(ub_test::EvalTruth(fixture.context, "answer() === 'a\\uFFFDb'"));
+    // The error survives its message, and the message keeps the rest of its text.
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        (function () {
+            try { fail(); return false; }
+            catch (e) { return e instanceof Error && e.message === 'bad \uFFFD(name'; }
+        })()
+    )"));
+
+    // The same holds outside a callback.
+    {
+        ub::TryCatch caught(fixture.iso());
+        ub::Throw(fixture.iso(), ub::ErrorKind::TypeError, std::string_view("x\xF0y"));
+        REQUIRE(caught.HasCaught());
+        const auto message = caught.Message(fixture.context);
+        REQUIRE(message.has_value());
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+        CHECK(message->find("x\xEF\xBF\xBDy") != std::string::npos);
+    }
+    const auto made = ub::MakeError(fixture.context, ub::ErrorKind::Error, std::string_view("m\x80"));
+    REQUIRE(made.has_value());
+    ub_test::Expose(fixture.context, "made", *made);
+    CHECK(ub_test::EvalTruth(fixture.context, "made.message === 'm\\uFFFD'"));
 }
 
 TEST_CASE("functions: a callback can answer with a value it holds between calls") {

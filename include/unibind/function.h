@@ -132,8 +132,11 @@ class ReturnValue {
     /// set - as for `Set(std::string_view)`.
     [[nodiscard]] bool SetEmptyString() const { return Set(std::string_view()); }
 
-    /// Convenience for the common case; empty if the string could not be made,
-    /// in which case nothing was set.
+    /// Convenience for the common case, decoded as `String::NewFromUtf8`
+    /// decodes - the text a callback returns is as often read from outside
+    /// (a file, a socket, a database) as written in the source, and V8 returns
+    /// such text lossily rather than not at all. False if the engine could not
+    /// allocate, in which case nothing was set.
     [[nodiscard]] bool Set(std::string_view utf8) const;
     /// Without this, `Set("literal")` would pick the `bool` overload.
     [[nodiscard]] bool Set(const char* utf8) const { return Set(std::string_view(utf8)); }
@@ -187,7 +190,8 @@ class CallbackContextBase {
     /// Throw and stop. The exception takes effect when the callback returns;
     /// the callback should return immediately after calling this and must not
     /// call further into the engine.
-    void Throw(ErrorKind kind, std::string_view message) const { detail::ThrowError(GetIsolate(), kind, message); }
+    /// `message` is decoded as `ub::Throw` decodes it.
+    void Throw(ErrorKind kind, std::string_view message) const { detail::ThrowErrorLossy(GetIsolate(), kind, message); }
     void ThrowTypeError(std::string_view message) const { Throw(ErrorKind::TypeError, message); }
 
     /// Implementation detail: the backend's per-call state.
@@ -231,7 +235,7 @@ class PropertyCallbackInfo : public CallbackContextBase {
 };
 
 inline bool ReturnValue::Set(std::string_view utf8) const {
-    auto string = String::New(detail::CallbackIsolate(*state_), utf8);
+    auto string = String::NewFromUtf8(detail::CallbackIsolate(*state_), utf8);
     if (!string) {
         return false;
     }
