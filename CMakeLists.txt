@@ -1,5 +1,22 @@
 cmake_minimum_required(VERSION 3.25)
 
+# The python backend's engine is CPython from vcpkg - the `python` manifest
+# feature - so that nobody has to fetch it separately. It is asked for only when
+# that backend is configured, because building CPython costs minutes that a V8
+# or SpiderMonkey tree has no use for. This has to happen before `project()`,
+# which is when the vcpkg toolchain installs the manifest.
+#
+# The port itself is overlaid: see cmake/vcpkg-ports/README.md for the one
+# change, which is what makes vcpkg's static CPython linkable at all.
+if(UNIBIND_BACKEND STREQUAL "python")
+    if(NOT "python" IN_LIST VCPKG_MANIFEST_FEATURES)
+        list(APPEND VCPKG_MANIFEST_FEATURES "python")
+    endif()
+    if(NOT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-ports" IN_LIST VCPKG_OVERLAY_PORTS)
+        list(APPEND VCPKG_OVERLAY_PORTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-ports")
+    endif()
+endif()
+
 # vcpkg toolchain, if the caller did not already set one. UNIBIND_VCPKG_ROOT may be
 # passed on the command line; otherwise VCPKG_ROOT from the environment is used.
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
@@ -23,8 +40,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # --------------------------------------------------------------------------
 # Options
 # --------------------------------------------------------------------------
-set(UNIBIND_BACKEND "v8" CACHE STRING "JavaScript engine to build against: v8 | spidermonkey")
-set_property(CACHE UNIBIND_BACKEND PROPERTY STRINGS v8 spidermonkey)
+set(UNIBIND_BACKEND "v8" CACHE STRING "Engine to build against: v8 | spidermonkey | python")
+set_property(CACHE UNIBIND_BACKEND PROPERTY STRINGS v8 spidermonkey python)
 
 # The engine. Left empty, the build fetches the version below into
 # dependencies/ and uses that; set either one and nothing is downloaded, which
@@ -33,6 +50,8 @@ set(UNIBIND_V8_DIR "" CACHE PATH
     "Prebuilt V8: a directory holding include/ and v8_monolith.lib. Empty: fetch UNIBIND_V8_VERSION")
 set(UNIBIND_SPIDERMONKEY_DIR "" CACHE PATH
     "Prebuilt SpiderMonkey: a directory holding include/ and spidermonkey.lib. Empty: fetch UNIBIND_SPIDERMONKEY_VERSION")
+set(UNIBIND_PYTHON_DIR "" CACHE PATH
+    "Static CPython in vcpkg's installed layout: include/python3.X/, lib/python3X.lib, debug/lib/python3X_d.lib, tools/python3/Lib/. Empty: vcpkg's python3 port for this triplet")
 
 set(UNIBIND_V8_VERSION "15.6.8" CACHE STRING
     "Which published V8 build to fetch: the release tag is v8-<version>")
@@ -123,8 +142,8 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # that question belongs. `UNIBIND_BACKEND` selects what this tree builds and
 # installs, and nothing else.
 # --------------------------------------------------------------------------
-if(NOT UNIBIND_BACKEND STREQUAL "v8" AND NOT UNIBIND_BACKEND STREQUAL "spidermonkey")
-    message(FATAL_ERROR "unibind: unknown UNIBIND_BACKEND '${UNIBIND_BACKEND}' (expected v8 or spidermonkey)")
+if(NOT UNIBIND_BACKEND MATCHES "^(v8|spidermonkey|python)$")
+    message(FATAL_ERROR "unibind: unknown UNIBIND_BACKEND '${UNIBIND_BACKEND}' (expected v8, spidermonkey or python)")
 endif()
 
 # One value for the whole build tree: it changes sizeof(Local<T>), so a
@@ -352,6 +371,14 @@ if(UNIBIND_BACKEND STREQUAL "v8")
     set(UNIBIND_ENGINE_SYSTEM_LIBS
         winmm dbghelp advapi32 shlwapi ws2_32 user32 kernel32
         ole32 oleaut32 psapi version ntdll userenv bcrypt)
+elseif(UNIBIND_BACKEND STREQUAL "python")
+    # A static /MT CPython from vcpkg, like the other two engines a static
+    # library. What it does need at run time is its standard library, the
+    # `Lib/` directory - see docs/python.md.
+    set(UNIBIND_ENGINE_DIR "${UNIBIND_PYTHON_DIR}")
+    set(UNIBIND_ENGINE_LIB_NAME "lib/${UNIBIND_PYTHON_LIB_NAME}")
+    set(UNIBIND_MSBUILD_ENGINE_DIR_PROP "UnibindPythonDir")
+    set(UNIBIND_ENGINE_SYSTEM_LIBS ${UNIBIND_PYTHON_SYSTEM_LIBS})
 else()
     set(UNIBIND_ENGINE_DIR "${UNIBIND_SPIDERMONKEY_DIR}")
     set(UNIBIND_ENGINE_LIB_NAME "spidermonkey.lib")

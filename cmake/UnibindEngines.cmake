@@ -180,6 +180,14 @@ endfunction()
 # The knob stays what it always was: set the variable and nothing is downloaded,
 # whatever is or is not under dependencies/.
 function(unibind_provide_engine engine)
+    if(engine STREQUAL "python")
+        _unibind_provide_python()
+        foreach(out UNIBIND_PYTHON_DIR UNIBIND_PYTHON_INCLUDE_DIR UNIBIND_PYTHON_LIB_NAME UNIBIND_PYTHON_LIBS
+                    UNIBIND_PYTHON_SYSTEM_LIBS UNIBIND_PYTHON_STDLIB UNIBIND_PYTHON_VERSION)
+            set(${out} "${${out}}" PARENT_SCOPE)
+        endforeach()
+        return()
+    endif()
     if(engine STREQUAL "v8")
         set(variable "UNIBIND_V8_DIR")
     else()
@@ -242,4 +250,93 @@ function(unibind_spidermonkey_definitions target)
     if(flavour STREQUAL "debug")
         target_compile_definitions(${target} PRIVATE DEBUG MOZ_DIAGNOSTIC_ASSERT_ENABLED)
     endif()
+endfunction()
+
+# ---------------------------------------------------------------------------
+# CPython
+#
+# The third engine is not a published archive: it is vcpkg's `python3` port,
+# pulled in through this repository's `python` manifest feature (the root
+# CMakeLists.txt turns that on for UNIBIND_BACKEND=python). On the
+# `*-windows-static` triplets the port builds CPython as a **static library
+# against the static CRT** - exactly the shape of the other two engines - so
+# there is nothing to download by hand and no DLL to deploy.
+#
+# The price of a static CPython on Windows is that it cannot load C extension
+# modules: every `.pyd` links `python3X.dll`, which does not exist here. What is
+# available is what the core builds in (see docs/python.md for the list, and
+# for why that rules out asyncio and is fine).
+#
+# What a program does need at run time is the pure-Python half of the standard
+# library, `tools/python3/Lib`. `UNIBIND_PYTHON_STDLIB` records where it is, and
+# the backend bakes that in as its default - see docs/python.md, "Where the
+# standard library comes from".
+#
+# UNIBIND_PYTHON_DIR, when set, points at another prefix with the same layout
+# (include/python3.X/, lib/, debug/lib/, tools/python3/Lib/), and vcpkg is not
+# consulted.
+# ---------------------------------------------------------------------------
+function(_unibind_provide_python)
+    set(prefix "${UNIBIND_PYTHON_DIR}")
+    if(NOT prefix)
+        if(NOT DEFINED VCPKG_INSTALLED_DIR OR NOT DEFINED VCPKG_TARGET_TRIPLET)
+            message(FATAL_ERROR
+                "unibind: the python backend takes CPython from vcpkg, and this configure has no vcpkg toolchain. "
+                "Set UNIBIND_VCPKG_ROOT (or VCPKG_ROOT), or point -DUNIBIND_PYTHON_DIR=<prefix> at a static CPython.")
+        endif()
+        if(NOT VCPKG_TARGET_TRIPLET MATCHES "-static$")
+            message(FATAL_ERROR
+                "unibind: VCPKG_TARGET_TRIPLET is '${VCPKG_TARGET_TRIPLET}'. The python backend needs the static-CRT "
+                "CPython the *-windows-static triplets build; the presets set x86-windows-static / x64-windows-static.")
+        endif()
+        set(prefix "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+    endif()
+
+    file(GLOB includeDirs LIST_DIRECTORIES true "${prefix}/include/python3.*")
+    list(FILTER includeDirs INCLUDE REGEX "/python3\.[0-9]+$")
+    if(NOT includeDirs)
+        message(FATAL_ERROR "unibind: no include/python3.X under '${prefix}'. Is vcpkg's python feature installed?")
+    endif()
+    list(GET includeDirs 0 includeDir)
+    string(REGEX MATCH "python(3)\.([0-9]+)$" _ "${includeDir}")
+    set(version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+    set(tag "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+
+    set(release "${prefix}/lib/python${tag}.lib")
+    set(debug "${prefix}/debug/lib/python${tag}_d.lib")
+    if(NOT EXISTS "${release}")
+        message(FATAL_ERROR "unibind: no lib/python${tag}.lib under '${prefix}'")
+    endif()
+    set(stdlib "${prefix}/tools/python3/Lib")
+    if(NOT EXISTS "${stdlib}/os.py")
+        message(FATAL_ERROR "unibind: no standard library at '${stdlib}'")
+    endif()
+
+    # zlib is built into this CPython (vcpkg links its own), and the core calls
+    # into the Windows libraries below. A static library carries none of these,
+    # so they are link inputs of the backend.
+    find_library(zlibRelease NAMES zlib z zs PATHS "${prefix}/lib" NO_DEFAULT_PATH NO_CACHE)
+    find_library(zlibDebug NAMES zlibd zd zsd PATHS "${prefix}/debug/lib" NO_DEFAULT_PATH NO_CACHE)
+
+    set(libs "")
+    if(EXISTS "${debug}")
+        list(APPEND libs "$<$<CONFIG:Debug>:${debug}>" "$<$<NOT:$<CONFIG:Debug>>:${release}>")
+    else()
+        list(APPEND libs "${release}")
+    endif()
+    if(zlibRelease AND zlibDebug)
+        list(APPEND libs "$<$<CONFIG:Debug>:${zlibDebug}>" "$<$<NOT:$<CONFIG:Debug>>:${zlibRelease}>")
+    elseif(zlibRelease)
+        list(APPEND libs "${zlibRelease}")
+    endif()
+
+    set(UNIBIND_PYTHON_DIR "${prefix}" PARENT_SCOPE)
+    set(UNIBIND_PYTHON_INCLUDE_DIR "${includeDir}" PARENT_SCOPE)
+    set(UNIBIND_PYTHON_LIB_NAME "python${tag}.lib" PARENT_SCOPE)
+    set(UNIBIND_PYTHON_LIBS "${libs}" PARENT_SCOPE)
+    set(UNIBIND_PYTHON_SYSTEM_LIBS
+        version ws2_32 shlwapi pathcch bcrypt advapi32 user32 kernel32 ole32 oleaut32 PARENT_SCOPE)
+    set(UNIBIND_PYTHON_STDLIB "${stdlib}" PARENT_SCOPE)
+    set(UNIBIND_PYTHON_VERSION "${version}" PARENT_SCOPE)
+    message(STATUS "unibind: CPython ${version} (static, /MT) at ${prefix}")
 endfunction()

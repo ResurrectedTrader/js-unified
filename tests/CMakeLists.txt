@@ -4,6 +4,13 @@
 
 find_package(doctest CONFIG REQUIRED)
 
+# The python backend runs Python, not JavaScript, so this suite - and the parity
+# comparison built on it - does not apply to it. It has a suite of its own.
+if(UNIBIND_BACKEND STREQUAL "python")
+    add_subdirectory(python)
+    return()
+endif()
+
 # ---------------------------------------------------------------------------
 # What this backend can answer
 #
