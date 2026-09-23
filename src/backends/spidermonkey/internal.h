@@ -741,6 +741,20 @@ class RealmGuard {
 }
 
 [[nodiscard]] JSString* MakeRawString(JSContext* cx, std::string_view utf8) noexcept;
+/// A string of text the embedder declared - a property or function name, a
+/// template's string constant, an error message - decoded as
+/// `String::NewFromUtf8` decodes: bytes that are not UTF-8 become U+FFFD.
+/// `MakeRawString` is the strict form, for `String::New`.
+[[nodiscard]] JSString* MakeTextString(JSContext* cx, std::string_view utf8);
+/// The property key for a declared name, decoded as `MakeTextString` decodes.
+/// The engine's `const char*` name overloads read their argument as Latin-1,
+/// which turns every non-ASCII UTF-8 name into different text, and stop at a
+/// NUL; nothing a template or a class declares goes through them.
+[[nodiscard]] bool NameToId(JSContext* cx, std::string_view name, JS::MutableHandleId out);
+/// A native function with reserved slots, named by a declared name - see
+/// `NameToId` for why not `js::NewFunctionWithReserved`.
+[[nodiscard]] JSFunction* NewNamedFunction(JSContext* cx, JSNative native, unsigned nargs, unsigned flags,
+                                           std::string_view name);
 [[nodiscard]] bool ToPropertyKey(JSContext* cx, Slot key, JS::MutableHandleId out) noexcept;
 [[nodiscard]] unsigned ToNativeAttributes(PropertyAttribute attributes) noexcept;
 [[nodiscard]] JSExnType ToExnType(ErrorKind kind) noexcept;

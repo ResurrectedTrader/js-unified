@@ -616,3 +616,69 @@ UNIBIND_TEST_CASE(EXCEPTIONS, "regressions: a caught value's message is read wit
     REQUIRE(renamed.has_value());
     CHECK(renamed->find("Custom: the text") != std::string::npos);  // NOLINT(bugprone-unchecked-optional-access)
 }
+
+namespace {
+
+void NamedMethod(const ub::CallbackInfo& info) {
+    info.GetReturnValue().Set(std::int32_t{2});
+}
+
+void NamedGetter(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
+    info.GetReturnValue().Set(std::int32_t{3});
+}
+
+struct Named {};
+
+void NamedClassMethod(Named& /*self*/, const ub::CallbackInfo& info) {
+    info.GetReturnValue().Set(std::int32_t{4});
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(TEMPLATES, CLASSES, "regressions: a name a template or class declares is text, whatever its bytes") {
+    // Every name a template, a class or `SetAccessor` declares is UTF-8, as
+    // every other string handed to this API is, and reaches script as that
+    // text: `café` is four characters on both engines, not five on one. Bytes
+    // that are not UTF-8 are decoded as `String::NewFromUtf8` decodes them -
+    // a name is text an embedder may have read from anywhere - and are not a
+    // reason to end the process.
+    ub_test::Fixture fixture;
+    auto& isolate = fixture.iso();
+
+    const auto shape = ub::ObjectTemplate::New(isolate);
+    shape.Set("caf\xC3\xA9", ub::Constant(std::int32_t{1}));
+    shape.Set("na\xC3\xAFve", &NamedMethod);
+    shape.SetAccessor(
+        "\xC3\xBC"
+        "ber",
+        &NamedGetter);
+    shape.Set(std::string_view("bad\xFF", 4), ub::Constant(std::int32_t{5}));
+    shape.Set("text", ub::Constant("r\xC3\xA9sum\xC3\xA9"));
+    const auto instance = shape.NewInstance(fixture.context);
+    REQUIRE(instance.has_value());
+    ub_test::Expose(fixture.context, "shaped", *instance);  // NOLINT(bugprone-unchecked-optional-access)
+
+    const auto cls = ub::Class<Named>::New(isolate, "Na\xC3\xAFve");
+    cls.Method<&NamedClassMethod>("r\xC3\xA9sum\xC3\xA9");
+    const auto constructor = cls.GetConstructor(fixture.context);
+    REQUIRE(constructor.has_value());
+    ub_test::Expose(fixture.context, "NamedClass", *constructor);  // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalInt(fixture.context, "shaped['caf\u00e9']") == 1);
+    CHECK(ub_test::EvalInt(fixture.context, "shaped['na\u00efve']()") == 2);
+    CHECK(ub_test::EvalText(fixture.context, "shaped['na\u00efve'].name") == "na\xC3\xAFve");
+    CHECK(ub_test::EvalInt(fixture.context, "shaped['\u00fcber']") == 3);
+    CHECK(ub_test::EvalInt(fixture.context, "shaped['bad\ufffd']") == 5);
+    CHECK(ub_test::EvalText(fixture.context, "shaped.text") == "r\xC3\xA9sum\xC3\xA9");
+    CHECK(ub_test::EvalText(fixture.context, "NamedClass.name") == "Na\xC3\xAFve");
+    CHECK(ub_test::EvalTruth(fixture.context, "typeof NamedClass.prototype['r\u00e9sum\u00e9'] === 'function'"));
+
+    const auto object = ub::Object::New(fixture.context);
+    REQUIRE(object.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(object->SetAccessor(fixture.context, std::string_view("got\xFF", 4), &NamedGetter) ==
+          std::optional<bool>(true));
+    ub_test::Expose(fixture.context, "plain", *object);
+    // NOLINTEND(bugprone-unchecked-optional-access)
+    CHECK(ub_test::EvalInt(fixture.context, "plain['got\ufffd']") == 3);
+}

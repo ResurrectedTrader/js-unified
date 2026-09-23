@@ -630,8 +630,18 @@ namespace {
                                    static_cast<int>(text.size()));
 }
 
+/// A string of text the embedder declared - a property or function name, a
+/// class name, a template's string constant, a script's resource name -
+/// decoded as `String::NewFromUtf8` decodes: bytes that are not UTF-8 become
+/// U+FFFD. `NewString` is the strict form, for `String::New`, and refusing is
+/// not an answer here: there is nowhere to report it, and the check behind a
+/// refusal is one that ends the process.
 [[nodiscard]] v8::Local<v8::String> RawString(Isolate& isolate, std::string_view text) noexcept {
-    return NewString(isolate, text).ToLocalChecked();
+    const size_t firstInvalid = FirstInvalidUtf8(text);
+    if (firstInvalid == std::string_view::npos) {
+        return NewString(isolate, text).ToLocalChecked();
+    }
+    return NewString(isolate, ReplaceInvalidUtf8(text, firstInvalid)).ToLocalChecked();
 }
 
 [[nodiscard]] std::optional<bool> FromV8(v8::Maybe<bool> value) noexcept {

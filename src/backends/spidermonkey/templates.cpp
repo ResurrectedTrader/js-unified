@@ -229,14 +229,13 @@ bool AccessorSetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
 
 [[nodiscard]] JSObject* NewAccessorFunction(JSContext* cx, JSNative native, CallbackRecord* record,
                                             const std::string& name) {
-    JSFunction* function =
-        js::NewFunctionWithReserved(cx, native, native == &AccessorSetterTrampoline ? 1 : 0, 0, name.c_str());
+    JSFunction* function = NewNamedFunction(cx, native, native == &AccessorSetterTrampoline ? 1 : 0, 0, name);
     if (function == nullptr) {
         return nullptr;
     }
     JSObject* object = JS_GetFunctionObject(function);
     js::SetFunctionNativeReserved(object, FUNCTION_RECORD_SLOT, JS::PrivateValue(record));
-    JSString* text = MakeRawString(cx, name);
+    JSString* text = MakeTextString(cx, name);
     if (text == nullptr) {
         return nullptr;
     }
@@ -263,8 +262,7 @@ bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& n
         }
     }
     JS::RootedId id(cx);
-    JS::RootedString text(cx, MakeRawString(cx, name));
-    if (text == nullptr || !JS_StringToId(cx, text, &id)) {
+    if (!NameToId(cx, name, &id)) {
         return false;
     }
     // JSPROP_READONLY is meaningless on an accessor, and SpiderMonkey rejects
@@ -282,6 +280,16 @@ bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& n
 // ---------------------------------------------------------------------------
 
 namespace {
+
+/// Define `value` on `target` under a declared name. By key rather than by the
+/// engine's `const char*` overload, which reads a name as Latin-1; see
+/// `NameToId`.
+bool DefineNamed(JSContext* cx, JS::HandleObject target, const std::string& name, const JS::Value& value,
+                 PropertyAttribute attributes) {
+    JS::RootedValue rooted(cx, value);
+    JS::RootedId id(cx);
+    return NameToId(cx, name, &id) && JS_DefinePropertyById(cx, target, id, rooted, ToNativeAttributes(attributes));
+}
 
 bool ApplyConstant(JSContext* cx, JS::HandleObject target, const TemplateEntry& entry) {
     JS::RootedValue value(cx);
@@ -302,7 +310,7 @@ bool ApplyConstant(JSContext* cx, JS::HandleObject target, const TemplateEntry& 
             value.setInt32(entry.constant.AsInteger());
             break;
         case Constant::Kind::String: {
-            JSString* text = MakeRawString(cx, entry.text);
+            JSString* text = MakeTextString(cx, entry.text);
             if (text == nullptr) {
                 return false;
             }
@@ -310,7 +318,7 @@ bool ApplyConstant(JSContext* cx, JS::HandleObject target, const TemplateEntry& 
             break;
         }
     }
-    return JS_DefineProperty(cx, target, entry.name.c_str(), value, ToNativeAttributes(entry.attributes));
+    return DefineNamed(cx, target, entry.name, value, entry.attributes);
 }
 
 bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::MutableHandleObject functionOut,
@@ -328,7 +336,7 @@ bool ApplyEntry(JSContext* cx, const Context& context, JS::HandleObject target, 
             if (function == nullptr) {
                 return false;
             }
-            return JS_DefineProperty(cx, target, entry.name.c_str(), function, ToNativeAttributes(entry.attributes));
+            return DefineNamed(cx, target, entry.name, JS::ObjectValue(*function), entry.attributes);
         }
 
         case TemplateEntry::Kind::SymbolMethod: {
@@ -378,7 +386,7 @@ bool ApplyEntry(JSContext* cx, const Context& context, JS::HandleObject target, 
                     return false;
                 }
             }
-            return JS_DefineProperty(cx, target, entry.name.c_str(), function, ToNativeAttributes(entry.attributes));
+            return DefineNamed(cx, target, entry.name, JS::ObjectValue(*function), entry.attributes);
         }
     }
     return false;
@@ -422,7 +430,7 @@ bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::Mu
     }
 
     const std::string name = tpl->className.empty() ? std::string("") : tpl->className;
-    JSFunction* raw = js::NewFunctionWithReserved(cx, &ConstructorTrampoline, 0, JSFUN_CONSTRUCTOR, name.c_str());
+    JSFunction* raw = NewNamedFunction(cx, &ConstructorTrampoline, 0, JSFUN_CONSTRUCTOR, name);
     if (raw == nullptr) {
         return false;
     }

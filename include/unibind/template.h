@@ -126,6 +126,10 @@ std::optional<bool> TemplateHasInstance(const Context& context, TemplateRec* tpl
 
 /// The shape of an object: its properties, its accessors, and optionally an
 /// interceptor that answers for every property at once.
+///
+/// Every name declared here, on a `FunctionTemplate` or on a `Class<T>` - and a
+/// string `Constant` - is UTF-8 text and reaches script as that text; bytes
+/// that are not UTF-8 are decoded as `String::NewFromUtf8` decodes them.
 class ObjectTemplate {
    public:
     [[nodiscard]] static ObjectTemplate New(Isolate& isolate) {

@@ -194,6 +194,27 @@ JSString* MakeRawString(JSContext* cx, std::string_view utf8) noexcept {
     return JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(utf8.data(), utf8.size()));
 }
 
+JSString* MakeTextString(JSContext* cx, std::string_view utf8) {
+    const std::size_t firstInvalid = FirstInvalidUtf8(utf8);
+    if (firstInvalid == std::string_view::npos) {
+        return MakeRawString(cx, utf8);
+    }
+    return MakeRawString(cx, ReplaceInvalidUtf8(utf8, firstInvalid));
+}
+
+bool NameToId(JSContext* cx, std::string_view name, JS::MutableHandleId out) {
+    JS::RootedString text(cx, MakeTextString(cx, name));
+    return text != nullptr && JS_StringToId(cx, text, out);
+}
+
+JSFunction* NewNamedFunction(JSContext* cx, JSNative native, unsigned nargs, unsigned flags, std::string_view name) {
+    JS::RootedId id(cx);
+    if (!NameToId(cx, name, &id)) {
+        return nullptr;
+    }
+    return js::NewFunctionByIdWithReserved(cx, native, nargs, flags, id);
+}
+
 // Not `JS_EncodeStringToUTF8`: that hands back a NUL-terminated buffer, which
 // silently truncates a JavaScript string containing a NUL. Length first, then
 // exactly that many bytes.
@@ -898,8 +919,7 @@ bool FunctionTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
 }
 
 JSObject* NewNativeFunction(JSContext* cx, CallbackRecord* record, std::string_view name) {
-    const std::string owned(name);
-    JSFunction* function = js::NewFunctionWithReserved(cx, &FunctionTrampoline, 0, 0, owned.c_str());
+    JSFunction* function = NewNamedFunction(cx, &FunctionTrampoline, 0, 0, name);
     if (function == nullptr) {
         return nullptr;
     }
