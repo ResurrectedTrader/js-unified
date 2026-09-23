@@ -243,6 +243,12 @@ class FunctionTemplate {
     }
 
     void SetClassName(std::string_view name) const { detail::TemplateSetClassName(rec_, name); }
+    /// Puts `parent`'s prototype behind this template's, so its instances have
+    /// the parent's methods and accessors and `HasInstance` on the parent owns
+    /// them. Only the prototypes are chained - V8's rule: the constructor's own
+    /// prototype stays `Function.prototype`, so a static declared on the parent
+    /// is not on the child, and neither is anything on the parent's instance
+    /// template.
     void Inherit(const FunctionTemplate& parent) const { detail::TemplateInherit(rec_, parent.rec_); }
 
     /// Where instance methods and accessors go.

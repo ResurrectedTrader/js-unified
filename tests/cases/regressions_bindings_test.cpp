@@ -745,3 +745,29 @@ UNIBIND_TEST_CASE2(INTERCEPTORS, FUNCTION_VALUE_DATA,
         CHECK_FALSE(tryCatch.HasTerminated());
     }
 }
+
+UNIBIND_TEST_CASE(TEMPLATES, "regressions: Inherit chains the prototypes, not the constructors") {
+    // `FunctionTemplate::Inherit` is V8's, and V8 puts the parent's prototype
+    // behind the child's and leaves the two constructors alone: the child
+    // function's own prototype is `Function.prototype`, and a static declared
+    // on the parent is not on the child. SpiderMonkey's backend chained the
+    // constructors as a `class ... extends` would, so a parent's statics were
+    // reachable through the child on one engine only.
+    ub_test::Fixture fixture;
+    const auto parent = ub::FunctionTemplate::New(fixture.iso());
+    parent.Set("parentStatic", ub::Constant(3));
+    parent.PrototypeTemplate().Set("parentMember", ub::Constant(4));
+    const auto child = ub::FunctionTemplate::New(fixture.iso());
+    child.Inherit(parent);
+    const auto parentFunction = parent.GetFunction(fixture.context);
+    const auto childFunction = child.GetFunction(fixture.context);
+    REQUIRE(parentFunction.has_value());
+    REQUIRE(childFunction.has_value());
+    ub_test::Expose(fixture.context, "Parent", *parentFunction);  // NOLINT(bugprone-unchecked-optional-access)
+    ub_test::Expose(fixture.context, "Child", *childFunction);    // NOLINT(bugprone-unchecked-optional-access)
+
+    CHECK(ub_test::EvalTruth(fixture.context, "Object.getPrototypeOf(Child.prototype) === Parent.prototype"));
+    CHECK(ub_test::EvalInt(fixture.context, "new Child().parentMember") == 4);
+    CHECK(ub_test::EvalTruth(fixture.context, "Object.getPrototypeOf(Child) === Function.prototype"));
+    CHECK(ub_test::EvalText(fixture.context, "typeof Child.parentStatic") == "undefined");
+}

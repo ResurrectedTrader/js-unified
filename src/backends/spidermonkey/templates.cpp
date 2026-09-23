@@ -477,7 +477,10 @@ bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::Mu
         return CacheLookup(cx, context, 'p', tpl->id, prototypeOut);
     }
 
-    // The parent first, so this prototype can inherit from it.
+    // The parent first, so this prototype can inherit from it. Only the
+    // prototypes are chained, as V8's `Inherit` chains them: the constructor
+    // itself keeps `Function.prototype`, and the parent's statics stay the
+    // parent's.
     JS::RootedObject parentPrototype(cx);
     if (tpl->parent != nullptr) {
         JS::RootedObject parentFunction(cx);
@@ -526,13 +529,6 @@ bool Materialise(JSContext* cx, const Context& context, TemplateRec* tpl, JS::Mu
     JS::RootedValue functionValue(cx, JS::ObjectValue(*function));
     if (!JS_DefineProperty(cx, prototype, "constructor", functionValue, 0)) {
         return false;
-    }
-    if (tpl->parent != nullptr) {
-        JS::RootedObject parentFunction(cx);
-        if (CacheLookup(cx, context, 'c', tpl->parent->id, &parentFunction) &&
-            !JS_SetPrototype(cx, function, parentFunction)) {
-            return false;
-        }
     }
 
     functionOut.set(function);
