@@ -355,3 +355,62 @@ UNIBIND_TEST_CASE(BINARY_DATA, "regressions: a typed array of a kind the API had
     CHECK(ub_test::EvalTruth(fixture.context,
                              "made instanceof BigUint64Array && made[0] === 7n && made[1] === 2n ** 64n - 1n"));
 }
+
+namespace {
+
+std::vector<ub::StackFrame> g_capturedFrames;
+
+void CaptureCaller(const ub::CallbackInfo& info) {
+    g_capturedFrames = ub::CaptureStackFrames(info.GetIsolate());
+}
+
+/// Whether any frame names the engine's own built-in code rather than script.
+bool NamesBuiltinCode(const std::vector<ub::StackFrame>& frames) {
+    for (const ub::StackFrame& frame : frames) {
+        if (frame.scriptName != "frames.js") {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE2(STACK_FRAMES, MESSAGE_LOCATION,
+                   "regressions: frames and locations are script's, not the engine's built-ins") {
+    // A built-in such as `Array.prototype.reduce` is JavaScript inside one
+    // engine and native code inside the other. Either way it is not the
+    // embedder's script: a frame read off a stack names script, and an error a
+    // built-in throws is placed at the script that called it.
+    ub_test::Fixture fixture;
+
+    {
+        const auto script = ub::Script::Compile(
+            fixture.context, "function f() { return [].reduce((x, y) => x); }\nf();", {.resourceName = "frames.js"});
+        REQUIRE(script.has_value());
+        ub::TryCatch tryCatch(fixture.iso());
+        CHECK_FALSE(script->Run(fixture.context).has_value());
+        REQUIRE(tryCatch.HasCaught());
+        const auto frames = tryCatch.StackFrames(fixture.context);
+        REQUIRE(frames.has_value());
+        // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+        CHECK_FALSE(NamesBuiltinCode(*frames));
+        REQUIRE_FALSE(frames->empty());
+        CHECK(frames->front().functionName == "f");
+        const auto location = tryCatch.Location(fixture.context);
+        REQUIRE(location.has_value());
+        CHECK(location->scriptName == "frames.js");
+        CHECK(location->lineNumber == 1);
+        // NOLINTEND(bugprone-unchecked-optional-access)
+    }
+
+    const auto capture = ub::Function::New(fixture.context, &CaptureCaller);
+    REQUIRE(capture.has_value());
+    ub_test::Expose(fixture.context, "capture", *capture);  // NOLINT(bugprone-unchecked-optional-access)
+    const auto script = ub::Script::Compile(fixture.context, "[1].forEach(function each() { capture(); });",
+                                            {.resourceName = "frames.js"});
+    REQUIRE(script.has_value());
+    REQUIRE(script->Run(fixture.context).has_value());  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK_FALSE(NamesBuiltinCode(g_capturedFrames));
+    CHECK(g_capturedFrames.size() == 2);
+}

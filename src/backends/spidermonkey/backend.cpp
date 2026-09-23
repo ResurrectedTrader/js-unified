@@ -2315,34 +2315,46 @@ namespace {
 /// `limit` of 0 means everything the chain holds. Nothing here allocates an
 /// engine value the caller has to root: names come out as `std::string`, which
 /// is what makes `CaptureStackFrames` usable with no open `HandleScope`.
+///
+/// Only script's frames: every accessor is asked to skip the engine's
+/// self-hosted ones, which are this engine's built-ins - `Array.prototype.map`
+/// is JavaScript here and native code on V8 - so a stack names the same
+/// frames on both, and an error a built-in throws is placed at the script
+/// that called it rather than at a line of the engine's own source.
 std::vector<StackFrame> ReadSavedFrames(JSContext* cx, JS::HandleObject top, std::uint32_t limit) {
+    constexpr auto SCRIPT_ONLY = JS::SavedFrameSelfHosted::Exclude;
     std::vector<StackFrame> frames;
     JS::RootedObject frame(cx, top);
     while (frame != nullptr && (limit == 0 || frames.size() < limit)) {
         StackFrame out;
 
+        // Asked first, because it is also the question of whether any script
+        // frame is left: past the last one the answer is not `Ok`.
+        JS::RootedString source(cx);
+        if (JS::GetSavedFrameSource(cx, nullptr, frame, &source, SCRIPT_ONLY) != JS::SavedFrameResult::Ok) {
+            break;
+        }
+        if (source != nullptr) {
+            out.scriptName = EncodeToStdString(cx, source);
+        }
         JS::RootedString name(cx);
-        if (JS::GetSavedFrameFunctionDisplayName(cx, nullptr, frame, &name) == JS::SavedFrameResult::Ok &&
+        if (JS::GetSavedFrameFunctionDisplayName(cx, nullptr, frame, &name, SCRIPT_ONLY) == JS::SavedFrameResult::Ok &&
             name != nullptr) {
             out.functionName = EncodeToStdString(cx, name);
         }
-        JS::RootedString source(cx);
-        if (JS::GetSavedFrameSource(cx, nullptr, frame, &source) == JS::SavedFrameResult::Ok && source != nullptr) {
-            out.scriptName = EncodeToStdString(cx, source);
-        }
         std::uint32_t line = 0;
-        if (JS::GetSavedFrameLine(cx, nullptr, frame, &line) == JS::SavedFrameResult::Ok) {
+        if (JS::GetSavedFrameLine(cx, nullptr, frame, &line, SCRIPT_ONLY) == JS::SavedFrameResult::Ok) {
             out.lineNumber = static_cast<std::int32_t>(line);
         }
         JS::TaggedColumnNumberOneOrigin column;
-        if (JS::GetSavedFrameColumn(cx, nullptr, frame, &column) == JS::SavedFrameResult::Ok) {
+        if (JS::GetSavedFrameColumn(cx, nullptr, frame, &column, SCRIPT_ONLY) == JS::SavedFrameResult::Ok) {
             out.columnNumber = static_cast<std::int32_t>(column.oneOriginValue());
         }
 
         frames.push_back(std::move(out));
 
         JS::RootedObject parent(cx);
-        if (JS::GetSavedFrameParent(cx, nullptr, frame, &parent) != JS::SavedFrameResult::Ok) {
+        if (JS::GetSavedFrameParent(cx, nullptr, frame, &parent, SCRIPT_ONLY) != JS::SavedFrameResult::Ok) {
             break;
         }
         frame = parent;
