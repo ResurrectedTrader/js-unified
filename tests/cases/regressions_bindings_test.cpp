@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "support/harness.h"
 
@@ -335,4 +336,55 @@ UNIBIND_TEST_CASE2(TEMPLATES, INTERCEPTORS, "regressions: a template nested in a
     CHECK(ub_test::EvalText(fixture.context, "first.inner.anything") == "named");
     CHECK(log.seen == "nanything ");
     CHECK(ub_test::EvalTruth(fixture.context, "first.inner !== second.inner"));
+}
+
+UNIBIND_TEST_CASE(TEMPLATES, "regressions: HasInstance asks what made an object, not what its prototype chain says") {
+    // `HasInstance` is "whether the value was made by this template - the
+    // check to do before unwrapping", and V8 answers it from the template the
+    // object was made from. SpiderMonkey's backend answered `instanceof`
+    // instead, which script controls: an object made with
+    // `Object.create(F.prototype)` passed, an instance whose prototype was
+    // swapped failed, and so did every instance asked about from another realm.
+    ub_test::Fixture fixture;
+    const auto parent = ub::FunctionTemplate::New(fixture.iso());
+    const auto child = ub::FunctionTemplate::New(fixture.iso());
+    child.Inherit(parent);
+    const auto intercepted = ub::FunctionTemplate::New(fixture.iso());
+    intercepted.InstanceTemplate().SetHandler(ub::NamedPropertyHandler{.getter = &AnswerListedKeys});
+    for (const auto& [name, tpl] :
+         {std::pair{"Parent", parent}, std::pair{"Child", child}, std::pair{"Scoped", intercepted}}) {
+        const auto function = tpl.GetFunction(fixture.context);
+        REQUIRE(function.has_value());
+        ub_test::Expose(fixture.context, name, *function);  // NOLINT(bugprone-unchecked-optional-access)
+    }
+    const auto made = [&](std::string_view source) { return ub_test::Eval(fixture.context, source); };
+    const auto yes = std::optional<bool>(true);
+    const auto no = std::optional<bool>(false);
+
+    CHECK(parent.HasInstance(fixture.context, made("new Parent()")) == yes);
+    CHECK(parent.HasInstance(fixture.context, made("Object.create(Parent.prototype)")) == no);
+    CHECK(parent.HasInstance(fixture.context, made("Object.setPrototypeOf(new Parent(), {})")) == yes);
+    CHECK(parent.HasInstance(fixture.context, made("new (class extends Parent {})()")) == yes);
+    CHECK(parent.HasInstance(fixture.context, made("({})")) == no);
+
+    // Inheritance runs one way.
+    CHECK(parent.HasInstance(fixture.context, made("new Child()")) == yes);
+    CHECK(child.HasInstance(fixture.context, made("new Parent()")) == no);
+
+    // An intercepted instance is an instance, and nothing script wrote is.
+    CHECK(intercepted.HasInstance(fixture.context, made("new Scoped()")) == yes);
+    CHECK(intercepted.HasInstance(fixture.context, made("Object.create(Scoped.prototype)")) == no);
+    const auto shaped = intercepted.InstanceTemplate().NewInstance(fixture.context);
+    REQUIRE(shaped.has_value());
+    CHECK(intercepted.HasInstance(fixture.context, *shaped) == yes);  // NOLINT(bugprone-unchecked-optional-access)
+
+    // And from another realm, where neither prototype is the one it knows.
+    const auto instance = made("new Child()");
+    auto second = ub::Context::New(fixture.iso());
+    REQUIRE(second.has_value());
+    {
+        const ub::ContextScope entered(*second);              // NOLINT(bugprone-unchecked-optional-access)
+        CHECK(parent.HasInstance(*second, instance) == yes);  // NOLINT(bugprone-unchecked-optional-access)
+        CHECK(child.HasInstance(*second, instance) == yes);   // NOLINT(bugprone-unchecked-optional-access)
+    }
 }

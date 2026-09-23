@@ -245,8 +245,11 @@ class FunctionTemplate {
         return detail::WrapSlot<Function>(detail::TemplateGetFunction(context, rec_));
     }
 
-    /// Whether the value was made by this template, i.e. the check to do
-    /// before unwrapping.
+    /// Whether the value was made by this template, or by one that inherits
+    /// from it - the check to do before unwrapping. It asks what made the
+    /// object, never its prototype chain: `Object.create(F.prototype)` is not
+    /// an instance, one whose prototype was swapped still is, and the answer
+    /// is the same from any realm of the isolate.
     template <class T>
     [[nodiscard]] std::optional<bool> HasInstance(const Context& context, const Local<T>& value) const {
         return detail::TemplateHasInstance(context, rec_, value.slot());

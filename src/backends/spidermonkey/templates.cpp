@@ -13,6 +13,7 @@
 // bookkeeping of ours to get wrong.
 
 #include <js/Proxy.h>
+#include <js/WeakMap.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -957,6 +958,87 @@ bool InterceptorHandler::isExtensible(JSContext* cx, JS::HandleObject proxy, boo
     return JS_IsExtensible(cx, target, extensible);
 }
 
+/// The realm's record of which template made each of its template instances,
+/// or null - with nothing pending - if `create` is false and there is none yet.
+///
+/// A weak map on the realm's template cache, keyed by the instance as script
+/// sees it (the proxy, for an intercepted one) and holding the maker's
+/// `TemplateRec` as a private value. It keeps no instance alive, and an
+/// instance never changes realm, so its own realm's map is the one to ask.
+/// Plain objects stay plain objects: an object of a class of our own would
+/// answer `HasInstance` from a slot, but it would stop cloning the way a plain
+/// object clones, which is what V8 does with a template instance.
+JSObject* InstanceRegistry(JSContext* cx, JS::HandleObject cache, bool create) {
+    JS::RootedValue found(cx);
+    if (!JS_GetProperty(cx, cache, "instances", &found)) {
+        return nullptr;
+    }
+    if (found.isObject()) {
+        return &found.toObject();
+    }
+    if (!create) {
+        return nullptr;
+    }
+    JS::RootedObject registry(cx, JS::NewWeakMapObject(cx));
+    if (registry == nullptr) {
+        return nullptr;
+    }
+    JS::RootedValue value(cx, JS::ObjectValue(*registry));
+    if (!JS_DefineProperty(cx, cache, "instances", value, 0)) {
+        return nullptr;
+    }
+    return registry;
+}
+
+bool RecordMaker(JSContext* cx, const Context& context, JS::HandleObject instance, TemplateRec* maker) {
+    JS::RootedObject cache(cx, CacheObject(cx, context, true));
+    if (cache == nullptr) {
+        return false;
+    }
+    JS::RootedObject registry(cx, InstanceRegistry(cx, cache, true));
+    if (registry == nullptr) {
+        return false;
+    }
+    JS::RootedValue key(cx, JS::ObjectValue(*instance));
+    JS::RootedValue value(cx, JS::PrivateValue(maker));
+    return JS::SetWeakMapEntry(cx, registry, key, value);
+}
+
+/// The template that made `object`, which must not be a cross-compartment
+/// wrapper; null, with nothing pending, if no template did.
+bool MakerOf(JSContext* cx, JS::HandleObject object, TemplateRec** maker) {
+    *maker = nullptr;
+    JSObject* target = IsInterceptorProxy(object) ? InterceptorHandler::TargetOf(object) : object.get();
+    const JSClass* klass = JS::GetClass(target);
+    if (klass != nullptr && klass->hasFinalize() && klass->cOps->finalize == &InstanceFinalize) {
+        const JS::Value slot = JS::GetReservedSlot(target, INSTANCE_CLASS_SLOT);
+        if (!slot.isUndefined() && slot.toPrivate() != nullptr) {
+            *maker = static_cast<ClassRec*>(slot.toPrivate())->function;
+            return true;
+        }
+    }
+    JS::RootedObject global(cx, JS::GetNonCCWObjectGlobal(object));
+    const JSAutoRealm realm(cx, global);
+    const JS::Value slot = JS::GetReservedSlot(global, GLOBAL_TEMPLATE_CACHE_SLOT);
+    if (!slot.isObject()) {
+        return true;
+    }
+    JS::RootedObject cache(cx, &slot.toObject());
+    JS::RootedObject registry(cx, InstanceRegistry(cx, cache, false));
+    if (registry == nullptr) {
+        return !JS_IsExceptionPending(cx);
+    }
+    JS::RootedValue key(cx, JS::ObjectValue(*object));
+    JS::RootedValue found(cx);
+    if (!JS::GetWeakMapEntry(cx, registry, key, &found)) {
+        return false;
+    }
+    if (!found.isUndefined()) {
+        *maker = static_cast<TemplateRec*>(found.toPrivate());
+    }
+    return true;
+}
+
 /// A fresh instance of whatever `tpl` describes: a class instance if the
 /// template belongs to a `Class<T>`, an ordinary object otherwise - wrapped in
 /// an interceptor proxy if the shape declares a handler.
@@ -1015,16 +1097,25 @@ JSObject* NewInstanceOf(JSContext* cx, const Context& context, TemplateRec* tpl,
     if (!ApplyEntries(cx, context, instance, shape)) {
         return nullptr;
     }
-    if (!intercepted) {
-        return instance;
+    JS::RootedObject made(cx, instance);
+    if (intercepted) {
+        JS::RootedObject protoForProxy(cx);
+        if (!JS_GetPrototype(cx, instance, &protoForProxy)) {
+            return nullptr;
+        }
+        JS::RootedValue target(cx, JS::ObjectValue(*instance));
+        made = js::NewProxyObject(cx, &INTERCEPTOR_HANDLER, target, protoForProxy);
+        if (made == nullptr) {
+            return nullptr;
+        }
     }
-
-    JS::RootedObject protoForProxy(cx);
-    if (!JS_GetPrototype(cx, instance, &protoForProxy)) {
+    // A class instance says what made it in a slot of its own; anything else
+    // is a plain object, and is filed under its template instead. See
+    // `TemplateHasInstance`.
+    if (owner == nullptr && constructor != nullptr && !RecordMaker(cx, context, made, constructor)) {
         return nullptr;
     }
-    JS::RootedValue target(cx, JS::ObjectValue(*instance));
-    return js::NewProxyObject(cx, &INTERCEPTOR_HANDLER, target, protoForProxy);
+    return made;
 }
 
 void DestroyBox(NativeBox* box) noexcept {
@@ -1427,19 +1518,26 @@ Maybe<Slot> TemplateGetFunction(const Context& context, TemplateRec* tpl) {
 }
 
 Maybe<bool> TemplateHasInstance(const Context& context, TemplateRec* tpl, Slot value) {
+    // Whether a template made the object - this one, or one that inherits
+    // from it - as V8 answers, and not `instanceof`: that reads a prototype
+    // chain script can rewrite, and from another realm finds none of the
+    // prototypes it knows.
     JSContext* cx = Raw(context);
     RealmGuard realm(context);
-    JS::RootedObject function(cx);
-    JS::RootedObject prototype(cx);
-    if (!Materialise(cx, context, tpl, &function, &prototype)) {
+    JS::RootedObject object(cx, Unwrapped(Resolve(value)));
+    if (object == nullptr) {
+        return false;
+    }
+    TemplateRec* maker = nullptr;
+    if (!MakerOf(cx, object, &maker)) {
         return std::nullopt;
     }
-    JS::RootedValue candidate(cx);
-    bool result = false;
-    if (!ResolveHere(cx, value, &candidate) || !JS_HasInstance(cx, function, candidate, &result)) {
-        return std::nullopt;
+    for (; maker != nullptr; maker = maker->parent) {
+        if (maker == tpl) {
+            return true;
+        }
     }
-    return result;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
