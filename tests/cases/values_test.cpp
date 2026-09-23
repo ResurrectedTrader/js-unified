@@ -101,6 +101,58 @@ TEST_CASE("values: asking what a revoked proxy is answers, and leaves nothing pe
     CHECK_FALSE(fixture.iso().HasPendingException());
 }
 
+TEST_CASE("values: V8's type predicates answer as V8 does") {
+    ub_test::Fixture fixture;
+    const auto& context = fixture.context;
+
+    const auto undef = ub_test::Eval(context, "undefined");
+    CHECK(undef.IsUndefined());
+    CHECK(undef.IsNullOrUndefined());
+    CHECK_FALSE(undef.IsNull());
+    CHECK_FALSE(undef.IsObject());
+
+    const auto null = ub_test::Eval(context, "null");
+    CHECK(null.IsNull());
+    CHECK(null.IsNullOrUndefined());
+    CHECK_FALSE(null.IsObject());  // typeof null is 'object'; V8's IsObject says no
+
+    CHECK(ub_test::Eval(context, "true").IsTrue());
+    CHECK(ub_test::Eval(context, "false").IsFalse());
+    CHECK(ub_test::Eval(context, "false").IsBoolean());
+    CHECK_FALSE(ub_test::Eval(context, "1").IsTrue());  // truthy is not true
+
+    CHECK(ub_test::Eval(context, "'text'").IsString());
+    CHECK(ub_test::Eval(context, "'text'").IsName());
+    CHECK(ub_test::Eval(context, "Symbol('s')").IsSymbol());
+    CHECK(ub_test::Eval(context, "Symbol('s')").IsName());
+
+    // Numbers, and the two integer questions V8 asks about them.
+    CHECK(ub_test::Eval(context, "-7").IsInt32());
+    CHECK_FALSE(ub_test::Eval(context, "-7").IsUint32());
+    CHECK(ub_test::Eval(context, "4294967295").IsUint32());
+    CHECK_FALSE(ub_test::Eval(context, "4294967295").IsInt32());
+    CHECK_FALSE(ub_test::Eval(context, "4294967296").IsUint32());
+    CHECK_FALSE(ub_test::Eval(context, "1.5").IsInt32());
+    CHECK_FALSE(ub_test::Eval(context, "1.5").IsUint32());
+    CHECK(ub_test::Eval(context, "2.0").IsInt32());  // an exact integer however it is stored
+    CHECK(ub_test::Eval(context, "0").IsUint32());
+    CHECK_FALSE(ub_test::Eval(context, "-0").IsUint32());
+    CHECK(ub_test::Eval(context, "NaN").IsNumber());
+    CHECK_FALSE(ub_test::Eval(context, "'1'").IsNumber());
+
+    // Objects, and the kinds of object that are objects too.
+    CHECK(ub_test::Eval(context, "({})").IsObject());
+    CHECK(ub_test::Eval(context, "[]").IsObject());
+    CHECK(ub_test::Eval(context, "[]").IsArray());
+    CHECK(ub_test::Eval(context, "(function () {})").IsObject());
+    CHECK(ub_test::Eval(context, "(function () {})").IsFunction());
+    CHECK_FALSE(ub_test::Eval(context, "({})").IsFunction());
+    CHECK(ub_test::Eval(context, "new ArrayBuffer(4)").IsArrayBuffer());
+    CHECK(ub_test::Eval(context, "new Uint8Array(4)").IsTypedArray());
+    CHECK(ub_test::Eval(context, "Promise.resolve(1)").IsPromise());
+    CHECK(ub_test::Eval(context, "10n").IsBigInt());
+}
+
 TEST_CASE("values: narrowing is checked and widening is implicit") {
     ub_test::Fixture fixture;
 

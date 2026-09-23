@@ -12,6 +12,7 @@
 ///                         caller's frame.
 ///   Global<T>             a root that outlives every frame. Move-only.
 
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <span>
@@ -81,6 +82,41 @@ class Local {
     [[nodiscard]] bool Is() const noexcept {
         return detail::IsType(slot_, TypeCodeOf<U>);
     }
+
+    // V8's type predicates, spelled as V8 spells them. Each is `Kind()` or
+    // `Is<U>()` underneath; they exist because a binding asks these questions
+    // constantly, and one name per question reads better than a comparison.
+    [[nodiscard]] bool IsUndefined() const noexcept { return Kind() == ValueKind::Undefined; }
+    [[nodiscard]] bool IsNull() const noexcept { return Kind() == ValueKind::Null; }
+    [[nodiscard]] bool IsNullOrUndefined() const noexcept { return IsNull() || IsUndefined(); }
+    [[nodiscard]] bool IsBoolean() const noexcept { return Kind() == ValueKind::Boolean; }
+    [[nodiscard]] bool IsTrue() const noexcept { return IsBoolean() && detail::BooleanValue(slot_); }
+    [[nodiscard]] bool IsFalse() const noexcept { return IsBoolean() && !detail::BooleanValue(slot_); }
+    [[nodiscard]] bool IsNumber() const noexcept { return Kind() == ValueKind::Number; }
+    [[nodiscard]] bool IsString() const noexcept { return Kind() == ValueKind::String; }
+    [[nodiscard]] bool IsSymbol() const noexcept { return Kind() == ValueKind::Symbol; }
+    [[nodiscard]] bool IsName() const noexcept { return IsString() || IsSymbol(); }
+    [[nodiscard]] bool IsBigInt() const noexcept { return Kind() == ValueKind::BigInt; }
+    /// True for every object, arrays and functions included, as in V8.
+    [[nodiscard]] bool IsObject() const noexcept { return detail::IsType(slot_, TypeCode::Object); }
+    [[nodiscard]] bool IsArray() const noexcept { return Kind() == ValueKind::Array; }
+    [[nodiscard]] bool IsFunction() const noexcept { return Kind() == ValueKind::Function; }
+    [[nodiscard]] bool IsExternal() const noexcept { return Kind() == ValueKind::External; }
+    /// A number that is exactly an `int32_t`, however the engine stores it.
+    [[nodiscard]] bool IsInt32() const noexcept { return detail::IsType(slot_, TypeCode::Integer); }
+    /// A number that is exactly a `uint32_t` - an integer from 0 to 2^32 - 1,
+    /// and not `-0`, which V8 does not count as one either.
+    [[nodiscard]] bool IsUint32() const noexcept {
+        if (!IsNumber()) {
+            return false;
+        }
+        const double value = detail::NumberValue(slot_);
+        return value >= 0 && value <= 4294967295.0 && value == static_cast<double>(static_cast<std::uint32_t>(value)) &&
+               !(value == 0 && std::signbit(value));
+    }
+    [[nodiscard]] bool IsArrayBuffer() const noexcept { return detail::IsType(slot_, TypeCode::ArrayBuffer); }
+    [[nodiscard]] bool IsTypedArray() const noexcept { return detail::IsType(slot_, TypeCode::TypedArray); }
+    [[nodiscard]] bool IsPromise() const noexcept { return detail::IsType(slot_, TypeCode::Promise); }
 
     /// Checked narrowing. Empty if the value is not a `U`.
     template <class U>
