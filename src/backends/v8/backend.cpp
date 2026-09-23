@@ -39,6 +39,10 @@
 #include <v8-fast-api-calls.h>
 #include <v8-inspector.h>
 #include <v8.h>
+// For GetCurrentThreadStackLimits, which is how a stack limit gets clamped to a
+// stack that actually exists. WIN32_LEAN_AND_MEAN and NOMINMAX come from the
+// project's compile definitions.
+#include <windows.h>
 
 #include "unibind/class.h"
 #include "unibind/context.h"
@@ -3357,6 +3361,28 @@ size_t OnNearHeapLimit(void* data, size_t currentLimit, size_t initialLimit) {
     return answer < currentLimit ? currentLimit : answer;
 }
 
+/// `wanted`, or as much of this thread's stack below `top` as can safely be
+/// promised - what the SpiderMonkey backend clamps its quota to as well.
+///
+/// V8 takes whatever limit it is given, and a limit below the bottom of the
+/// real stack is one it never reaches: runaway recursion walks off the end and
+/// the process dies, which is the failure `stackLimitBytes` exists to turn into
+/// an exception. The reserve is what the engine unwinds through after it has
+/// decided it is out of stack - throwing the RangeError runs code, and that
+/// code needs frames of its own.
+std::size_t UsableStackBytes(uintptr_t top, std::size_t wanted) noexcept {
+    ULONG_PTR low = 0;
+    ULONG_PTR high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    if (top <= low || top > high) {
+        return wanted;
+    }
+    constexpr std::size_t RESERVE = std::size_t{128} * 1024;
+    const auto available = static_cast<std::size_t>(top - low);
+    const std::size_t usable = available > RESERVE ? available - RESERVE : available / 2;
+    return wanted < usable ? wanted : usable;
+}
+
 }  // namespace
 
 Platform::Platform(const PlatformOptions& options) {
@@ -3528,8 +3554,9 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
         // is the isolate's thread, so here is as good a datum as exists.
         const char here = 0;
         const auto top = reinterpret_cast<uintptr_t>(&here);
-        if (top > options.stackLimitBytes) {
-            impl->isolate->SetStackLimit(top - options.stackLimitBytes);
+        const std::size_t limit = UsableStackBytes(top, options.stackLimitBytes);
+        if (top > limit) {
+            impl->isolate->SetStackLimit(top - limit);
         }
     }
 

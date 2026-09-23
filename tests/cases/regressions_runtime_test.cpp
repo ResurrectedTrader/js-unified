@@ -7,10 +7,20 @@
 /// caught.
 
 #include <atomic>
+#include <cstddef>
 #include <string>
 #include <vector>
 
 #include "support/harness.h"
+
+// CreateThread, for a thread with a stack of a known size.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 namespace {
 
@@ -218,4 +228,50 @@ UNIBIND_TEST_CASE(INTERRUPTS, "regressions: an interrupt asked for inside one ru
 
     REQUIRE(chain.ranAtTick.size() == 5);
     CHECK(chain.ranAtTick == std::vector<int>(5, chain.ranAtTick.front()));
+}
+
+namespace {
+
+/// What happened to a runaway recursion on a thread of its own.
+struct Recursion {
+    std::size_t stackLimitBytes = 0;
+    bool isolateMade = false;
+    bool caught = false;
+};
+
+DWORD WINAPI RecurseOnThisThread(LPVOID parameter) {
+    auto* result = static_cast<Recursion*>(parameter);
+    const auto isolate = ub::Isolate::New({.stackLimitBytes = result->stackLimitBytes});
+    if (isolate == nullptr) {
+        return 0;
+    }
+    result->isolateMade = true;
+    const ub::HandleScope scope(*isolate);
+    const auto context = ub::Context::New(*isolate);
+    if (!context) {
+        return 0;
+    }
+    const ub::ContextScope entered(*context);
+    const ub::TryCatch caught(*isolate);
+    const auto value = ub::Evaluate(*context, "function deeper(n) { return deeper(n + 1) + 1; } deeper(0)");
+    result->caught = !value.has_value() && caught.HasCaught();
+    return 0;
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(STACK_LIMIT, "regressions: a stack limit larger than the thread's stack is still a limit") {
+    // The limit is measured from where the isolate is made, and an embedder
+    // setting one does not always know how much stack the thread it lands on
+    // has. SpiderMonkey's backend clamped it to the stack that exists; V8's set
+    // it wherever it pointed, below the bottom of the real stack, and runaway
+    // recursion walked off the end and took the process with it.
+    Recursion result{.stackLimitBytes = std::size_t{16} * 1024 * 1024};
+    HANDLE thread = CreateThread(nullptr, std::size_t{512} * 1024, &RecurseOnThisThread, &result,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    REQUIRE(thread != nullptr);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    REQUIRE(result.isolateMade);
+    CHECK(result.caught);
 }

@@ -413,7 +413,10 @@ struct IsolateOptions {
     /// process, which is why it is worth promising: it is per-isolate on both
     /// engines, both measure it the same way, and the failure it prevents is not
     /// one an embedder can catch by other means. Set it comfortably below the
-    /// thread's real stack - the engine needs headroom to build and throw.
+    /// thread's real stack - the engine needs headroom to build and throw. A
+    /// limit the thread's stack cannot hold is clamped to what it can, less
+    /// that headroom, on both backends: a thread's stack size is not always the
+    /// embedder's to know, and a limit past the end of the stack is no limit.
     ///
     /// **Which** error is the engine's business and the two do not agree -
     /// `RangeError` on one, `InternalError` on the other - so a portable script
