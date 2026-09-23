@@ -202,13 +202,14 @@ struct Isolate::Impl {
     /// realm, and V8 makes it in the current one or crashes. SpiderMonkey's
     /// backend has the same thing for the same reason.
     v8::Global<v8::Context> utility;
-    /// The isolate's inspector, if it has one - there is at most one - and the
-    /// work `Inspector::RequestDispatch` has queued for it. The queue is here
-    /// rather than in the inspector because what a V8 interrupt and a posted
-    /// job are handed is this isolate, which outlives any request still in
-    /// flight; an inspector's address would not. Guarded by `work`.
+    /// The isolate's inspector, if it has one - there is at most one - and its
+    /// dispatcher, which holds the queue `InspectorDispatcher::RequestDispatch`
+    /// fills. What a V8 interrupt and a posted job are handed is this isolate,
+    /// which outlives any request still in flight, and they find the queue
+    /// through here - so a wake-up that arrives after the inspector has gone
+    /// finds nothing rather than a freed queue. Isolate thread only.
     Inspector* inspector = nullptr;
-    std::deque<std::pair<JobCallback, CallbackData>> inspectorDispatches;
+    std::shared_ptr<InspectorDispatcher> inspectorDispatcher;
 };
 
 namespace detail {
@@ -3801,22 +3802,57 @@ void AppendUtf8(std::string& out, std::uint32_t point) {
     return {units.data(), units.size()};
 }
 
+}  // namespace
+
+/// What `InspectorDispatcher::RequestDispatch` fills, shared between the
+/// inspector and every thread holding its dispatcher. The mutex is what makes a
+/// request safe against the inspector going: `~Inspector` takes it to clear
+/// `owner`, so a request either finishes asking the isolate for a wake-up
+/// before the inspector - and therefore the isolate - can go, or finds `owner`
+/// null and declines.
+struct InspectorDispatcher::Impl {
+    std::mutex mutex;
+    /// The isolate, while the inspector lives; null from the moment it starts
+    /// going.
+    Isolate* owner = nullptr;
+    std::deque<std::pair<JobCallback, CallbackData>> queue;
+    /// An interrupt and a job have been asked for since a drain last started.
+    /// A request made while it is set needs no wake-up of its own: whichever of
+    /// the two arrives first starts a drain after the request was queued, and
+    /// a drain runs until the queue is empty. Cleared when a drain starts
+    /// rather than when it ends, so a request made while callbacks are running
+    /// - into a nested pause that pumps, say - asks for a wake-up of its own.
+    bool wakePending = false;
+};
+
+namespace {
+
 /// Run what `RequestDispatch` queued, in order, until nothing is left - which
-/// includes anything a callback queues while it runs. Called from a V8
-/// interrupt and from a posted job, whichever reaches the isolate first; the
-/// other finds the queue empty.
+/// includes anything requested while it runs. Called from a V8 interrupt and
+/// from a posted job, whichever reaches the isolate first; the other finds the
+/// queue empty.
 void DrainDispatches(Isolate& isolate) {
+    // Held for the whole drain: a callback may destroy the inspector, and the
+    // isolate's reference with it.
+    const std::shared_ptr<InspectorDispatcher> dispatcher = isolate.impl().inspectorDispatcher;
+    if (dispatcher == nullptr) {
+        return;
+    }
+    InspectorDispatcher::Impl& shared = dispatcher->impl();
+    {
+        const std::scoped_lock guard(shared.mutex);
+        shared.wakePending = false;
+    }
     for (;;) {
         JobCallback callback = nullptr;
         CallbackData data;
         {
-            const std::scoped_lock guard(isolate.impl().work);
-            auto& queue = isolate.impl().inspectorDispatches;
-            if (queue.empty()) {
+            const std::scoped_lock guard(shared.mutex);
+            if (shared.owner == nullptr || shared.queue.empty()) {
                 return;
             }
-            std::tie(callback, data) = queue.front();
-            queue.pop_front();
+            std::tie(callback, data) = shared.queue.front();
+            shared.queue.pop_front();
         }
         callback(isolate, data);
     }
@@ -3870,6 +3906,7 @@ struct Inspector::Impl final : v8_inspector::V8InspectorClient {
 
     Isolate* owner;
     InspectorClient* client;
+    std::shared_ptr<InspectorDispatcher> dispatcher;
     /// The realms announced and not withdrawn, oldest first; the last live one
     /// is where an evaluation naming no context runs. Weak: DevTools seeing a
     /// realm is no reason for it to live.
@@ -3880,6 +3917,12 @@ struct Inspector::Impl final : v8_inspector::V8InspectorClient {
 };
 
 /// One connection: V8's channel, forwarding every message to the embedder.
+///
+/// Destroying one inside a pause, or inside a callback its own dispatch made,
+/// is V8's design and not something to defer: V8 reaches a session and its
+/// channel through weak pointers across exactly those calls, because a
+/// DevTools connection that closes in the middle of a pause is ordinary. The
+/// suite holds it to that.
 struct InspectorSession::Impl final : v8_inspector::V8Inspector::Channel {
     Impl(Isolate& owner, InspectorClient& client) : owner(&owner), client(&client) {}
 
@@ -3900,6 +3943,10 @@ struct InspectorSession::Impl final : v8_inspector::V8Inspector::Channel {
 
     Isolate* owner;
     InspectorClient* client;
+    /// `Stop` is final, and ours rather than V8's to promise: a stopped
+    /// session's `Resume` and `Stop` do nothing, whatever the engine would
+    /// make of being asked again.
+    bool stopped = false;
     // Last, so that it goes before the channel it reports through.
     std::unique_ptr<v8_inspector::V8InspectorSession> session;
 };
@@ -3912,16 +3959,31 @@ std::unique_ptr<Inspector> Inspector::New(Isolate& isolate, InspectorClient& cli
     if (isolate.impl().inspector != nullptr) {
         return nullptr;
     }
-    auto impl = std::make_unique<Impl>(isolate, client);
-    {
-        const v8::HandleScope scope(isolate.impl().isolate);
-        impl->inspector = v8_inspector::V8Inspector::create(isolate.impl().isolate, impl.get());
-    }
-    if (impl->inspector == nullptr) {
+    // Everything of ours is allocated before V8 is asked for anything, so that
+    // running out of memory is a null here rather than an exception thrown
+    // through the engine's frames.
+    std::unique_ptr<Inspector> made;
+    try {
+        auto impl = std::make_unique<Impl>(isolate, client);
+        impl->dispatcher.reset(new InspectorDispatcher(std::make_unique<InspectorDispatcher::Impl>()));
+        made.reset(new Inspector(std::move(impl)));
+    } catch (const std::bad_alloc&) {
         return nullptr;
     }
-    std::unique_ptr<Inspector> made(new Inspector(std::move(impl)));
+    {
+        const v8::HandleScope scope(isolate.impl().isolate);
+        made->impl_->inspector = v8_inspector::V8Inspector::create(isolate.impl().isolate, made->impl_.get());
+    }
+    if (made->impl_->inspector == nullptr) {
+        return nullptr;
+    }
     isolate.impl().inspector = made.get();
+    isolate.impl().inspectorDispatcher = made->impl_->dispatcher;
+    {
+        InspectorDispatcher::Impl& shared = made->impl_->dispatcher->impl();
+        const std::scoped_lock guard(shared.mutex);
+        shared.owner = &isolate;
+    }
     return made;
 }
 
@@ -3930,10 +3992,15 @@ Inspector::Inspector(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl
 Inspector::~Inspector() {
     Isolate& owner = *impl_->owner;
     {
-        const std::scoped_lock guard(owner.impl().work);
-        owner.impl().inspectorDispatches.clear();
+        InspectorDispatcher::Impl& shared = impl_->dispatcher->impl();
+        const std::scoped_lock guard(shared.mutex);
+        shared.owner = nullptr;
+        shared.queue.clear();
     }
-    owner.impl().inspector = nullptr;
+    if (owner.impl().inspector == this) {
+        owner.impl().inspector = nullptr;
+        owner.impl().inspectorDispatcher.reset();
+    }
     const v8::HandleScope scope(owner.impl().isolate);
     impl_->inspector.reset();
     impl_->contexts.clear();
@@ -3977,33 +4044,58 @@ void Inspector::ContextDestroyed(const Context& context) {
 }
 
 std::unique_ptr<InspectorSession> Inspector::Connect() {
-    auto impl = std::make_unique<InspectorSession::Impl>(*impl_->owner, *impl_->client);
-    {
-        const v8::HandleScope scope(impl_->owner->impl().isolate);
-        impl->session = impl_->inspector->connect(CONTEXT_GROUP, impl.get(), v8_inspector::StringView(),
-                                                  v8_inspector::V8Inspector::kFullyTrusted,
-                                                  v8_inspector::V8Inspector::kNotWaitingForDebugger);
-    }
-    if (impl->session == nullptr) {
+    // As in `New`: ours first, so that out of memory is a null, then V8's.
+    std::unique_ptr<InspectorSession> made;
+    try {
+        made.reset(new InspectorSession(std::make_unique<InspectorSession::Impl>(*impl_->owner, *impl_->client)));
+    } catch (const std::bad_alloc&) {
         return nullptr;
     }
-    return std::unique_ptr<InspectorSession>(new InspectorSession(std::move(impl)));
+    {
+        const v8::HandleScope scope(impl_->owner->impl().isolate);
+        made->impl_->session = impl_->inspector->connect(CONTEXT_GROUP, made->impl_.get(), v8_inspector::StringView(),
+                                                         v8_inspector::V8Inspector::kFullyTrusted,
+                                                         v8_inspector::V8Inspector::kNotWaitingForDebugger);
+    }
+    if (made->impl_->session == nullptr) {
+        return nullptr;
+    }
+    return made;
 }
 
-void Inspector::RequestDispatch(JobCallback callback, CallbackData data) noexcept {
+std::shared_ptr<InspectorDispatcher> Inspector::Dispatcher() const noexcept {
+    return impl_->dispatcher;
+}
+
+InspectorDispatcher::InspectorDispatcher(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+InspectorDispatcher::~InspectorDispatcher() = default;
+
+bool InspectorDispatcher::RequestDispatch(JobCallback callback, CallbackData data) noexcept {
     if (callback == nullptr) {
-        return;
+        return false;
     }
-    Isolate& owner = *impl_->owner;
-    {
-        const std::scoped_lock guard(owner.impl().work);
-        owner.impl().inspectorDispatches.emplace_back(callback, data);
+    Impl& shared = *impl_;
+    const std::scoped_lock guard(shared.mutex);
+    if (shared.owner == nullptr) {
+        return false;
     }
-    // Both, and whichever arrives first drains: an interrupt reaches a script
-    // that is running and never fires while the isolate is idle, and a job is
-    // the other way round.
-    owner.impl().isolate->RequestInterrupt(&DispatchInterrupt, &owner);
-    owner.PostJob(&DispatchJob, {});
+    try {
+        shared.queue.emplace_back(callback, data);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    if (!shared.wakePending) {
+        shared.wakePending = true;
+        // Both, and whichever arrives first drains: an interrupt reaches a
+        // script that is running and never fires while the isolate is idle, and
+        // a job is the other way round. Asked for under the lock, which is what
+        // keeps the isolate alive until they have been.
+        Isolate& owner = *shared.owner;
+        owner.impl().isolate->RequestInterrupt(&DispatchInterrupt, &owner);
+        owner.PostJob(&DispatchJob, {});
+    }
+    return true;
 }
 
 InspectorSession::InspectorSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -4015,15 +4107,26 @@ InspectorSession::~InspectorSession() {
 
 void InspectorSession::DispatchProtocolMessage(std::string_view message) {
     const v8::HandleScope scope(impl_->owner->impl().isolate);
+    // Nothing of `this` is touched once the dispatch has started: a callback
+    // inside it may destroy the session.
     impl_->session->dispatchProtocolMessage(
         v8_inspector::StringView(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
 }
 
 void InspectorSession::Resume() {
+    if (impl_->stopped) {
+        return;
+    }
+    const v8::HandleScope scope(impl_->owner->impl().isolate);
     impl_->session->resume();
 }
 
 void InspectorSession::Stop() {
+    if (impl_->stopped) {
+        return;
+    }
+    impl_->stopped = true;
+    const v8::HandleScope scope(impl_->owner->impl().isolate);
     impl_->session->stop();
 }
 

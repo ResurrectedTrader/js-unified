@@ -23,6 +23,7 @@ namespace ub {
 
 struct Inspector::Impl {};
 struct InspectorSession::Impl {};
+struct InspectorDispatcher::Impl {};
 
 bool Inspector::Supported() noexcept {
     return false;
@@ -43,7 +44,15 @@ void Inspector::ContextDestroyed(const Context& /*context*/) {}
 std::unique_ptr<InspectorSession> Inspector::Connect() {
     return nullptr;
 }
-void Inspector::RequestDispatch(JobCallback /*callback*/, CallbackData /*data*/) noexcept {}
+std::shared_ptr<InspectorDispatcher> Inspector::Dispatcher() const noexcept {
+    return nullptr;
+}
+
+InspectorDispatcher::InspectorDispatcher(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+InspectorDispatcher::~InspectorDispatcher() = default;
+bool InspectorDispatcher::RequestDispatch(JobCallback /*callback*/, CallbackData /*data*/) noexcept {
+    return false;
+}
 
 InspectorSession::InspectorSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 InspectorSession::~InspectorSession() = default;

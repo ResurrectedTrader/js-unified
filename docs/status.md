@@ -12,7 +12,7 @@ backend without one can define none of them.
 
 **Where the two backends are.** Both implement everything the headers declare
 that their engines can do, decisions 1-29, and the suite agrees case for case:
-360 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
+365 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
 harness's own test of the skip path, which exists so that the machinery for
 reporting a missing area is exercised on every backend rather than only on the
 day one falls behind.
@@ -339,7 +339,7 @@ the case this decision exists for.
 
 `TerminateExecution` is callable from a thread other than the isolate's, as are
 `RequestInterrupt` (decision 24), `PostJob` and `PostDelayedJob` (decision 23)
-and the inspector's `RequestDispatch` (decision 29); nothing else is. Not
+and the inspector dispatcher's `RequestDispatch` (decision 29); nothing else is. Not
 catchable from script, not consumed by a `TryCatch`
 (`HasTerminated` is how a caller tells it from a throw), remembered if nothing
 is running yet, and **it does not interrupt a native callback** on either
@@ -668,7 +668,7 @@ teardown is dropped like the rest.
 ### 24. What an interrupt callback may do (`unibind/isolate.h`)
 
 `RequestInterrupt` is the other way to reach a running script from another
-thread, and - the inspector's `RequestDispatch` aside, which is built on it - the
+thread, and - the inspector dispatcher's `RequestDispatch` aside, which is built on it - the
 only way to reach the isolate's thread without waiting for the script to finish. The contract is a
 split, not a ban:
 
@@ -1021,17 +1021,52 @@ either engine. What keeps it from being the silent answer decision 19 refuses is
 that there is no parameter here a backend quietly ignores - only an object a
 backend declines to make, and a null pointer is not used by accident.
 
-Three things had to be decided on top of V8's shape:
+These had to be decided on top of V8's shape:
 
-- **One thread may be foreign.** `RequestDispatch` is how a message read on a
-  socket thread reaches the isolate, and it runs the embedder's callback at
-  whichever comes first: an interrupt, which reaches a script that is running
-  and never fires while the isolate is idle, or the next `PumpJobs`, which is
-  the other way round. Unlike `RequestInterrupt`'s callback (decision 24) it may
-  dispatch protocol messages, which run script - V8's inspector is designed to
-  be driven from exactly that point, and it is how a busy isolate still answers
-  DevTools. The queue lives on the isolate rather than the inspector, because an
-  interrupt or a job still in flight is handed the isolate, which outlives it.
+- **One thread may be foreign, and it holds a dispatcher, not the inspector.**
+  `InspectorDispatcher::RequestDispatch` is how a message read on a socket
+  thread reaches the isolate, and it runs the embedder's callback at whichever
+  comes first: an interrupt, which reaches a script that is running and never
+  fires while the isolate is idle, or the next `PumpJobs`, which is the other
+  way round. Unlike `RequestInterrupt`'s callback (decision 24) it may dispatch
+  protocol messages, which run script - V8's inspector is designed to be driven
+  from exactly that point, and it is how a busy isolate still answers DevTools.
+  It used to be a member of `Inspector`, which made it unusable exactly where it
+  is needed: the socket thread cannot know when the isolate's thread destroys
+  the inspector, so every embedder had to put a mutex of its own around the call
+  and the destruction. The dispatcher is V8's `TaskRunner` shape instead - a
+  `std::shared_ptr` from `Inspector::Dispatcher()` that any thread may hold for
+  as long as it likes, safe through the inspector's destruction and after it,
+  where a request answers false and never runs. Its mutex is the one the
+  embedder no longer writes: `~Inspector` takes it to mark the dispatcher
+  orphaned, so a request either finishes asking the isolate for its wake-up
+  first or finds it orphaned. A wake-up still in flight is handed the isolate,
+  which outlives it, and finds the queue through the isolate's reference to the
+  current inspector - none, once it has gone.
+- **The wake-up is coalesced, the work is not.** Requests made before the
+  isolate gets to the first of them share one interrupt and one posted job, and
+  every one of them still runs, once, in order - the same callback and data
+  asked for twice run twice. Coalescing belongs here rather than in the
+  embedder, because only the backend knows whether a wake-up is already on its
+  way; without it a burst of protocol messages costs an engine interrupt and a
+  posted job each, which the suite measures. What was not done is merging
+  requests themselves, because "each request runs exactly once" is a contract a
+  caller can build on and "at least one of several runs" is not.
+- **`New` and `Connect` are null only for want of memory**, besides `New` on a
+  backend without an inspector or an isolate that already has one. The engine
+  refuses no connection, so null from `Connect` is not a condition to wait out.
+  The backend makes all of its own allocations before it asks the engine for
+  anything, so that the null is a clean one.
+- **`Resume`, `Stop` and destruction, in any order.** `Resume` leaves a pause
+  (the engine calls `QuitMessageLoopOnPause` before it returns) and does nothing
+  outside one or after `Stop`. `Stop` is final and idempotent, and during a
+  pause it ends the pause unless another session still has the debugger on. A
+  session may be destroyed anywhere on the isolate's thread, inside
+  `RunMessageLoopOnPause` and inside a callback of its own dispatch included:
+  that is `Stop`, and the client hears nothing more from it. V8 supports that
+  by design - it reaches a session through weak pointers across exactly those
+  calls - so nothing is deferred, and the suite holds each of these on every
+  backend that has an inspector.
 - **The default realm** - where an evaluation naming no context runs - is the
   one announced most recently and not yet withdrawn. The inspector holds realms
   weakly: DevTools seeing one is no reason for it to live.
@@ -1148,7 +1183,7 @@ failing to link:
 "ARRAY_BUFFER_VIEWS|ArrayBufferViewByteLength,ArrayBufferViewByteOffset,ArrayBufferViewBuffer,ArrayBufferViewCopyOut,MakeDataView"
 "FUNCTION_VALUE_DATA|MakeFunctionWithValue,CallbackValueData"
 "EAGER_COMPILE|CompileScript,CompileScriptWithCache,ScriptCreateCodeCache"
-"INSPECTOR|Supported@Inspector,New@Inspector,ContextCreated@Inspector,ContextDestroyed@Inspector,Connect@Inspector,RequestDispatch@Inspector,DispatchProtocolMessage@InspectorSession,Resume@InspectorSession,Stop@InspectorSession"
+"INSPECTOR|Supported@Inspector,New@Inspector,ContextCreated@Inspector,ContextDestroyed@Inspector,Connect@Inspector,Dispatcher@Inspector,RequestDispatch@InspectorDispatcher,DispatchProtocolMessage@InspectorSession,Resume@InspectorSession,Stop@InspectorSession"
 ```
 
 `EAGER_COMPILE` names no new symbol, like `STACK_LIMIT`: the option rides on the

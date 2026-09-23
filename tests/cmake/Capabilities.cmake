@@ -114,5 +114,5 @@ set(UNIBIND_CAPABILITIES
     # all of it - an engine without an inspector answers Supported() with false
     # and New with null - so this row is always present, and the cases that
     # exercise the protocol ask Supported() and report a skip when it says no.
-    "INSPECTOR|Supported@Inspector,New@Inspector,ContextCreated@Inspector,ContextDestroyed@Inspector,Connect@Inspector,RequestDispatch@Inspector,DispatchProtocolMessage@InspectorSession,Resume@InspectorSession,Stop@InspectorSession"
+    "INSPECTOR|Supported@Inspector,New@Inspector,ContextCreated@Inspector,ContextDestroyed@Inspector,Connect@Inspector,Dispatcher@Inspector,RequestDispatch@InspectorDispatcher,DispatchProtocolMessage@InspectorSession,Resume@InspectorSession,Stop@InspectorSession"
 )

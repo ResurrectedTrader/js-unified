@@ -681,9 +681,9 @@ wrap engine calls in a `TryCatch`.
 `PostDelayedJob` is not a timer. Its delay is a floor: once it has passed the
 job is ordinary posted work, and nothing wakes the thread to run it, so a job due
 in ten milliseconds on a thread that pumps once a second runs up to a second
-late. The same goes for `Inspector::RequestDispatch` on an idle isolate - it
-runs at the next pump - and a request still waiting when the `Inspector` goes is
-dropped with it.
+late. The same goes for `InspectorDispatcher::RequestDispatch` on an idle
+isolate - it runs at the next pump - and a request still waiting when the
+`Inspector` goes is dropped with it.
 
 ### A stack quota larger than the thread's real stack is not a limit
 

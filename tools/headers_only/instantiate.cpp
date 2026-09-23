@@ -86,7 +86,7 @@ void OnDispatch(ub::Isolate& /*isolate*/, ub::CallbackData /*data*/) {}
         session->Resume();
         session->Stop();
     }
-    inspector->RequestDispatch(&OnDispatch);
+    (void)inspector->Dispatcher()->RequestDispatch(&OnDispatch);
     inspector->ContextDestroyed(context);
 }
 

@@ -58,6 +58,7 @@ class ReturnValue;
 class CallbackData;
 class Inspector;
 class InspectorClient;
+class InspectorDispatcher;
 class InspectorSession;
 
 namespace detail {

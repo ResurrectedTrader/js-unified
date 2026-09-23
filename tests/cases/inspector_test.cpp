@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,14 @@ struct Client final : ub::InspectorClient {
     void RunMessageLoopOnPause() override {
         ++pauses;
         quit = false;
+        if (duringPause) {
+            // What the embedder does when the connection closes mid-pause. It
+            // may take the session with it, and then there is nothing to feed.
+            duringPause();
+            if (quit || session == nullptr) {
+                return;
+            }
+        }
         for (const std::string& message : onPause) {
             if (quit) {
                 break;
@@ -86,6 +95,7 @@ struct Client final : ub::InspectorClient {
 
     std::vector<std::string> messages;
     std::vector<std::string> onPause;
+    std::function<void()> duringPause;
     ub::InspectorSession* session = nullptr;
     std::optional<std::string> urlPrefix;
     int pauses = 0;
@@ -226,10 +236,10 @@ UNIBIND_TEST_CASE(INSPECTOR, "inspector: a dispatch requested from another threa
         R"({"id":20,"method":"Runtime.evaluate","params":{"expression":"globalThis.stopLooping = true; 42"}})";
     std::atomic<bool> finished{false};
 
-    ub::Inspector* inspector = attached.inspector.get();
-    std::thread requester([inspector, &remote] {
+    const std::shared_ptr<ub::InspectorDispatcher> dispatcher = attached.inspector->Dispatcher();
+    std::thread requester([dispatcher, &remote] {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        inspector->RequestDispatch(&DispatchRemote, ub::CallbackData::For(remote));
+        (void)dispatcher->RequestDispatch(&DispatchRemote, ub::CallbackData::For(remote));
     });
     // A request that never lands would leave the loop below spinning for ever;
     // this turns that into a failure instead of a hung suite.
@@ -270,9 +280,9 @@ UNIBIND_TEST_CASE(INSPECTOR, "inspector: a dispatch requested while the isolate 
     remote.session = attached.session.get();
     remote.message = R"({"id":30,"method":"Runtime.evaluate","params":{"expression":"'idle'"}})";
 
-    ub::Inspector* inspector = attached.inspector.get();
+    const std::shared_ptr<ub::InspectorDispatcher> dispatcher = attached.inspector->Dispatcher();
     std::thread requester(
-        [inspector, &remote] { inspector->RequestDispatch(&DispatchRemote, ub::CallbackData::For(remote)); });
+        [dispatcher, &remote] { (void)dispatcher->RequestDispatch(&DispatchRemote, ub::CallbackData::For(remote)); });
     requester.join();
 
     // No script is running, so nothing has checked for it yet.
@@ -363,4 +373,337 @@ UNIBIND_TEST_CASE(INSPECTOR, "inspector: realms come and go, and a stopped sessi
     const long long growth = ub_test::OutstandingAllocations() - afterWarmup;
     INFO("outstanding allocations grew by ", growth, " over ", WINDOW, " inspectors");
     CHECK(growth < WINDOW);
+}
+
+// ---------------------------------------------------------------------------
+// The dispatcher: the one object another thread may hold
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void CountDispatch(ub::Isolate& /*isolate*/, ub::CallbackData data) {
+    if (auto* count = data.As<std::atomic<int>>()) {
+        ++*count;
+    }
+}
+
+/// A request that says which one it was.
+struct Numbered {
+    std::vector<int>* log = nullptr;
+    int number = 0;
+};
+
+void LogNumber(ub::Isolate& /*isolate*/, ub::CallbackData data) {
+    if (auto* numbered = data.As<Numbered>()) {
+        numbered->log->push_back(numbered->number);
+    }
+}
+
+}  // namespace
+
+UNIBIND_TEST_CASE(INSPECTOR,
+                  "inspector: a dispatcher may be used from another thread while and after its inspector goes") {
+    // A socket thread cannot know when the isolate's thread destroys the
+    // inspector - that is the whole difficulty - so the thing it holds has to
+    // stay safe to call through the destruction and after it, and say no.
+    if (!ub::Inspector::Supported()) {
+        ub_test::ReportSkip("this backend has no inspector");
+        return;
+    }
+    ub_test::Fixture fixture;
+    std::atomic<int> ran{0};
+    int taken = 0;
+    int declined = 0;
+    constexpr int ROUNDS = 40;
+    constexpr int BURST = 100;
+    for (int round = 0; round < ROUNDS; ++round) {
+        Client client;
+        auto inspector = ub::Inspector::New(fixture.iso(), client);
+        REQUIRE(inspector != nullptr);
+        std::atomic<bool> burstDone{false};
+        std::atomic<bool> go{false};
+        std::atomic<bool> stop{false};
+        std::atomic<int> takenHere{0};
+        std::atomic<int> declinedHere{0};
+        // The thread's copy is the last one standing, so the dispatcher is
+        // also destroyed on the foreign thread.
+        std::thread hammer(
+            [dispatcher = inspector->Dispatcher(), &burstDone, &go, &stop, &ran, &takenHere, &declinedHere] {
+                const auto request = [&] {
+                    if (dispatcher->RequestDispatch(&CountDispatch, ub::CallbackData::For(ran))) {
+                        ++takenHere;
+                    } else {
+                        ++declinedHere;
+                    }
+                };
+                for (int i = 0; i < BURST; ++i) {
+                    request();
+                }
+                burstDone = true;
+                while (!go) {
+                    std::this_thread::yield();
+                }
+                while (!stop) {
+                    request();
+                }
+            });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!burstDone && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        // While the thread holds off, what it asked for runs. Not while it
+        // hammers: a pump runs until nothing is left, and nothing is ever left
+        // while another thread keeps asking.
+        fixture.iso().PumpJobs();
+        CHECK(ran == (round + 1) * BURST);
+
+        // The race itself: the inspector goes while the thread is mid-request.
+        go = true;
+        while (takenHere < 2 * BURST && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        inspector.reset();
+        while (declinedHere == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        stop = true;
+        hammer.join();
+        taken += takenHere;
+        declined += declinedHere;
+
+        // Nothing runs once the inspector has gone - not from the jobs it
+        // posted, not from the interrupts it requested.
+        const int before = ran;
+        fixture.iso().PumpJobs();
+        CHECK(ub_test::EvalInt(fixture.context, "for (var i = 0; i < 1000; ++i) {} 2") == 2);
+        fixture.iso().PumpJobs();
+        CHECK(ran == before);
+    }
+    INFO("taken ", taken, ", declined ", declined, ", ran ", ran.load());
+    CHECK(ran == ROUNDS * BURST);
+    CHECK(taken > ROUNDS * BURST);
+    CHECK(declined >= ROUNDS);
+}
+
+UNIBIND_TEST_CASE(INSPECTOR, "inspector: a burst of requests shares one wake-up, and every request still runs once") {
+    // What is coalesced is the wake-up and never the work: a request is a
+    // callback and its data, run exactly once, in order - asked for twice, run
+    // twice. The wake-up - an engine interrupt and a posted job - is what a
+    // burst made before the isolate gets to it does not need one each of, and
+    // the only place that shows is in what the burst costs.
+    if (!ub::Inspector::Supported()) {
+        ub_test::ReportSkip("this backend has no inspector");
+        return;
+    }
+    ub_test::Fixture fixture;
+    Client client;
+    auto inspector = ub::Inspector::New(fixture.iso(), client);
+    REQUIRE(inspector != nullptr);
+    const std::shared_ptr<ub::InspectorDispatcher> dispatcher = inspector->Dispatcher();
+
+    constexpr int BURST = 2000;
+    std::vector<int> log;
+    log.reserve(BURST + 4);
+    std::vector<Numbered> requests(BURST);
+    for (int i = 0; i < BURST; ++i) {
+        requests[static_cast<size_t>(i)] = Numbered{.log = &log, .number = i};
+    }
+    int taken = 0;
+    const long long before = ub_test::OutstandingAllocations();
+    for (Numbered& request : requests) {
+        taken += dispatcher->RequestDispatch(&LogNumber, ub::CallbackData::For(request)) ? 1 : 0;
+    }
+    const long long growth = ub_test::OutstandingAllocations() - before;
+    CHECK(taken == BURST);
+    // The requests themselves have to be kept somewhere; a wake-up each on top
+    // of that - a job and an interrupt per request - would be two more.
+    INFO("a burst of ", BURST, " requests left ", growth, " allocations outstanding");
+    CHECK(growth < BURST + (BURST / 2));
+
+    fixture.iso().PumpJobs();
+    REQUIRE(log.size() == static_cast<size_t>(BURST));
+    bool inOrder = true;
+    for (int i = 0; i < BURST; ++i) {
+        inOrder = inOrder && log[static_cast<size_t>(i)] == i;
+    }
+    CHECK(inOrder);
+
+    // The same callback and data twice is two requests.
+    log.clear();
+    CHECK(dispatcher->RequestDispatch(&LogNumber, ub::CallbackData::For(requests[7])));
+    CHECK(dispatcher->RequestDispatch(&LogNumber, ub::CallbackData::For(requests[7])));
+    CHECK(ub_test::EvalInt(fixture.context, "for (var i = 0; i < 1000; ++i) {} 3") == 3);
+    fixture.iso().PumpJobs();
+    CHECK(log == std::vector<int>{7, 7});
+
+    // A null callback is not a request.
+    CHECK_FALSE(dispatcher->RequestDispatch(nullptr));
+}
+
+UNIBIND_TEST_CASE(INSPECTOR, "inspector: New and Connect answer null only when there is not the memory") {
+    if (!ub::Inspector::Supported()) {
+        ub_test::ReportSkip("this backend has no inspector");
+        return;
+    }
+    ub_test::Fixture fixture;
+    Client client;
+
+    std::unique_ptr<ub::Inspector> refused;
+    long long fired = 0;
+    {
+        ub_test::AllocationFailure failing(1);
+        refused = ub::Inspector::New(fixture.iso(), client);
+        fired = failing.Stop();
+    }
+    if (fired == 0) {
+        ub_test::ReportSkip("the failed allocation never reached the inspector");
+        return;
+    }
+    CHECK(refused == nullptr);
+    // The refusal left nothing behind: the isolate takes an inspector.
+    auto inspector = ub::Inspector::New(fixture.iso(), client);
+    REQUIRE(inspector != nullptr);
+    inspector->ContextCreated(fixture.context, "main");
+
+    std::unique_ptr<ub::InspectorSession> none;
+    {
+        ub_test::AllocationFailure failing(1);
+        none = inspector->Connect();
+        fired = failing.Stop();
+    }
+    CHECK(fired == 1);
+    CHECK(none == nullptr);
+
+    // And in no other case: several at once, and one made during a pause.
+    auto first = inspector->Connect();
+    auto second = inspector->Connect();
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    client.session = first.get();
+    first->DispatchProtocolMessage(R"({"id":70,"method":"Debugger.enable"})");
+    std::unique_ptr<ub::InspectorSession> duringPause;
+    client.duringPause = [&inspector, &duringPause] { duringPause = inspector->Connect(); };
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 8") == 8);
+    CHECK(client.pauses == 1);
+    CHECK(duringPause != nullptr);
+
+    duringPause.reset();
+    second.reset();
+    first.reset();
+    inspector->ContextDestroyed(fixture.context);
+}
+
+// ---------------------------------------------------------------------------
+// Resume, Stop and destruction, in every order
+// ---------------------------------------------------------------------------
+
+UNIBIND_TEST_CASE(INSPECTOR, "inspector: Resume leaves a pause and does nothing outside one") {
+    ub_test::Fixture fixture;
+    Client client;
+    const Attached attached = Attach(fixture, client);
+    if (!attached) {
+        return;
+    }
+    attached.session->DispatchProtocolMessage(R"({"id":80,"method":"Debugger.enable"})");
+
+    attached.session->Resume();
+    attached.session->Resume();
+    CHECK(client.quits == 0);
+
+    // The client's loop resumes from outside the protocol when it has nothing
+    // to feed, and the inspector answers with a quit before Resume returns.
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 9") == 9);
+    CHECK(client.pauses == 1);
+    CHECK(client.quits == 1);
+
+    attached.session->Resume();
+    CHECK(client.quits == 1);
+}
+
+UNIBIND_TEST_CASE(INSPECTOR, "inspector: Stop during a pause ends the pause, and a stopped session stays stopped") {
+    ub_test::Fixture fixture;
+    Client client;
+    const Attached attached = Attach(fixture, client);
+    if (!attached) {
+        return;
+    }
+    attached.session->DispatchProtocolMessage(R"({"id":90,"method":"Debugger.enable"})");
+
+    client.duringPause = [&attached] { attached.session->Stop(); };
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 10") == 10);
+    CHECK(client.pauses == 1);
+    CHECK(client.quits == 1);
+    client.duringPause = nullptr;
+
+    // Stop again, Resume after Stop: nothing, and no error.
+    attached.session->Stop();
+    attached.session->Resume();
+    CHECK(client.quits == 1);
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 11") == 11);
+    CHECK(client.pauses == 1);
+
+    // Still answered - but the debugger does not come back on.
+    attached.session->DispatchProtocolMessage(R"({"id":91,"method":"Runtime.evaluate","params":{"expression":"6*7"}})");
+    CHECK(client.ResponseTo(91).find("\"value\":42") != std::string::npos);
+    attached.session->DispatchProtocolMessage(R"({"id":92,"method":"Debugger.enable"})");
+    const std::string refused = client.ResponseTo(92);
+    INFO(refused);
+    CHECK(refused.find("\"error\"") != std::string::npos);
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 12") == 12);
+    CHECK(client.pauses == 1);
+}
+
+UNIBIND_TEST_CASE(INSPECTOR, "inspector: a session destroyed inside a pause ends the pause and says nothing more") {
+    ub_test::Fixture fixture;
+    Client client;
+    Attached attached = Attach(fixture, client);
+    if (!attached) {
+        return;
+    }
+
+    // A pause in the embedder's own script.
+    attached.session->DispatchProtocolMessage(R"({"id":100,"method":"Debugger.enable"})");
+    size_t sentAtClose = 0;
+    client.duringPause = [&attached, &client, &sentAtClose] {
+        attached.session.reset();
+        client.session = nullptr;
+        sentAtClose = client.messages.size();
+    };
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 13") == 13);
+    CHECK(client.pauses == 1);
+    CHECK(client.quits == 1);
+    CHECK(client.messages.size() == sentAtClose);
+
+    // A pause inside the session's own dispatch - the engine's session is
+    // several frames up the stack when the embedder destroys it.
+    auto own = attached.inspector->Connect();
+    REQUIRE(own != nullptr);
+    client.session = own.get();
+    own->DispatchProtocolMessage(R"({"id":101,"method":"Debugger.enable"})");
+    client.duringPause = [&own, &client, &sentAtClose] {
+        own.reset();
+        client.session = nullptr;
+        sentAtClose = client.messages.size();
+    };
+    ub::InspectorSession* raw = own.get();
+    raw->DispatchProtocolMessage(R"({"id":102,"method":"Runtime.evaluate","params":{"expression":"debugger; 14"}})");
+    CHECK(own == nullptr);
+    CHECK(client.pauses == 2);
+    CHECK(client.quits == 2);
+    CHECK(client.messages.size() == sentAtClose);
+    CHECK(client.ResponseTo(102).empty());
+
+    // The inspector is none the worse: a new connection works, and pauses.
+    client.duringPause = nullptr;
+    auto again = attached.inspector->Connect();
+    REQUIRE(again != nullptr);
+    client.session = again.get();
+    again->DispatchProtocolMessage(R"({"id":103,"method":"Runtime.evaluate","params":{"expression":"5*5"}})");
+    CHECK(client.ResponseTo(103).find("\"value\":25") != std::string::npos);
+    again->DispatchProtocolMessage(R"({"id":104,"method":"Debugger.enable"})");
+    CHECK(ub_test::EvalInt(fixture.context, "debugger; 15") == 15);
+    CHECK(client.pauses == 3);
+
+    again.reset();
+    attached.inspector->ContextDestroyed(fixture.context);
 }

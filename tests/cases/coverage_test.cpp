@@ -812,13 +812,15 @@ UNIBIND_TEST_CASE(INSPECTOR, "coverage: dispatches run in the order they were re
     for (int i = 0; i < 4; ++i) {
         requests.at(i) = Tagged{.log = &log, .tag = i};
     }
-    ub::Inspector* raw = inspector.get();
-    std::thread requester([raw, &requests] {
+    const std::shared_ptr<ub::InspectorDispatcher> dispatcher = inspector->Dispatcher();
+    std::atomic<int> taken{0};
+    std::thread requester([dispatcher, &requests, &taken] {
         for (Tagged& request : requests) {
-            raw->RequestDispatch(&RecordTag, ub::CallbackData::For(request));
+            taken += dispatcher->RequestDispatch(&RecordTag, ub::CallbackData::For(request)) ? 1 : 0;
         }
     });
     requester.join();
+    CHECK(taken == 4);
 
     fixture.iso().PumpJobs();
     CHECK(log == std::vector<int>{0, 1, 2, 3});
@@ -839,7 +841,7 @@ UNIBIND_TEST_CASE(INSPECTOR, "coverage: dispatches still waiting when the inspec
     {
         auto inspector = ub::Inspector::New(fixture.iso(), client);
         REQUIRE(inspector != nullptr);
-        inspector->RequestDispatch(&RecordRan, ub::CallbackData::For(ran));
+        CHECK(inspector->Dispatcher()->RequestDispatch(&RecordRan, ub::CallbackData::For(ran)));
     }
     // Neither the pump nor a script's interrupt check runs it now.
     fixture.iso().PumpJobs();

@@ -21,7 +21,7 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting, a Chrome DevTools inspector |
 | V8 15.6 | implements all of it |
 | SpiderMonkey 153.3.0esr | implements all of it except two things its engine does not have: the near-heap-limit hook - a call to that one does not link, on purpose - and the inspector, which links and answers `Supported()` with false |
-| Tests | one suite, written once against `ub::`: 360 cases, green on both backends, every case compared backend against backend with no divergences |
+| Tests | one suite, written once against `ub::`: 365 cases, green on both backends, every case compared backend against backend with no divergences |
 | Not here | cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
@@ -125,16 +125,16 @@ to refuse the fetch outright and be told what to unpack where.
 bump repoints the tag, the asset and the directory together rather than
 silently reusing the old library.
 
-The number `ctest` prints is a little larger than 360 and depends on the tree,
+The number `ctest` prints is a little larger than 365 and depends on the tree,
 because it registers the suite's cases *and* a few things that cannot be cases
 among others: the whole suite again in one process, four checks that each need
 a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **360 cases is the figure that means the same thing everywhere** - it is
+built). **365 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
-different number of times on each engine, so V8 counts 9786 and SpiderMonkey
-9651, and neither number is the one to compare a run against.
+different number of times on each engine, so V8 counts 10141 and SpiderMonkey
+9682, and neither number is the one to compare a run against.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
 engine archives were built with, and therefore the one a consumer links
@@ -1040,17 +1040,35 @@ client, usually before the dispatch returns. A pause runs inside whatever call
 was running script, and it is yours to run: `RunMessageLoopOnPause` feeds the
 session until DevTools resumes.
 
-A socket is read on a thread of its own, and a message read there reaches the
-isolate through `Inspector::RequestDispatch`, from any thread. It runs your
-callback on the isolate's thread at the next safe point - inside a running
-script, which is how a busy isolate still answers, or at the next `PumpJobs` if
-it is idle - and that callback may dispatch. Requests run in the order they were
-made; any still waiting when the `Inspector` is destroyed are dropped, not run.
+A socket is read on a thread of its own, and that thread holds the inspector's
+`Dispatcher()` - a `std::shared_ptr<ub::InspectorDispatcher>`, taken on the
+isolate's thread and handed over - never the `Inspector` itself:
+
+```cpp
+std::thread reader([dispatcher = inspector->Dispatcher(), &socket] {
+    while (auto message = socket.Receive()) {
+        // false once the inspector has gone; the callback then never runs
+        dispatcher->RequestDispatch(&DispatchOne, ub::CallbackData::For(*message));
+    }
+});
+```
+
+`RequestDispatch` runs your callback on the isolate's thread at the next safe
+point - inside a running script, which is how a busy isolate still answers, or
+at the next `PumpJobs` if it is idle - and that callback may dispatch. It is
+safe from any thread at any time, including while the isolate's thread is
+destroying the inspector and after: no mutex of yours around it. Each request
+runs exactly once, in the order they were made; a burst made before the isolate
+gets to them shares one wake-up. Any still waiting when the `Inspector` is
+destroyed are dropped, not run.
 
 A session goes before its inspector and an inspector before its isolate, all on
 the isolate's thread, and a realm is withdrawn with `ContextDestroyed` before
-the `Context` is let go. A connection that closes during a pause is `Stop`ped
-there - the session stops pausing script - and destroyed once the pause is over.
+the `Context` is let go. A connection that closes during a pause can simply be
+destroyed there, inside `RunMessageLoopOnPause`: that ends the pause as `Stop`
+does, and the client hears nothing more from the session. `Resume` does nothing
+outside a pause or after `Stop`. `Connect` is null only when there is not the
+memory to make a session.
 
 ---
 
@@ -1224,7 +1242,7 @@ not link there. Both engines still report the failure itself as
 `MOZ_CRASH`, so the backend recognises the crash itself.
 
 **Not thread-safe, by contract.** Everything but `TerminateExecution`,
-`RequestInterrupt`, `PostJob`, `PostDelayedJob` and the inspector's
+`RequestInterrupt`, `PostJob`, `PostDelayedJob` and the inspector dispatcher's
 `RequestDispatch` happens on the isolate's own thread.
 
 **Windows only.** x86 and x64 are both built and tested, on both backends, and

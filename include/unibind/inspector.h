@@ -32,14 +32,20 @@
 /// ---------------------------------------------------------------------------
 ///
 /// Everything happens on the isolate's own thread except
-/// `Inspector::RequestDispatch`, which is how a message arriving on a socket
-/// thread gets to the isolate. It runs the embedder's callback at the next safe
-/// point on the isolate's thread - in the middle of running script, which is
-/// how DevTools gets an answer from a busy isolate, or at the next
+/// `InspectorDispatcher::RequestDispatch`, which is how a message arriving on a
+/// socket thread gets to the isolate. It runs the embedder's callback at the
+/// next safe point on the isolate's thread - in the middle of running script,
+/// which is how DevTools gets an answer from a busy isolate, or at the next
 /// `Isolate::PumpJobs` if the isolate is idle - and unlike
 /// `Isolate::RequestInterrupt`'s callback, this one may dispatch protocol
 /// messages, which run script. The inspector is designed to be driven from
 /// exactly that point.
+///
+/// The dispatcher is a separate object, shared, because the thread that reads
+/// the socket is exactly the one that cannot know when the inspector goes: it
+/// is V8's `TaskRunner` shape - a `std::shared_ptr` a foreign thread holds for
+/// as long as it likes, which keeps answering after its owner is gone, by
+/// declining.
 ///
 /// A pause - a breakpoint, a `debugger` statement, a step - happens inside
 /// whatever call was running script, and it is the embedder's to run:
@@ -64,9 +70,11 @@
 ///
 /// **Lifetimes.** An `InspectorSession` does not outlive its `Inspector`, and an
 /// `Inspector` does not outlive its isolate: destroy them in that order, on the
-/// isolate's thread. A session is not destroyed from inside
-/// `RunMessageLoopOnPause` - stop it there if you must, and destroy it once the
-/// pause is over.
+/// isolate's thread. A session may be destroyed anywhere on that thread -
+/// inside `RunMessageLoopOnPause` and inside a callback its own dispatch made
+/// included (see `~InspectorSession`) - but the `Inspector` may not be
+/// destroyed while a pause or a dispatch is on the stack. An
+/// `InspectorDispatcher` may outlive everything, on any thread.
 
 #include <chrono>
 #include <memory>
@@ -119,8 +127,18 @@ class InspectorClient {
 };
 
 /// One DevTools connection. Isolate thread only.
+///
+/// `Resume`, `Stop` and destruction, in any order and any number of times, do
+/// what is written below and nothing else; none of them is an error.
 class InspectorSession {
    public:
+    /// The connection is gone: everything `Stop` does - a pause ends, as it
+    /// says - and the client is sent nothing more on this session's behalf.
+    /// Anywhere on the isolate's thread, including inside
+    /// `RunMessageLoopOnPause` and inside a callback this session's own
+    /// dispatch made, several frames below the engine's session: a connection
+    /// that closes during a pause is destroyed right there, not remembered
+    /// for later.
     ~InspectorSession();
 
     InspectorSession(const InspectorSession&) = delete;
@@ -131,18 +149,25 @@ class InspectorSession {
     /// A protocol message from DevTools, JSON in UTF-8. Answers arrive through
     /// `InspectorClient::SendProtocolMessage`, usually before this returns -
     /// and it may run script to produce them, so a `Runtime.evaluate` can
-    /// throw, loop or pause like any other script.
+    /// throw, loop or pause like any other script. Still answered after
+    /// `Stop`, but nothing a stopped session asks for pauses script:
+    /// `Debugger.enable` is refused.
     void DispatchProtocolMessage(std::string_view message);
 
     /// Leave a pause from outside the protocol - on the embedder's own
-    /// decision rather than a `Debugger.resume` from DevTools.
+    /// decision rather than a `Debugger.resume` from DevTools. The inspector
+    /// calls `InspectorClient::QuitMessageLoopOnPause` before this returns, and
+    /// the script goes on once `RunMessageLoopOnPause` does. Outside a pause it
+    /// does nothing, and after `Stop` it does nothing: a stopped session holds
+    /// no pause to leave.
     void Resume();
 
     /// The connection is going: the session stops pausing script - its
     /// breakpoints and `debugger` statements no longer stop anything - so that
-    /// nothing waits on a DevTools that is not there. Destroying the session
-    /// does this too; `Stop` is for a connection that closed while the session
-    /// cannot be destroyed yet, such as during a pause.
+    /// nothing waits on a DevTools that is not there. **During a pause it ends
+    /// the pause**: the inspector calls `InspectorClient::QuitMessageLoopOnPause`
+    /// before this returns, unless another session still has the debugger on.
+    /// Final - there is no restart - and a second call does nothing.
     void Stop();
 
     /// Implementation detail: the backend's per-session state.
@@ -155,9 +180,58 @@ class InspectorSession {
     std::unique_ptr<Impl> impl_;
 };
 
+/// How another thread reaches an inspector's isolate. Every member may be called
+/// from any thread, at any time - including while the `Inspector` is being
+/// destroyed on the isolate's thread, and after it has gone - so a socket
+/// thread holds one of these, never the `Inspector`. Made by
+/// `Inspector::Dispatcher`.
+class InspectorDispatcher {
+   public:
+    ~InspectorDispatcher();
+
+    InspectorDispatcher(const InspectorDispatcher&) = delete;
+    InspectorDispatcher& operator=(const InspectorDispatcher&) = delete;
+    InspectorDispatcher(InspectorDispatcher&&) = delete;
+    InspectorDispatcher& operator=(InspectorDispatcher&&) = delete;
+
+    /// Run `callback` on the isolate's thread at the next safe point - inside
+    /// running script, as soon as the engine next checks, or at the next
+    /// `Isolate::PumpJobs` if no script is running. Unlike
+    /// `Isolate::RequestInterrupt`'s, this callback may call
+    /// `InspectorSession::DispatchProtocolMessage`, and is how a message read
+    /// on a socket thread reaches a session.
+    ///
+    /// **Each request runs exactly once**, in the order requests were made -
+    /// the same callback and data asked for twice run twice. What is coalesced
+    /// is the wake-up, not the work: requests made before the isolate gets to
+    /// the first of them share one engine interrupt and one posted job, and
+    /// all of them run from whichever of the two reaches the thread first. A
+    /// request made while callbacks are running - by one of them, or from
+    /// another thread - runs in that same pass or a later one, never lost. A
+    /// pass runs until nothing is waiting, as `Isolate::PumpJobs` does, so a
+    /// thread that never stops requesting never lets it end.
+    ///
+    /// True when the request was taken. False when the inspector has gone, or
+    /// the request could not be stored (out of memory, or a null `callback`),
+    /// and then the callback never runs. A request taken and still waiting
+    /// when the `Inspector` is destroyed is dropped, not run - so true means
+    /// "will run unless the inspector goes first".
+    bool RequestDispatch(JobCallback callback, CallbackData data = {}) noexcept;
+
+    /// Implementation detail: the backend's shared dispatch state.
+    struct Impl;
+    [[nodiscard]] Impl& impl() const noexcept { return *impl_; }
+
+   private:
+    friend class Inspector;
+    explicit InspectorDispatcher(std::unique_ptr<Impl> impl) noexcept;
+
+    std::unique_ptr<Impl> impl_;
+};
+
 /// The inspector for one isolate: the realms DevTools can see, and the sessions
-/// it connects. At most one per isolate. Isolate thread only, except
-/// `RequestDispatch`.
+/// it connects. At most one per isolate. Isolate thread only; another thread
+/// reaches it through its `Dispatcher()`.
 class Inspector {
    public:
     /// Whether this backend has an inspector at all. Fixed for the program;
@@ -165,10 +239,13 @@ class Inspector {
     [[nodiscard]] static bool Supported() noexcept;
 
     /// An inspector for `isolate`, calling `client` - which must outlive it.
-    /// Null when `Supported()` is false, and null if the isolate already has
-    /// one.
+    /// Null when `Supported()` is false, null if the isolate already has one,
+    /// and null when there is not the memory to make one.
     [[nodiscard]] static std::unique_ptr<Inspector> New(Isolate& isolate, InspectorClient& client);
 
+    /// Drops every dispatch still waiting; from here on this inspector's
+    /// `InspectorDispatcher::RequestDispatch` declines. Not inside a pause or
+    /// a dispatch: a session may go there, the inspector may not.
     ~Inspector();
 
     Inspector(const Inspector&) = delete;
@@ -191,20 +268,17 @@ class Inspector {
     /// A new DevTools connection. Fully trusted, and not waiting for a debugger:
     /// script keeps running while DevTools attaches, and nothing is withheld
     /// from it.
+    ///
+    /// Null in one case only: there was not the memory to make the session.
+    /// The engine refuses no connection - any number may be open at once, and
+    /// one may be made during a pause - so null is handled as running out of
+    /// memory is handled anywhere else, not as a condition to wait out.
     [[nodiscard]] std::unique_ptr<InspectorSession> Connect();
 
-    /// From any thread: run `callback` on the isolate's thread at the next safe
-    /// point - inside running script, as soon as the engine next checks, or at
-    /// the next `Isolate::PumpJobs` if no script is running. Whichever comes
-    /// first runs it, once. Unlike `Isolate::RequestInterrupt`'s, this callback
-    /// may call `InspectorSession::DispatchProtocolMessage`, and is how a
-    /// message read on a socket thread reaches a session.
-    ///
-    /// Requests are run in the order they were made. Ones still waiting when
-    /// the `Inspector` is destroyed are dropped, not run; make sure no other
-    /// thread is still requesting by then. Does nothing when `Supported()` is
-    /// false.
-    void RequestDispatch(JobCallback callback, CallbackData data = {}) noexcept;
+    /// What another thread uses to reach this inspector: the same object on
+    /// every call, never null. Take it here, on the isolate's thread, and hand
+    /// it to the thread that reads the socket.
+    [[nodiscard]] std::shared_ptr<InspectorDispatcher> Dispatcher() const noexcept;
 
     /// Implementation detail: the backend's per-inspector state.
     struct Impl;
