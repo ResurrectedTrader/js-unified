@@ -808,3 +808,66 @@ UNIBIND_TEST_CASE(TERMINATION, "regressions: a native that caught a stop cannot 
     CHECK(state.ranAfterStop.load() == 0);
     fixture.iso().CancelTerminateExecution();
 }
+
+UNIBIND_TEST_CASE(TERMINATION, "regressions: a stopped isolate runs no getter, trap or conversion either") {
+    // Every operation that would run script fails until the stop is
+    // cancelled - and reading a property runs its getter, a proxy runs its
+    // traps, a conversion runs valueOf. SpiderMonkey's backend refuses each
+    // one at the door. V8's left it to the engine, which forgets a stop once
+    // its unwind is done, so a stopped isolate ran all of them.
+    ub_test::Fixture fixture;
+    (void)ub_test::Eval(fixture.context, R"(
+        globalThis.ran = [];
+        const note = (what) => { ran.push(what); return true; };
+        globalThis.plain = {
+            get g() { note('getter'); return 1; },
+            set s(v) { note('setter'); },
+            valueOf() { note('valueOf'); return 2; },
+            toString() { note('toString'); return 'x'; },
+        };
+        Object.defineProperty(plain, 0, { get() { note('index getter'); return 3; }, set(v) { note('index setter'); } });
+        globalThis.trapped = new Proxy({}, {
+            has() { return note('has'); },
+            deleteProperty() { return note('deleteProperty'); },
+            defineProperty() { return note('defineProperty'); },
+            getOwnPropertyDescriptor() { note('getOwnPropertyDescriptor'); return undefined; },
+            ownKeys() { note('ownKeys'); return []; },
+            getPrototypeOf() { note('getPrototypeOf'); return null; },
+            setPrototypeOf() { return note('setPrototypeOf'); },
+        });
+    )");
+    const ub::Local<ub::Object> global = fixture.context.GlobalObject();
+    const auto plain = global.Get(fixture.context, "plain")->To<ub::Object>();
+    const auto trapped = global.Get(fixture.context, "trapped")->To<ub::Object>();
+    REQUIRE(plain.has_value());
+    REQUIRE(trapped.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    const ub::Local<ub::String> key = ub_test::Str(fixture.iso(), "k");
+    const ub::Local<ub::Value> one = ub::Integer::New(fixture.iso(), 1);
+
+    // Stopped, and the stop has already run its course through the engine.
+    fixture.iso().TerminateExecution();
+    CHECK_FALSE(ub::Evaluate(fixture.context, "for (;;) {}").has_value());
+    REQUIRE(fixture.iso().IsExecutionTerminating());
+
+    const ub::Local<ub::Value> plainValue = *plain;
+    CHECK_FALSE(plain->Get(fixture.context, "g").has_value());
+    CHECK_FALSE(plain->Set(fixture.context, "s", one).has_value());
+    CHECK_FALSE(plain->Get(fixture.context, 0U).has_value());
+    CHECK_FALSE(plain->Set(fixture.context, 0U, one).has_value());
+    CHECK_FALSE(plainValue.ToNumber(fixture.context).has_value());
+    CHECK_FALSE(plainValue.ToString(fixture.context).has_value());
+    CHECK_FALSE(plainValue.Equals(fixture.context, one).has_value());
+    CHECK_FALSE(trapped->Has(fixture.context, key).has_value());
+    CHECK_FALSE(trapped->HasOwn(fixture.context, key).has_value());
+    CHECK_FALSE(trapped->Delete(fixture.context, key).has_value());
+    CHECK_FALSE(trapped->DefineOwnProperty(fixture.context, key, one).has_value());
+    CHECK_FALSE(trapped->GetPropertyAttributes(fixture.context, key).has_value());
+    CHECK_FALSE(trapped->GetOwnPropertyNames(fixture.context).has_value());
+    CHECK_FALSE(trapped->GetPrototype(fixture.context).has_value());
+    CHECK_FALSE(trapped->SetPrototype(fixture.context, *plain).has_value());
+    // NOLINTEND(bugprone-unchecked-optional-access)
+
+    fixture.iso().CancelTerminateExecution();
+    CHECK(ub_test::EvalText(fixture.context, "ran.join(', ')").empty());
+}

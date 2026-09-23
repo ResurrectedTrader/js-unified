@@ -398,6 +398,16 @@ stop is the open question listed at the end of this file, so that case reports
 it rather than asserting it, and every other case cancels (a no-op when nothing
 is armed) before carrying on. A decision either way touches one case.
 
+**And the other engine's state is not the stop either.** V8 is terminating
+only while its termination is pending: it forgets once the unwind reaches the
+top, and a native whose own `TryCatch` caught the stop is not terminating to it
+at all. So a stopped isolate on V8 ran the next getter, proxy trap, conversion
+or call, and a native that called its callback again after catching the stop
+ran a loop there for ever. V8's backend now keeps the stop itself at every
+entry that can reach script, as SpiderMonkey's does, and arms the engine again
+whenever it refuses; `regressions: a stopped isolate runs no getter, trap or
+conversion either` walks the entries.
+
 **A compile during a stop fails without asking the engine.** V8 asserts, in a
 debug build, that nothing enters its compiler while a termination is unwinding;
 a release V8 compiles anyway. Decision 15 says a stopped isolate may be asked

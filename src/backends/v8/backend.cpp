@@ -679,6 +679,26 @@ namespace {
     return *RecOf(context)->owner;
 }
 
+/// Whether a stop is in force - and if one is, V8's own termination armed
+/// again, so that whatever script is reached next stops at its first check.
+///
+/// V8 refuses to run script while its own termination is pending, and that is
+/// not the same thing as a stop being in force: it forgets one as soon as its
+/// unwind is done, and a native whose own `TryCatch` has caught the stop is no
+/// longer "terminating" to V8 either. Either way the next getter, trap,
+/// conversion or call ran. The stop is ours to keep (`unibind/isolate.h`), so
+/// every entry point that can reach script asks here first, as every one of
+/// SpiderMonkey's backend does; the ones that run script outright ask again
+/// when it came back empty, which re-arms the engine for whatever is reached
+/// afterwards.
+[[nodiscard]] bool Stopped(Isolate& isolate) noexcept {
+    if (!isolate.impl().terminating.load(std::memory_order_acquire)) {
+        return false;
+    }
+    isolate.impl().isolate->TerminateExecution();
+    return true;
+}
+
 /// Whether these bytes are UTF-8 - strictly, which is the only useful kind.
 ///
 /// V8 does not ask: `NewFromUtf8` replaces whatever it does not understand
@@ -969,6 +989,9 @@ bool SameValue(Slot lhs, Slot rhs) noexcept {
 }
 
 std::optional<bool> LooseEquals(const Context& context, Slot lhs, Slot rhs) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return FromV8(Resolve(lhs)->Equals(Raw(context), Resolve(rhs)));
 }
 
@@ -1042,6 +1065,9 @@ std::optional<bool> ToBoolean(const Context& context, Slot value) {
 }
 
 std::optional<double> ToNumber(const Context& context, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Maybe<double> number = Resolve(value)->NumberValue(Raw(context));
     if (number.IsNothing()) {
         return std::nullopt;
@@ -1050,6 +1076,9 @@ std::optional<double> ToNumber(const Context& context, Slot value) {
 }
 
 std::optional<int32_t> ToInt32(const Context& context, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Maybe<int32_t> number = Resolve(value)->Int32Value(Raw(context));
     if (number.IsNothing()) {
         return std::nullopt;
@@ -1058,6 +1087,9 @@ std::optional<int32_t> ToInt32(const Context& context, Slot value) {
 }
 
 std::optional<uint32_t> ToUint32(const Context& context, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Maybe<uint32_t> number = Resolve(value)->Uint32Value(Raw(context));
     if (number.IsNothing()) {
         return std::nullopt;
@@ -1066,6 +1098,9 @@ std::optional<uint32_t> ToUint32(const Context& context, Slot value) {
 }
 
 std::optional<Slot> ToJsString(const Context& context, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::String> string;
     if (!Resolve(value)->ToString(Raw(context)).ToLocal(&string)) {
         return std::nullopt;
@@ -1074,6 +1109,9 @@ std::optional<Slot> ToJsString(const Context& context, Slot value) {
 }
 
 std::optional<Slot> ToJsObject(const Context& context, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::Object> object;
     if (!Resolve(value)->ToObject(Raw(context)).ToLocal(&object)) {
         return std::nullopt;
@@ -1224,6 +1262,9 @@ std::optional<Slot> MakeError(const Context& context, ErrorKind kind, std::strin
 // ---------------------------------------------------------------------------
 
 std::optional<Slot> GetProperty(const Context& context, Slot object, Slot key) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return PushMaybe(OwnerOf(context), Resolve(object).As<v8::Object>()->Get(Raw(context), Resolve(key)));
 }
 
@@ -1240,6 +1281,9 @@ constexpr uint32_t MAX_ARRAY_INDEX = 0xFFFFFFFEU;
 }  // namespace
 
 std::optional<Slot> GetIndex(const Context& context, Slot object, uint32_t index) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
     if (index > MAX_ARRAY_INDEX) {
         return PushMaybe(OwnerOf(context), target->Get(Raw(context), v8::Number::New(Raw(OwnerOf(context)), index)));
@@ -1248,10 +1292,16 @@ std::optional<Slot> GetIndex(const Context& context, Slot object, uint32_t index
 }
 
 std::optional<bool> SetProperty(const Context& context, Slot object, Slot key, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return FromV8(Resolve(object).As<v8::Object>()->Set(Raw(context), Resolve(key), Resolve(value)));
 }
 
 std::optional<bool> SetIndex(const Context& context, Slot object, uint32_t index, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
     if (index > MAX_ARRAY_INDEX) {
         return FromV8(target->Set(Raw(context), v8::Number::New(Raw(OwnerOf(context)), index), Resolve(value)));
@@ -1261,20 +1311,32 @@ std::optional<bool> SetIndex(const Context& context, Slot object, uint32_t index
 
 std::optional<bool> DefineProperty(const Context& context, Slot object, Slot key, Slot value,
                                    PropertyAttribute attributes) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return FromV8(Resolve(object).As<v8::Object>()->DefineOwnProperty(
         Raw(context), Resolve(key).As<v8::Name>(), Resolve(value),
         static_cast<v8::PropertyAttribute>(static_cast<uint8_t>(attributes))));
 }
 
 std::optional<bool> HasProperty(const Context& context, Slot object, Slot key) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return FromV8(Resolve(object).As<v8::Object>()->Has(Raw(context), Resolve(key)));
 }
 
 std::optional<bool> HasOwnProperty(const Context& context, Slot object, Slot key) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return FromV8(Resolve(object).As<v8::Object>()->HasOwnProperty(Raw(context), Resolve(key).As<v8::Name>()));
 }
 
 std::optional<bool> DeleteProperty(const Context& context, Slot object, Slot key) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     return FromV8(Resolve(object).As<v8::Object>()->Delete(Raw(context), Resolve(key)));
 }
 
@@ -1291,6 +1353,9 @@ std::optional<bool> DeleteProperty(const Context& context, Slot object, Slot key
 // other engine finds them. No descriptor anywhere, whatever `has` said, is no
 // attributes.
 std::optional<PropertyAttribute> GetPropertyAttributes(const Context& context, Slot object, Slot key) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::Context> realm = Raw(context);
     v8::Isolate* raw = Raw(OwnerOf(context));
     v8::Local<v8::Object> holder = Resolve(object).As<v8::Object>();
@@ -1358,6 +1423,9 @@ std::optional<PropertyAttribute> GetPropertyAttributes(const Context& context, S
 }
 
 std::optional<Slot> GetOwnPropertyNames(const Context& context, Slot object, KeyFilter filter) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     int propertyFilter = filter.includeNonEnumerable ? v8::ALL_PROPERTIES : v8::ONLY_ENUMERABLE;
     if (!filter.includeSymbols) {
         propertyFilter |= v8::SKIP_SYMBOLS;
@@ -1379,6 +1447,9 @@ std::optional<Slot> GetOwnPropertyNames(const Context& context, Slot object, Key
 // one still takes the API's short way; a proxy's goes through its trap.
 
 std::optional<Slot> GetPrototype(const Context& context, Slot object) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::Object> target = Resolve(object).As<v8::Object>();
     if (!target->IsProxy()) {
         return PushOrNothing(OwnerOf(context), target->GetPrototype());
@@ -1390,6 +1461,9 @@ std::optional<Slot> GetPrototype(const Context& context, Slot object) {
 }
 
 std::optional<bool> SetPrototype(const Context& context, Slot object, Slot prototype) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Isolate* raw = Raw(OwnerOf(context));
     std::array<v8::Local<v8::Value>, 2> arguments{Resolve(object), Resolve(prototype)};
     v8::Local<v8::Value> result;
@@ -1638,6 +1712,9 @@ std::optional<Slot> MakePromise(const Context& context) {
 }
 
 std::optional<bool> ResolvePromise(const Context& context, Slot promise, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     v8::Local<v8::Promise> raw = Resolve(promise).As<v8::Promise>();
     if (raw->State() != v8::Promise::kPending) {
         return false;
@@ -1692,6 +1769,9 @@ class CloneDelegate final : public v8::ValueSerializer::Delegate {
 }  // namespace
 
 std::optional<std::vector<uint8_t>> SerializeValue(const Context& context, Slot value) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     Isolate& owner = OwnerOf(context);
     v8::Context::Scope entered(Raw(context));
     CloneDelegate delegate(Raw(owner));
@@ -1746,23 +1826,6 @@ class ArgumentBuffer {
 };
 
 }  // namespace
-
-/// Whether a stop is in force - and if one is, V8's own termination armed
-/// again, so that whatever script is reached next stops at its first check.
-///
-/// V8 refuses to run script while its termination is pending, but a native
-/// whose own `TryCatch` has caught the stop is no longer "terminating" to V8:
-/// its next call into script ran, and nothing was left to stop it. The stop
-/// is ours to keep (`unibind/isolate.h`), so the entry points that run script
-/// ask here first, and ask again when what they ran came back empty - which is
-/// what re-arms the engine for a getter or a conversion reached afterwards.
-[[nodiscard]] bool Stopped(Isolate& isolate) noexcept {
-    if (!isolate.impl().terminating.load(std::memory_order_acquire)) {
-        return false;
-    }
-    isolate.impl().isolate->TerminateExecution();
-    return true;
-}
 
 std::optional<Slot> CallFunction(const Context& context, Slot function, Slot receiver,
                                  std::span<const Slot> arguments) {
@@ -2289,6 +2352,9 @@ void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetter
 std::optional<bool> SetAccessorProperty(const Context& context, Slot object, std::string_view name,
                                         AccessorGetterCallback getter, AccessorSetterCallback setter, CallbackData data,
                                         PropertyAttribute attributes) {
+    if (Stopped(OwnerOf(context))) {
+        return std::nullopt;
+    }
     Isolate& owner = IsolateFor(object);
     v8::Local<v8::Context> raw = Raw(context);
     v8::Local<v8::String> key = RawString(owner, name);
