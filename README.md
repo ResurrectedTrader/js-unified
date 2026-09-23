@@ -18,11 +18,11 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 
 | | |
 |---|---|
-| Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting |
+| Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting, a Chrome DevTools inspector |
 | V8 15.6 | implements all of it |
-| SpiderMonkey 153.3.0esr | implements all of it except the near-heap-limit hook, which its engine does not have - a call to that one does not link there, on purpose |
-| Tests | one suite, written once against `ub::`: 297 cases, green on both backends, every case compared backend against backend with no divergences |
-| Not here | a debugger, and cross-realm access control - see [Limits](#limits) |
+| SpiderMonkey 153.3.0esr | implements all of it except two things its engine does not have: the near-heap-limit hook - a call to that one does not link, on purpose - and the inspector, which links and answers `Supported()` with false |
+| Tests | one suite, written once against `ub::`: 304 cases, green on both backends, every case compared backend against backend with no divergences |
+| Not here | cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
 > them.** It is sixty-odd traps indexed by what you were doing when it bit you,
@@ -45,7 +45,7 @@ handle model is where that bites hardest.
 
 The rest of [`docs/`](docs/) is the design: [`lifetimes.md`](docs/lifetimes.md)
 for the handle model everything else follows from,
-[`status.md`](docs/status.md) for the twenty-eight decisions a backend author has
+[`status.md`](docs/status.md) for the twenty-nine decisions a backend author has
 to know, [`testing.md`](docs/testing.md) for where the two engines differ and
 what the suite asserts instead, [`spidermonkey.md`](docs/spidermonkey.md) for
 what writing the second backend cost, and
@@ -69,6 +69,7 @@ what writing the second backend cost, and
   - [8. Promises, jobs, and the drain](#8-promises-jobs-and-the-drain)
   - [9. Stopping a runaway script](#9-stopping-a-runaway-script)
   - [10. When the engine itself is in trouble](#10-when-the-engine-itself-is-in-trouble)
+  - [11. Chrome DevTools](#11-chrome-devtools)
 - [Rules an embedder must know](#rules-an-embedder-must-know)
 - [What it costs](#what-it-costs)
 - [Gotchas worth knowing before you start](#gotchas-worth-knowing-before-you-start)
@@ -124,16 +125,16 @@ to refuse the fetch outright and be told what to unpack where.
 bump repoints the tag, the asset and the directory together rather than
 silently reusing the old library.
 
-The number `ctest` prints is a little larger than 297 and depends on the tree,
+The number `ctest` prints is a little larger than 304 and depends on the tree,
 because it registers the suite's cases *and* a few things that cannot be cases
 among others: the whole suite again in one process, four checks that each need
 a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **297 cases is the figure that means the same thing everywhere** - it is
+built). **304 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
-different number of times on each engine, so V8 counts 8906 and SpiderMonkey
-8879, and neither number is the one to compare a run against.
+different number of times on each engine, so V8 counts 8980 and SpiderMonkey
+8894, and neither number is the one to compare a run against.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
 engine archives were built with, and therefore the one a consumer links
@@ -975,6 +976,40 @@ That is this library's standing answer for an operation an engine cannot do: a
 build error at your call site, not a field that compiles everywhere and fires in
 half the builds.
 
+### 11. Chrome DevTools
+
+```cpp
+class DevTools final : public ub::InspectorClient {
+    void SendProtocolMessage(std::string_view message) override { socket.Send(message); }
+    void RunMessageLoopOnPause() override {
+        paused = true;
+        while (paused) {                                        // script is stopped until this returns
+            session->DispatchProtocolMessage(socket.Receive());
+        }
+    }
+    void QuitMessageLoopOnPause() override { paused = false; }  // a Debugger.resume came through
+    // ...
+};
+
+if (ub::Inspector::Supported()) {                               // false on SpiderMonkey, and it links anyway
+    const auto inspector = ub::Inspector::New(isolate, devTools);
+    inspector->ContextCreated(context, "main");
+    const auto session = inspector->Connect();
+}
+```
+
+DevTools talks to a session in protocol messages - JSON, UTF-8 -
+`DispatchProtocolMessage` takes them in, and answers come back through the
+client, usually before the dispatch returns. A pause runs inside whatever call
+was running script, and it is yours to run: `RunMessageLoopOnPause` feeds the
+session until DevTools resumes.
+
+A socket is read on a thread of its own, and a message read there reaches the
+isolate through `Inspector::RequestDispatch`, from any thread. It runs your
+callback on the isolate's thread at the next safe point - inside a running
+script, which is how a busy isolate still answers, or at the next `PumpJobs` if
+it is idle - and that callback may dispatch.
+
 ---
 
 ## Rules an embedder must know
@@ -1110,17 +1145,20 @@ matter of writing one.
 
 ## Limits
 
-**No debugger, and that is a conclusion rather than a deferral.** V8's debugging
-surface is the inspector protocol - a C++ channel carrying CDP messages - while
-SpiderMonkey's is the `Debugger` object, a JavaScript API installed into a
-debuggee realm. They do not share a shape, a vocabulary or even a language. The
-only common C++ surface would be "ask the backend whether it has a debugger",
-which is a string, not an abstraction. A debugger belongs to a per-engine
-frontend built *on* unibind - and for V8 that frontend needs the engine objects,
-which [`unibind/interop/v8.h`](include/unibind/interop/v8.h) hands out
-(`ub::interop::V8Isolate`, `ub::interop::V8Context`). It is the one header whose
-functions only one backend defines: put the code that calls it in a library
-linked only into the V8 build, and link something else in its place for
+**A debugger where the engine has the protocol, and not where it does not.**
+[`unibind/inspector.h`](include/unibind/inspector.h) offers the Chrome DevTools
+inspector - V8's inspector protocol, in this library's terms - and on
+SpiderMonkey `Inspector::Supported()` says no. Its debugging surface is the
+`Debugger` object, a JavaScript API installed into a debuggee realm, which
+speaks no protocol and has no C++ session to drive; a DevTools server over it
+would be a different and much larger thing than a backend. A program links
+either way and asks at run time (decision 29).
+
+For anything else only V8 can do,
+[`unibind/interop/v8.h`](include/unibind/interop/v8.h) hands out the engine
+objects (`ub::interop::V8Isolate`, `ub::interop::V8Context`). It is the one
+header whose functions only one backend defines: put the code that calls it in a
+library linked only into the V8 build, and link something else in its place for
 SpiderMonkey.
 
 **Cross-realm access control is not expressible.** Two realms cannot be told to

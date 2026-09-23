@@ -8,6 +8,7 @@
 
 #include <array>
 #include <memory>
+#include <string_view>
 
 #include "unibind/unibind.h"
 
@@ -54,6 +55,39 @@ void WriteValue(Native& self, const ub::Local<ub::Value>& value, const ub::Prope
 
 ub::Intercepted Intercept(const ub::Local<ub::Name>& /*name*/, const ub::PropertyCallbackInfo& /*info*/) {
     return ub::Intercepted::No;
+}
+
+/// The inspector's client is the one interface in the API an embedder
+/// implements by overriding, so it has to be instantiable against the header
+/// alone - which is also what says its defaults are defined there.
+struct Client final : ub::InspectorClient {
+    void SendProtocolMessage(std::string_view /*message*/) override {}
+    void RunMessageLoopOnPause() override {}
+    void QuitMessageLoopOnPause() override {}
+};
+
+void OnDispatch(ub::Isolate& /*isolate*/, ub::CallbackData /*data*/) {}
+
+[[maybe_unused]] void Inspect(ub::Isolate& isolate, const ub::Context& context) {
+    Client client;
+    (void)client.CurrentTimeMs();
+    (void)client.ResourceNameToUrl("x.js");
+    if (!ub::Inspector::Supported()) {
+        return;
+    }
+    const auto inspector = ub::Inspector::New(isolate, client);
+    if (inspector == nullptr) {
+        return;
+    }
+    inspector->ContextCreated(context, "main");
+    const auto session = inspector->Connect();
+    if (session != nullptr) {
+        session->DispatchProtocolMessage(R"({"id":1,"method":"Runtime.enable"})");
+        session->Resume();
+        session->Stop();
+    }
+    inspector->RequestDispatch(&OnDispatch);
+    inspector->ContextDestroyed(context);
 }
 
 [[maybe_unused]] void Surface(ub::Isolate& isolate, const ub::Context& context) {

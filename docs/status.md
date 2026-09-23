@@ -11,18 +11,21 @@ decision 19, where the compiled-code cache is three entry points precisely so a
 backend without one can define none of them.
 
 **Where the two backends are.** Both implement everything the headers declare
-that their engines can do, decisions 1-28, and the suite agrees case for case:
-297 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
+that their engines can do, decisions 1-29, and the suite agrees case for case:
+304 cases compared, **no divergences**. The single `SKIPPED | SKIPPED` row is the
 harness's own test of the skip path, which exists so that the machinery for
 reporting a missing area is exercised on every backend rather than only on the
 day one falls behind.
 
-Two rows are `SKIPPED | PASSED`, and they are the first ones here that are not a
-backend falling behind. `HEAP_LIMIT` is decision 28's near-heap-limit hook:
-SpiderMonkey has no such thing to implement, so it defines nothing, a call does
-not link, and the two cases report a skip. That is the shape decision 19
-designed for an absent operation, working as designed - it is a gap in the
-*engines*, and the report saying so is the point rather than a defect in it.
+Eight rows are `SKIPPED | PASSED`, and none of them is a backend falling behind.
+Two are `HEAP_LIMIT`, decision 28's near-heap-limit hook: SpiderMonkey has no
+such thing to implement, so it defines nothing, a call does not link, and the
+two cases report a skip. That is the shape decision 19 designed for an absent
+operation, working as designed - it is a gap in the *engines*, and the report
+saying so is the point rather than a defect in it. The other six are the
+inspector's protocol cases (decision 29), which ask `Inspector::Supported()` and
+report a skip where it says no - the same gap, reported the way decision 29 says
+this one is.
 
 - V8 15.6: `src/backends/v8/`.
 - SpiderMonkey 153.3.0esr: `src/backends/spidermonkey/`. Its own notes - what
@@ -944,17 +947,55 @@ Handles are refused for a second reason on top of that one: an interrupt may
 make them because the engine sets a scope up for exactly that, and nothing sets
 one up here.
 
-### A note on the debugger, which is out of scope
+### 29. The inspector is offered where the engine has one (`unibind/inspector.h`)
 
-Deliberately, and this is the conclusion rather than a deferral. V8's debugging
-surface is the inspector protocol - a C++ channel carrying CDP messages -
-while SpiderMonkey's is the `Debugger` object, a JavaScript API installed into a
-debuggee realm. They do not share a shape, a vocabulary, or even a language: one
-is bytes over a channel, the other is script calling script. There is no common
-C++ surface to abstract, and the only honest common denominator would be "ask the
-backend whether it has a debugger and how to reach it", which is a string, not an
-abstraction. A `unibind` debugger belongs to a `unibind` *frontend* built per engine, not
-to this API.
+This reverses what used to stand here, which was that a debugger is out of
+scope. The reasoning behind that was sound as far as it went: V8's debugging
+surface is the inspector protocol - a C++ channel carrying CDP messages - while
+SpiderMonkey's is the `Debugger` object, a JavaScript API installed into a
+debuggee realm, and the two share no shape to abstract. What changed is the
+requirement. **A consumer compiles against these headers and nothing else**:
+anything it needs from V8 is abstracted here, and the one thing that still sent
+a consumer to V8 directly - through `unibind/interop/v8.h` - was a Chrome
+DevTools inspector. So there is now an inspector API, and it is V8's
+`v8_inspector` in this library's terms: an embedder-written `InspectorClient`,
+one `Inspector` per isolate, an `InspectorSession` per connection.
+
+It does not pretend SpiderMonkey has one. **`Inspector::Supported()` answers at
+run time, and every member is defined on every backend**, so a program links
+either way; on SpiderMonkey `New` returns null and nothing else is reachable.
+That is deliberately not decision 19's link error, and the difference is the
+point: whether to open a DevTools port is decided when a program starts, not
+when it is built, and one binary has to be able to make that decision against
+either engine. What keeps it from being the silent answer decision 19 refuses is
+that there is no parameter here a backend quietly ignores - only an object a
+backend declines to make, and a null pointer is not used by accident.
+
+Three things had to be decided on top of V8's shape:
+
+- **One thread may be foreign.** `RequestDispatch` is how a message read on a
+  socket thread reaches the isolate, and it runs the embedder's callback at
+  whichever comes first: an interrupt, which reaches a script that is running
+  and never fires while the isolate is idle, or the next `PumpJobs`, which is
+  the other way round. Unlike `RequestInterrupt`'s callback (decision 24) it may
+  dispatch protocol messages, which run script - V8's inspector is designed to
+  be driven from exactly that point, and it is how a busy isolate still answers
+  DevTools. The queue lives on the isolate rather than the inspector, because an
+  interrupt or a job still in flight is handed the isolate, which outlives it.
+- **The default realm** - where an evaluation naming no context runs - is the
+  one announced most recently and not yet withdrawn. The inspector holds realms
+  weakly: DevTools seeing one is no reason for it to live.
+- **Two names are not V8's.** `sendResponse` and `sendNotification` are one
+  `SendProtocolMessage`, because an embedder forwards both to the same socket;
+  and neither that nor `DispatchProtocolMessage` is spelled `SendMessage` or
+  `DispatchMessage`, which `<windows.h>` defines as macros. A member with either
+  name is silently renamed in whichever translation units included it first - an
+  override that overrides nothing, or a call that links against a function
+  nobody defined.
+
+`unibind/interop/v8.h` stays, for whatever else only V8 can do, and it is still
+the one header whose functions only one backend defines. The inspector no longer
+needs it.
 
 ## Smaller things worth knowing
 
@@ -1039,12 +1080,15 @@ skip rather than failing to link:
 "ARRAY_BUFFER_VIEWS|ArrayBufferViewByteLength,ArrayBufferViewByteOffset,ArrayBufferViewBuffer,ArrayBufferViewCopyOut,MakeDataView"
 "FUNCTION_VALUE_DATA|MakeFunctionWithValue,CallbackValueData"
 "EAGER_COMPILE|CompileScript,CompileScriptWithCache,ScriptCreateCodeCache"
+"INSPECTOR|Supported@Inspector,New@Inspector,ContextCreated@Inspector,ContextDestroyed@Inspector,Connect@Inspector,RequestDispatch@Inspector,DispatchProtocolMessage@InspectorSession,Resume@InspectorSession,Stop@InspectorSession"
 ```
 
 `EAGER_COMPILE` names no new symbol, like `STACK_LIMIT`: the option rides on the
 two compile entry points, and the row is there so the area is listed.
 `String::NewFromUtf8` has no row at all, because it adds no entry point - it is
-written in the header over `String::New`.
+written in the header over `String::New`. `INSPECTOR` is present on every
+backend by construction, since every backend defines all of it (decision 29); it
+is a row so the area is listed, and its cases gate on `Supported()` inside.
 
 Decision 28 is the clearest case that rule was written for, and it splits in
 two: `HEAP_LIMIT` earns a row because one engine has the hook and the other has

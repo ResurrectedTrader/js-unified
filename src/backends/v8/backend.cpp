@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <ranges>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -36,6 +37,7 @@
 // v8-template.h names std::span<const v8::CFunction> while v8.h only forward
 // declares CFunction; this header is what completes it.
 #include <v8-fast-api-calls.h>
+#include <v8-inspector.h>
 #include <v8.h>
 
 #include "unibind/class.h"
@@ -43,6 +45,7 @@
 #include "unibind/exception.h"
 #include "unibind/function.h"
 #include "unibind/handle.h"
+#include "unibind/inspector.h"
 #include "unibind/interop/v8.h"
 #include "unibind/isolate.h"
 #include "unibind/script.h"
@@ -193,6 +196,13 @@ struct Isolate::Impl {
     /// compilation cache files it apart from a lazy compile of the same source.
     /// See `CompileInto`.
     v8::Global<v8::PrimitiveArray> eagerMarker;
+    /// The isolate's inspector, if it has one - there is at most one - and the
+    /// work `Inspector::RequestDispatch` has queued for it. The queue is here
+    /// rather than in the inspector because what a V8 interrupt and a posted
+    /// job are handed is this isolate, which outlives any request still in
+    /// flight; an inspector's address would not. Guarded by `work`.
+    Inspector* inspector = nullptr;
+    std::deque<std::pair<JobCallback, CallbackData>> inspectorDispatches;
 };
 
 namespace detail {
@@ -3286,6 +3296,7 @@ Isolate::~Isolate() {
     impl_->accessors.clear();
     impl_->valueDataTemplate.Reset();
     impl_->eagerMarker.Reset();
+    assert(impl_->inspector == nullptr && "an Inspector outlived its Isolate");
     // Callback records outlive nothing: the isolate is going, so anything that
     // could still reach them is going too.
     impl_->callbacks.clear();
@@ -3488,5 +3499,321 @@ v8::Local<v8::Context> V8Context(const Context& context) noexcept {
 }
 
 }  // namespace interop
+
+// ---------------------------------------------------------------------------
+// The inspector
+//
+// `v8_inspector` is this API's model, so this is adapters and nothing more: a
+// `V8InspectorClient` that forwards to the embedder's `InspectorClient`, a
+// `Channel` per session that does the same for protocol messages, and the
+// conversion between the embedder's UTF-8 and the inspector's `StringView`,
+// which is either 8-bit or UTF-16 and says which.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Every realm is in one context group. The group is the inspector's unit of
+/// "what one debugger sees", and this API has one debugger per isolate.
+constexpr int CONTEXT_GROUP = 1;
+
+/// What an 8-bit `StringView` holds depends on where it came from, and nothing
+/// in it says so. A protocol message is JSON the inspector serialised, which
+/// is UTF-8 - in practice ASCII, with anything else escaped. A name converted
+/// from one of V8's own strings is Latin-1, one byte per UTF-16 unit below
+/// 256.
+enum class EightBit : bool { Utf8, Latin1 };
+
+void AppendUtf8(std::string& out, std::uint32_t point) {
+    if (point < 0x80) {
+        out.push_back(static_cast<char>(point));
+    } else if (point < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (point >> 6)));
+        out.push_back(static_cast<char>(0x80 | (point & 0x3F)));
+    } else if (point < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (point >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((point >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (point & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (point >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((point >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((point >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (point & 0x3F)));
+    }
+}
+
+[[nodiscard]] std::string ToUtf8(const v8_inspector::StringView& view, EightBit eightBit) {
+    std::string out;
+    if (view.is8Bit()) {
+        const auto* bytes = view.characters8();
+        if (eightBit == EightBit::Utf8) {
+            out.assign(reinterpret_cast<const char*>(bytes), view.length());
+            return out;
+        }
+        out.reserve(view.length());
+        for (size_t i = 0; i < view.length(); ++i) {
+            AppendUtf8(out, bytes[i]);
+        }
+        return out;
+    }
+    // UTF-16, where a surrogate that is not half of a pair has no UTF-8 of its
+    // own and becomes U+FFFD, as `Utf8Value` makes it.
+    const auto* units = view.characters16();
+    out.reserve(view.length());
+    for (size_t i = 0; i < view.length(); ++i) {
+        const std::uint32_t unit = units[i];
+        if (unit >= 0xD800 && unit <= 0xDBFF && i + 1 < view.length() && units[i + 1] >= 0xDC00 &&
+            units[i + 1] <= 0xDFFF) {
+            AppendUtf8(out, 0x10000 + ((unit - 0xD800) << 10) + (units[i + 1] - 0xDC00));
+            ++i;
+        } else if (unit >= 0xD800 && unit <= 0xDFFF) {
+            AppendUtf8(out, 0xFFFD);
+        } else {
+            AppendUtf8(out, unit);
+        }
+    }
+    return out;
+}
+
+/// UTF-8 to the UTF-16 the inspector takes a name or a URL in. Bytes that are
+/// not UTF-8 become U+FFFD, by the rule `String::NewFromUtf8` uses.
+[[nodiscard]] std::vector<uint16_t> ToUtf16(std::string_view utf8) {
+    std::vector<uint16_t> out;
+    out.reserve(utf8.size());
+    for (size_t at = 0; at < utf8.size();) {
+        const detail::Utf8Step step = detail::NextUtf8(utf8, at);
+        std::uint32_t point = 0xFFFD;
+        if (step.valid) {
+            static constexpr std::array<std::uint8_t, 5> LEAD_MASK{0, 0x7F, 0x1F, 0x0F, 0x07};
+            point = static_cast<std::uint8_t>(utf8[at]) & LEAD_MASK[step.length];
+            for (size_t k = 1; k < step.length; ++k) {
+                point = (point << 6) | (static_cast<std::uint8_t>(utf8[at + k]) & 0x3FU);
+            }
+        }
+        if (point >= 0x10000) {
+            out.push_back(static_cast<uint16_t>(0xD800 + ((point - 0x10000) >> 10)));
+            out.push_back(static_cast<uint16_t>(0xDC00 + ((point - 0x10000) & 0x3FF)));
+        } else {
+            out.push_back(static_cast<uint16_t>(point));
+        }
+        at += step.length;
+    }
+    return out;
+}
+
+[[nodiscard]] v8_inspector::StringView ViewOf(const std::vector<uint16_t>& units) noexcept {
+    return {units.data(), units.size()};
+}
+
+/// Run what `RequestDispatch` queued, in order, until nothing is left - which
+/// includes anything a callback queues while it runs. Called from a V8
+/// interrupt and from a posted job, whichever reaches the isolate first; the
+/// other finds the queue empty.
+void DrainDispatches(Isolate& isolate) {
+    for (;;) {
+        JobCallback callback = nullptr;
+        CallbackData data;
+        {
+            const std::scoped_lock guard(isolate.impl().work);
+            auto& queue = isolate.impl().inspectorDispatches;
+            if (queue.empty()) {
+                return;
+            }
+            std::tie(callback, data) = queue.front();
+            queue.pop_front();
+        }
+        callback(isolate, data);
+    }
+}
+
+void DispatchInterrupt(v8::Isolate* /*raw*/, void* data) {
+    DrainDispatches(*static_cast<Isolate*>(data));
+}
+
+void DispatchJob(Isolate& isolate, CallbackData /*data*/) {
+    DrainDispatches(isolate);
+}
+
+}  // namespace
+
+/// The inspector's side of the embedder's client. V8 asks it for the default
+/// realm, the time and a script's URL, and tells it about pauses.
+struct Inspector::Impl final : v8_inspector::V8InspectorClient {
+    Impl(Isolate& owner, InspectorClient& client) : owner(&owner), client(&client) {}
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    Impl(Impl&&) = delete;
+    Impl& operator=(Impl&&) = delete;
+    ~Impl() override = default;
+
+    void runMessageLoopOnPause(int /*contextGroupId*/) override { client->RunMessageLoopOnPause(); }
+    void quitMessageLoopOnPause() override { client->QuitMessageLoopOnPause(); }
+    double currentTimeMS() override { return client->CurrentTimeMs(); }
+
+    /// The realm announced most recently and not yet withdrawn - or collected,
+    /// since what is kept here does not keep a realm alive.
+    v8::Local<v8::Context> ensureDefaultContextInGroup(int /*contextGroupId*/) override {
+        v8::Isolate* raw = owner->impl().isolate;
+        for (const auto& kept : std::views::reverse(contexts)) {
+            if (!kept.IsEmpty()) {
+                return kept.Get(raw);
+            }
+        }
+        return {};
+    }
+
+    std::unique_ptr<v8_inspector::StringBuffer> resourceNameToUrl(
+        const v8_inspector::StringView& resourceName) override {
+        auto url = client->ResourceNameToUrl(ToUtf8(resourceName, EightBit::Latin1));
+        if (!url) {
+            return nullptr;
+        }
+        return v8_inspector::StringBuffer::create(ViewOf(ToUtf16(*url)));
+    }
+
+    Isolate* owner;
+    InspectorClient* client;
+    /// The realms announced and not withdrawn, oldest first; the last live one
+    /// is where an evaluation naming no context runs. Weak: DevTools seeing a
+    /// realm is no reason for it to live.
+    std::vector<v8::Global<v8::Context>> contexts;
+    // Last, so that it goes first: V8's inspector calls back into this object
+    // while it is being torn down.
+    std::unique_ptr<v8_inspector::V8Inspector> inspector;
+};
+
+/// One connection: V8's channel, forwarding every message to the embedder.
+struct InspectorSession::Impl final : v8_inspector::V8Inspector::Channel {
+    Impl(Isolate& owner, InspectorClient& client) : owner(&owner), client(&client) {}
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    Impl(Impl&&) = delete;
+    Impl& operator=(Impl&&) = delete;
+    ~Impl() override = default;
+
+    void sendResponse(int /*callId*/, std::unique_ptr<v8_inspector::StringBuffer> message) override {
+        client->SendProtocolMessage(ToUtf8(message->string(), EightBit::Utf8));
+    }
+    void sendNotification(std::unique_ptr<v8_inspector::StringBuffer> message) override {
+        client->SendProtocolMessage(ToUtf8(message->string(), EightBit::Utf8));
+    }
+    // Nothing is buffered on this side, so there is nothing to flush.
+    void flushProtocolNotifications() override {}
+
+    Isolate* owner;
+    InspectorClient* client;
+    // Last, so that it goes before the channel it reports through.
+    std::unique_ptr<v8_inspector::V8InspectorSession> session;
+};
+
+bool Inspector::Supported() noexcept {
+    return true;
+}
+
+std::unique_ptr<Inspector> Inspector::New(Isolate& isolate, InspectorClient& client) {
+    if (isolate.impl().inspector != nullptr) {
+        return nullptr;
+    }
+    auto impl = std::make_unique<Impl>(isolate, client);
+    {
+        const v8::HandleScope scope(isolate.impl().isolate);
+        impl->inspector = v8_inspector::V8Inspector::create(isolate.impl().isolate, impl.get());
+    }
+    if (impl->inspector == nullptr) {
+        return nullptr;
+    }
+    std::unique_ptr<Inspector> made(new Inspector(std::move(impl)));
+    isolate.impl().inspector = made.get();
+    return made;
+}
+
+Inspector::Inspector(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+Inspector::~Inspector() {
+    Isolate& owner = *impl_->owner;
+    {
+        const std::scoped_lock guard(owner.impl().work);
+        owner.impl().inspectorDispatches.clear();
+    }
+    owner.impl().inspector = nullptr;
+    const v8::HandleScope scope(owner.impl().isolate);
+    impl_->inspector.reset();
+    impl_->contexts.clear();
+}
+
+void Inspector::ContextCreated(const Context& context, std::string_view name) {
+    v8::Isolate* raw = impl_->owner->impl().isolate;
+    const v8::HandleScope scope(raw);
+    v8::Local<v8::Context> local = detail::Raw(context);
+    const std::vector<uint16_t> title = ToUtf16(name);
+    const v8_inspector::V8ContextInfo info(local, CONTEXT_GROUP, ViewOf(title));
+    impl_->inspector->contextCreated(info);
+    // Collected entries go here rather than in a weak callback, which would
+    // have to reach this vector from inside a collection.
+    std::erase_if(impl_->contexts, [](const v8::Global<v8::Context>& kept) { return kept.IsEmpty(); });
+    impl_->contexts.emplace_back(raw, local).SetWeak();
+}
+
+void Inspector::ContextDestroyed(const Context& context) {
+    v8::Isolate* raw = impl_->owner->impl().isolate;
+    const v8::HandleScope scope(raw);
+    v8::Local<v8::Context> local = detail::Raw(context);
+    impl_->inspector->contextDestroyed(local);
+    std::erase_if(impl_->contexts, [raw, local](const v8::Global<v8::Context>& kept) {
+        return kept.IsEmpty() || kept.Get(raw) == local;
+    });
+}
+
+std::unique_ptr<InspectorSession> Inspector::Connect() {
+    auto impl = std::make_unique<InspectorSession::Impl>(*impl_->owner, *impl_->client);
+    {
+        const v8::HandleScope scope(impl_->owner->impl().isolate);
+        impl->session = impl_->inspector->connect(CONTEXT_GROUP, impl.get(), v8_inspector::StringView(),
+                                                  v8_inspector::V8Inspector::kFullyTrusted,
+                                                  v8_inspector::V8Inspector::kNotWaitingForDebugger);
+    }
+    if (impl->session == nullptr) {
+        return nullptr;
+    }
+    return std::unique_ptr<InspectorSession>(new InspectorSession(std::move(impl)));
+}
+
+void Inspector::RequestDispatch(JobCallback callback, CallbackData data) noexcept {
+    if (callback == nullptr) {
+        return;
+    }
+    Isolate& owner = *impl_->owner;
+    {
+        const std::scoped_lock guard(owner.impl().work);
+        owner.impl().inspectorDispatches.emplace_back(callback, data);
+    }
+    // Both, and whichever arrives first drains: an interrupt reaches a script
+    // that is running and never fires while the isolate is idle, and a job is
+    // the other way round.
+    owner.impl().isolate->RequestInterrupt(&DispatchInterrupt, &owner);
+    owner.PostJob(&DispatchJob, {});
+}
+
+InspectorSession::InspectorSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+InspectorSession::~InspectorSession() {
+    const v8::HandleScope scope(impl_->owner->impl().isolate);
+    impl_->session.reset();
+}
+
+void InspectorSession::DispatchProtocolMessage(std::string_view message) {
+    const v8::HandleScope scope(impl_->owner->impl().isolate);
+    impl_->session->dispatchProtocolMessage(
+        v8_inspector::StringView(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+}
+
+void InspectorSession::Resume() {
+    impl_->session->resume();
+}
+
+void InspectorSession::Stop() {
+    impl_->session->stop();
+}
 
 }  // namespace ub

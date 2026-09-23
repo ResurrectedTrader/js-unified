@@ -18,6 +18,7 @@ endif()
 add_library(unibind_backend_spidermonkey STATIC
     backend.cpp
     frame_alloc.cpp
+    inspector.cpp
     templates.cpp)
 add_library(unibind::backend_spidermonkey ALIAS unibind_backend_spidermonkey)
 

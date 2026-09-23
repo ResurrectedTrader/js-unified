@@ -1,9 +1,10 @@
 #pragma once
 
 /// The V8 objects under a `ub::Isolate` and a `ub::Context`, for the few things
-/// only V8 can do - the one that motivated it being the V8 inspector (Chrome
-/// DevTools), which is an API over `v8::Isolate` and `v8::Context` and has no
-/// counterpart in the other engine.
+/// only V8 can do and this library does not abstract. The Chrome DevTools
+/// inspector, which is what first needed these, is not one of them any more:
+/// `unibind/inspector.h` offers it on every backend that has one, and a program
+/// that uses it compiles against no engine header at all.
 ///
 /// **This is the one header whose functions only one backend defines.** It
 /// compiles without V8's headers - the V8 types are forward-declared, so

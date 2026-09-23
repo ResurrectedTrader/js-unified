@@ -41,6 +41,7 @@
 #include "unibind/function.h"
 #include "unibind/fwd.h"
 #include "unibind/handle.h"
+#include "unibind/inspector.h"
 #include "unibind/isolate.h"
 #include "unibind/script.h"
 #include "unibind/template.h"

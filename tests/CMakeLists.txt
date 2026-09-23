@@ -46,6 +46,7 @@ add_executable(unibind_tests
     cases/faults_test.cpp
     cases/functions_test.cpp
     cases/handles_test.cpp
+    cases/inspector_test.cpp
     cases/harness_test.cpp
     cases/interceptors_test.cpp
     cases/isolate_test.cpp

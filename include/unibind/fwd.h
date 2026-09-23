@@ -56,6 +56,9 @@ class CallbackInfo;
 class PropertyCallbackInfo;
 class ReturnValue;
 class CallbackData;
+class Inspector;
+class InspectorClient;
+class InspectorSession;
 
 namespace detail {
 
