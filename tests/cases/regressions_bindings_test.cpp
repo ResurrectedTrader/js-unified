@@ -4,6 +4,8 @@
 /// on the code before its fix, and passes on every backend after it. The
 /// comment on each says what it caught.
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -739,7 +741,8 @@ UNIBIND_TEST_CASE2(INTERCEPTORS, FUNCTION_VALUE_DATA,
         ub_test::Expose(fixture.context, "f", *self);  // NOLINT(bugprone-unchecked-optional-access)
 
         ub::TryCatch tryCatch(fixture.iso());
-        const auto result = ub::Evaluate(fixture.context, kind == 1 ? "o[1]" : kind == 3 ? "f()" : "o.x");
+        constexpr std::array<std::string_view, 4> SOURCES = {"o.x", "o[1]", "o.x", "f()"};
+        const auto result = ub::Evaluate(fixture.context, SOURCES.at(static_cast<std::size_t>(kind)));
         CHECK_FALSE(result.has_value());
         CHECK(tryCatch.HasCaught());
         CHECK_FALSE(tryCatch.HasTerminated());
