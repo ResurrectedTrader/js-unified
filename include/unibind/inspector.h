@@ -218,6 +218,14 @@ class InspectorDispatcher {
     /// `InspectorSession::DispatchProtocolMessage`, and is how a message read
     /// on a socket thread reaches a session.
     ///
+    /// **A pause is not a safe point.** Script paused in
+    /// `InspectorClient::RunMessageLoopOnPause` checks for nothing, so a
+    /// request made then waits until script runs again - after the pause, or
+    /// inside an evaluation made in it. A pause loop therefore takes its
+    /// messages from wherever the socket thread puts them, not from here: a
+    /// `Debugger.resume` that could only arrive through a request would never
+    /// arrive.
+    ///
     /// **Each request runs exactly once**, in the order requests were made -
     /// the same callback and data asked for twice run twice. What is coalesced
     /// is the wake-up, not the work: requests made before the isolate gets to

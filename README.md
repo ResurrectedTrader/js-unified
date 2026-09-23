@@ -1020,7 +1020,7 @@ class DevTools final : public ub::InspectorClient {
     void RunMessageLoopOnPause() override {
         paused = true;
         while (paused) {                                        // script is stopped until this returns
-            session->DispatchProtocolMessage(socket.Receive());
+            session->DispatchProtocolMessage(inbox.Wait());     // what the socket thread queued
         }
     }
     void QuitMessageLoopOnPause() override { paused = false; }  // a Debugger.resume came through
@@ -1045,25 +1045,35 @@ session until DevTools resumes.
 
 A socket is read on a thread of its own, and that thread holds the inspector's
 `Dispatcher()` - a `std::shared_ptr<ub::InspectorDispatcher>`, taken on the
-isolate's thread and handed over - never the `Inspector` itself:
+isolate's thread and handed over - never the `Inspector` itself. It queues what
+it reads and asks the isolate to come and take it:
 
 ```cpp
-std::thread reader([dispatcher = inspector->Dispatcher(), &socket] {
+std::thread reader([dispatcher = inspector->Dispatcher(), &socket, &devTools] {
     while (auto message = socket.Receive()) {
+        devTools.inbox.Push(std::move(*message));
         // false once the inspector has gone; the callback then never runs
-        dispatcher->RequestDispatch(&DispatchOne, ub::CallbackData::For(*message));
+        dispatcher->RequestDispatch(&DispatchQueued, ub::CallbackData::For(devTools));
     }
 });
+// DispatchQueued, on the isolate's thread: take what is in the inbox without
+// waiting, and hand each message to the session.
 ```
 
 `RequestDispatch` runs your callback on the isolate's thread at the next safe
 point - inside a running script, which is how a busy isolate still answers, or
-at the next `PumpJobs` if it is idle - and that callback may dispatch. It is
-safe from any thread at any time, including while the isolate's thread is
-destroying the inspector and after: no mutex of yours around it. Each request
-runs exactly once, in the order they were made; a burst made before the isolate
-gets to them shares one wake-up. Any still waiting when the `Inspector` is
-destroyed are dropped, not run.
+at the next `PumpJobs` if it is idle - and that callback may dispatch. **A
+pause is neither**, which is why the pause loop above reads the inbox itself: a
+request made while script is paused waits until script runs again - after the
+pause, or inside an evaluation made in it - so a `Debugger.resume` that only
+reached the isolate through one would never arrive.
+The callback finds the inbox empty afterwards, which is what one queue read by
+both costs. `RequestDispatch` is safe from any thread at any time, including
+while the isolate's thread is destroying the inspector and after: no mutex of
+yours around it. Each request runs exactly once, in the order they were made; a
+burst made before the isolate gets to them shares one wake-up. Any still
+waiting when the `Inspector` is destroyed are dropped, not run - so what a
+request's data points at has to live until it runs or the inspector goes.
 
 A session goes before its inspector and an inspector before its isolate, all on
 the isolate's thread, and a realm is withdrawn with `ContextDestroyed` before
