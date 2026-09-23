@@ -102,6 +102,7 @@
 /// which keeps a class method one indirect call - the trampoline that unwraps
 /// `this` - with no per-method storage to own and no capture to keep alive.
 
+#include <concepts>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -197,12 +198,14 @@ std::optional<Slot> ClassGetConstructor(const Context& context, ClassRec* rec);
 std::optional<Slot> ClassInstantiate(const Context& context, ClassRec* rec, NativeBox* native) noexcept;
 std::optional<bool> ClassHasInstance(const Context& context, ClassRec* rec, Slot value);
 
-template <class T, std::unique_ptr<T> (*Fn)(const CallbackInfo&)>
+template <class T, auto Fn>
 NativeBox* ConstructorTrampoline(const CallbackInfo& info) {
-    std::unique_ptr<T> native = Fn(info);
+    auto native = Fn(info);
     if (!native) {
         return nullptr;  // the callback threw, or declined
     }
+    // A `std::unique_ptr` becomes the wrapper's first share; a
+    // `std::shared_ptr` is taken as it is, deleter and all.
     return new NativeHolder<T>(std::shared_ptr<T>(std::move(native)));
 }
 
@@ -253,6 +256,10 @@ class Class {
     /// native is the thing being made. Handing script a wrapper over a native
     /// that already exists is `Wrap`, which takes the share.
     using ConstructorFn = std::unique_ptr<T> (*)(const CallbackInfo& info);
+    /// The other shape a constructor may have: a share rather than a fresh
+    /// owner, for a native that must be released through a deleter of its own
+    /// - one that counts, say - or that something else already holds.
+    using SharedConstructorFn = std::shared_ptr<T> (*)(const CallbackInfo& info);
     using MethodFn = void (*)(T& self, const CallbackInfo& info);
     using GetterFn = void (*)(T& self, const PropertyCallbackInfo& info);
     using SetterFn = void (*)(T& self, const Local<Value>& value, const PropertyCallbackInfo& info);
@@ -269,7 +276,8 @@ class Class {
     /// default and stays the default - it is what a `class` declaration does,
     /// and a class that answers to a plain call by accident hands script
     /// something nobody asked it to make.
-    template <ConstructorFn Fn>
+    template <auto Fn>
+        requires std::same_as<decltype(Fn), ConstructorFn> || std::same_as<decltype(Fn), SharedConstructorFn>
     const Class& Construct() const {
         detail::ClassSetConstructor(rec_, &detail::ConstructorTrampoline<T, Fn>, false);
         return *this;
@@ -295,7 +303,8 @@ class Class {
     /// second callback with a different signature, so that the one thing the
     /// typed layer exists to guarantee - what comes out of a `Class<T>` carries
     /// a `T` - would stop being true.
-    template <ConstructorFn Fn>
+    template <auto Fn>
+        requires std::same_as<decltype(Fn), ConstructorFn> || std::same_as<decltype(Fn), SharedConstructorFn>
     const Class& ConstructOrCall() const {
         detail::ClassSetConstructor(rec_, &detail::ConstructorTrampoline<T, Fn>, true);
         return *this;

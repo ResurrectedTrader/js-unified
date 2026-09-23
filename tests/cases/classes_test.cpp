@@ -188,6 +188,25 @@ void CountedIterate(const ub::CallbackInfo& info) {
     IterateCounter(*self, info);
 }
 
+/// How many natives a counting deleter has released - what a constructor that
+/// hands back a share with a deleter of its own is for.
+int g_releasedBySharedDeleter = 0;
+
+std::shared_ptr<Counter> MakeSharedCounter(const ub::CallbackInfo& info) {
+    std::int32_t start = 0;
+    if (info.Length() > 0) {
+        const auto asInt = info[0].ToInt32(info.GetContext());
+        if (!asInt) {
+            return nullptr;
+        }
+        start = *asInt;
+    }
+    return {new Counter(start), [](Counter* counter) {
+                ++g_releasedBySharedDeleter;
+                delete counter;
+            }};
+}
+
 /// An accessor one instance carries and its class does not.
 void ReadExtra(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
     info.GetReturnValue().Set(*info.Data<std::int32_t>());
@@ -528,6 +547,26 @@ UNIBIND_TEST_CASE2(CLASSES, SYMBOL_METHODS,
             catch (e) { return e instanceof TypeError; }
         })()
     )"));
+}
+
+UNIBIND_TEST_CASE(CLASSES, "classes: a constructor can hand back a share, and its deleter is the one that runs") {
+    Counter::Reset();
+    g_releasedBySharedDeleter = 0;
+    {
+        ub_test::Fixture fixture;
+        const auto cls = ub::Class<Counter>::New(fixture.iso(), "SharedCounter");
+        cls.Construct<&MakeSharedCounter>();
+        cls.Method<&Increment>("increment");
+        ub_test::Expose(fixture.context, "SharedCounter", *cls.GetConstructor(fixture.context));
+
+        CHECK(ub_test::EvalInt(fixture.context, "new SharedCounter(3).increment()") == 4);
+        CHECK(ub_test::EvalTruth(fixture.context, "new SharedCounter(1) instanceof SharedCounter"));
+        CHECK(Counter::constructed == 2);
+    }
+    // The isolate is gone, so every share the engine held has been given back
+    // - through the constructor's own deleter, not a default one.
+    CHECK(g_releasedBySharedDeleter == 2);
+    CHECK(Counter::alive == 0);
 }
 
 UNIBIND_TEST_CASE2(CLASSES, OBJECT_ACCESSORS, "classes: one instance can carry an accessor its class does not") {
