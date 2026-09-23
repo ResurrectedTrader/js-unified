@@ -290,3 +290,27 @@ UNIBIND_TEST_CASE(SERIALIZATION, "regressions: a value that will not clone says 
     }
     CHECK(ub_test::EvalInt(fixture.context, "6 * 7") == 42);
 }
+
+UNIBIND_TEST_CASE(SCRIPTS, "regressions: source that is not UTF-8 is a syntax error, and says so") {
+    // "Empty if the source did not compile; the syntax error is pending."
+    // Source is UTF-8 text, so bytes that are not UTF-8 do not compile - and
+    // the caller's `TryCatch` has to hear why. One engine's tokenizer throws a
+    // SyntaxError; the other backend could not make a string of the source at
+    // all and answered empty with nothing thrown, which is the failure that
+    // looks like success to a caller checking `HasCaught`.
+    ub_test::Fixture fixture;
+    const std::string_view bad("1 + \xFF", 5);
+
+    {
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(ub::Script::Compile(fixture.context, bad).has_value());
+        REQUIRE(handler.HasCaught());
+        ub_test::Expose(fixture.context, "thrown", handler.Exception());
+        CHECK(ub_test::EvalTruth(fixture.context, "thrown instanceof SyntaxError"));
+    }
+    {
+        ub::TryCatch handler(fixture.iso());
+        CHECK_FALSE(ub::Evaluate(fixture.context, bad).has_value());
+        CHECK(handler.HasCaught());
+    }
+}

@@ -3145,6 +3145,16 @@ namespace {
     }
     v8::Local<v8::String> text;
     if (!NewString(owner, source).ToLocal(&text)) {
+        // Source is UTF-8 text, and bytes that are not do not compile. That is
+        // a syntax error - what the other engine's tokenizer throws - and the
+        // header promises one is pending; V8 never sees the source to say so.
+        const size_t firstInvalid = FirstInvalidUtf8(source);
+        if (firstInvalid != std::string_view::npos) {
+            const v8::Context::Scope entered(Raw(context));
+            const std::string message =
+                "source is not UTF-8: byte " + std::to_string(firstInvalid) + " does not begin or continue a character";
+            Raw(owner)->ThrowException(v8::Exception::SyntaxError(RawString(owner, message)));
+        }
         return nullptr;
     }
     const bool eager = options == CompileOptions::EagerCompile;

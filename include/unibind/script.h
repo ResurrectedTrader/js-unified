@@ -203,6 +203,8 @@ inline constexpr std::uint32_t CODE_CACHE_FORMAT = 1;
 class Script {
    public:
     /// Empty if the source did not compile; the syntax error is pending.
+    /// Source is UTF-8 text, so bytes in it that are not UTF-8 are a syntax
+    /// error too.
     ///
     /// `options` says how much to compile now: by default what both engines
     /// do by default, which is the top level and no function body until it is
