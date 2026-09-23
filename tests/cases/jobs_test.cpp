@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -68,6 +69,20 @@ void RecordJob(ub::Isolate& /*isolate*/, ub::CallbackData data) {
     state->ranOn = std::this_thread::get_id();
     state->jobRuns.fetch_add(1, std::memory_order_relaxed);
     state->order.push_back(state->nextTag++);
+}
+
+/// One posted job that says which one it was, so a case can read the order a
+/// set of them ran in rather than only how many did.
+struct TaggedJob {
+    std::vector<int>* log = nullptr;
+    int tag = 0;
+};
+
+void RecordTag(ub::Isolate& /*isolate*/, ub::CallbackData data) {
+    auto* job = data.As<TaggedJob>();
+    if (job != nullptr && job->log != nullptr) {
+        job->log->push_back(job->tag);
+    }
 }
 
 /// The only thing an interrupt callback is allowed to do: notice, and set a
@@ -209,6 +224,63 @@ UNIBIND_TEST_CASE(JOBS, "jobs: posted work runs on the isolate's thread, in orde
     // The same callback posted three times ran three times - never coalesced -
     // and on the thread that owns the isolate, not the one that posted.
     CHECK(state.ranOn == here);
+}
+
+UNIBIND_TEST_CASE(DELAYED_JOBS, "jobs: delayed work waits for its delay, and then for the pump") {
+    ub_test::Fixture fixture;
+
+    JobState state;
+    fixture.iso().PostDelayedJob(&RecordJob, ub::CallbackData::For(state), 0.2);
+
+    // Not yet due, so a pump does not run it.
+    fixture.iso().PumpJobs();
+    CHECK(state.jobRuns.load() == 0);
+
+    // Due now - and still nothing runs it but a pump.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(state.jobRuns.load() == 0);
+
+    fixture.iso().PumpJobs();
+    CHECK(state.jobRuns.load() == 1);
+    CHECK(state.ranOn == std::this_thread::get_id());
+
+    // Once, like any posted work.
+    fixture.iso().PumpJobs();
+    CHECK(state.jobRuns.load() == 1);
+}
+
+UNIBIND_TEST_CASE(DELAYED_JOBS, "jobs: delayed work runs in the order it fell due, and after work already queued") {
+    ub_test::Fixture fixture;
+
+    std::vector<int> log;
+    TaggedJob late{.log = &log, .tag = 1};
+    TaggedJob earlyFirst{.log = &log, .tag = 2};
+    TaggedJob earlySecond{.log = &log, .tag = 3};
+    TaggedJob undelayed{.log = &log, .tag = 4};
+
+    auto& isolate = fixture.iso();
+    isolate.PostDelayedJob(&RecordTag, ub::CallbackData::For(late), 0.1);
+    isolate.PostDelayedJob(&RecordTag, ub::CallbackData::For(earlyFirst), 0.05);
+    isolate.PostDelayedJob(&RecordTag, ub::CallbackData::For(earlySecond), 0.05);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Posted after all three fell due, but before the pump that finds them.
+    isolate.PostJob(&RecordTag, ub::CallbackData::For(undelayed));
+
+    isolate.PumpJobs();
+    CHECK(log == std::vector<int>{4, 2, 3, 1});
+}
+
+UNIBIND_TEST_CASE(DELAYED_JOBS, "jobs: a delay that is zero, negative or not a number is no delay") {
+    ub_test::Fixture fixture;
+
+    JobState state;
+    auto& isolate = fixture.iso();
+    isolate.PostDelayedJob(&RecordJob, ub::CallbackData::For(state), 0.0);
+    isolate.PostDelayedJob(&RecordJob, ub::CallbackData::For(state), -1.0);
+    isolate.PostDelayedJob(&RecordJob, ub::CallbackData::For(state), std::numeric_limits<double>::quiet_NaN());
+
+    isolate.PumpJobs();
+    CHECK(state.jobRuns.load() == 3);
 }
 
 UNIBIND_TEST_CASE(JOBS, "jobs: work posted from a job is work, and is drained too") {

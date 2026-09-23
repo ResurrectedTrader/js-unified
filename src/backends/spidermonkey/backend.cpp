@@ -9,6 +9,7 @@
 // `unibind_headers_only` proves.
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1497,6 +1498,21 @@ Maybe<bool> DefineProperty(const Context& context, Slot object, Slot key, Slot v
     return true;
 }
 
+Maybe<bool> SetAccessorProperty(const Context& context, Slot object, std::string_view name,
+                                AccessorGetterCallback getter, AccessorSetterCallback setter, CallbackData data,
+                                PropertyAttribute attributes) {
+    ObjectOp op(context, object);
+    if (!op.Valid()) {
+        return std::nullopt;
+    }
+    CallbackRecord* record =
+        StoreCallback(context.GetIsolate(), CallbackRecord{.getter = getter, .setter = setter, .data = data});
+    if (record == nullptr || !DefineAccessor(op.cx, op.target, std::string(name), record, attributes)) {
+        return std::nullopt;
+    }
+    return true;
+}
+
 Maybe<bool> HasProperty(const Context& context, Slot object, Slot key) {
     ObjectOp op(context, object);
     if (!op.Valid()) {
@@ -2179,6 +2195,90 @@ std::optional<std::vector<StackFrame>> TryCatchStackFrames(const TryCatchState& 
     return ReadSavedFrames(cx, stack, 0);
 }
 
+namespace {
+
+/// Line `lineNumber` of a retained script, without its terminator, or nothing
+/// if the script is not retained or has no such line.
+std::optional<std::string> RetainedLine(const Isolate& isolate, const std::string& scriptName,
+                                        std::int32_t lineNumber) {
+    const auto& sources = isolate.impl().sources;
+    const auto found = sources.find(scriptName);
+    if (found == sources.end() || lineNumber < found->second.firstLine) {
+        return std::nullopt;
+    }
+    const std::string_view text = found->second.text;
+    std::size_t start = 0;
+    for (std::int32_t line = found->second.firstLine; line < lineNumber; ++line) {
+        const std::size_t newline = text.find('\n', start);
+        if (newline == std::string_view::npos) {
+            return std::nullopt;
+        }
+        start = newline + 1;
+    }
+    std::string_view line = text.substr(start, text.find('\n', start) - start);
+    if (!line.empty() && line.back() == '\r') {
+        line.remove_suffix(1);
+    }
+    return std::string(line);
+}
+
+}  // namespace
+
+Maybe<MessageLocation> TryCatchLocation(const TryCatchState& state, const Context& context) {
+    Drain(const_cast<TryCatchState&>(state));
+    if (!state.caught || state.terminated) {
+        return std::nullopt;
+    }
+    JSContext* cx = Raw(context);
+    RealmGuard realm(context);
+
+    MessageLocation location;
+    bool located = false;
+    // An Error knows where it was made, and a syntax error where it was found -
+    // with the offending line, which is the one case the engine quotes itself.
+    JS::RootedValue value(cx, state.exception.get());
+    if (value.isObject()) {
+        JS::RootedObject object(cx, &value.toObject());
+        JS::BorrowedErrorReport report(cx);
+        if (JS_ErrorFromException(cx, object, report)) {
+            if (report->filename) {
+                location.scriptName = report->filename.c_str();
+            }
+            location.lineNumber = static_cast<std::int32_t>(report->lineno);
+            location.columnNumber = static_cast<std::int32_t>(report->column.oneOriginValue());
+            if (report->linebuf() != nullptr) {
+                JS::RootedString line(cx, JS_NewUCStringCopyN(cx, report->linebuf(), report->linebufLength()));
+                if (line != nullptr) {
+                    location.sourceLine = EncodeToStdString(cx, line);
+                }
+            }
+            located = true;
+        }
+    }
+    // Anything else thrown is placed where it was thrown: the engine captured
+    // the stack at the throw, and its top frame is that place.
+    if (!located && state.stack != nullptr) {
+        JS::RootedObject stack(cx, state.stack.get());
+        std::vector<StackFrame> top = ReadSavedFrames(cx, stack, 1);
+        if (!top.empty()) {
+            location.scriptName = std::move(top.front().scriptName);
+            location.lineNumber = top.front().lineNumber;
+            location.columnNumber = top.front().columnNumber;
+            located = true;
+        }
+    }
+    if (JS_IsExceptionPending(cx)) {
+        JS_ClearPendingException(cx);
+    }
+    if (!located) {
+        return std::nullopt;
+    }
+    if (!location.sourceLine) {
+        location.sourceLine = RetainedLine(*state.owner, location.scriptName, location.lineNumber);
+    }
+    return location;
+}
+
 bool TryCatchHasTerminated(const TryCatchState& state) noexcept {
     Drain(const_cast<TryCatchState&>(state));
     return state.terminated;
@@ -2291,6 +2391,14 @@ ScriptRec* RecFromStencil(JSContext* cx, const Context& context, RefPtr<JS::Sten
     return rec;
 }
 
+/// Keep the text `TryCatch::Location` will quote from; see
+/// `Isolate::Impl::sources`.
+void RetainSource(const Context& context, const std::string& resourceName, std::string_view source,
+                  const ScriptOrigin& origin) {
+    OwnerOf(context).impl().sources[resourceName] =
+        Isolate::Impl::RetainedSource{.text = std::string(source), .firstLine = origin.lineOffset + 1};
+}
+
 RefPtr<JS::Stencil> CompileToStencil(JSContext* cx, std::string_view source, const JS::CompileOptions& options) {
     JS::SourceText<mozilla::Utf8Unit> text;
     if (!text.init(cx, source.data(), source.size(), JS::SourceOwnership::Borrowed)) {
@@ -2309,6 +2417,9 @@ ScriptRec* CompileScript(const Context& context, std::string_view source, const 
     }
 
     const std::string resourceName(origin.resourceName);
+    // Before compiling, so that a syntax error can be quoted too - although the
+    // engine quotes that one itself.
+    RetainSource(context, resourceName, source, origin);
     JS::CompileOptions options(cx);
     options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
     return RecFromStencil(cx, context, CompileToStencil(cx, source, options), false);
@@ -2323,6 +2434,7 @@ ScriptRec* CompileScriptWithCache(const Context& context, std::string_view sourc
     }
 
     const std::string resourceName(origin.resourceName);
+    RetainSource(context, resourceName, source, origin);
     JS::CompileOptions options(cx);
     options.setFileAndLine(resourceName.c_str(), origin.lineOffset + 1);
 
@@ -2756,6 +2868,21 @@ void Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
     impl_->jobs.push_back({.callback = callback, .data = data});
 }
 
+void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept {
+    // `!(x > 0)` rather than `x <= 0`, so that a NaN is no delay too.
+    if (!(delayInSeconds > 0)) {
+        PostJob(callback, data);
+        return;
+    }
+    if (callback == nullptr) {
+        return;
+    }
+    const auto due = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                            std::chrono::duration<double>(delayInSeconds));
+    const std::lock_guard<std::mutex> lock(impl_->jobMutex);
+    impl_->delayedJobs.emplace(due, Impl::PostedJob{.callback = callback, .data = data});
+}
+
 void Isolate::PumpJobs() {
     // Nothing runs while a stop is in force, and the queues survive it: cancel
     // the termination and pump again. Draining here would run work the embedder
@@ -2782,6 +2909,14 @@ void Isolate::PumpJobs() {
         std::vector<Impl::PostedJob> batch;
         {
             const std::lock_guard<std::mutex> lock(impl_->jobMutex);
+            // Whatever has fallen due joins the queue first, in the order it
+            // fell due, so it runs in this pump.
+            const auto now = std::chrono::steady_clock::now();
+            auto& delayed = impl_->delayedJobs;
+            while (!delayed.empty() && delayed.begin()->first <= now) {
+                impl_->jobs.push_back(delayed.begin()->second);
+                delayed.erase(delayed.begin());
+            }
             batch.swap(impl_->jobs);
         }
         if (batch.empty()) {
@@ -2998,8 +3133,12 @@ void Isolate::ThrowError(ErrorKind kind, std::string_view message) {
 }
 
 HeapStatistics Isolate::GetHeapStatistics() const noexcept {
+    // The collector reserves its heap in chunks, so the chunks it holds are
+    // what it has reserved - used or not, which is what `totalBytes` asks.
+    const std::uint64_t chunks = JS_GetGCParameter(impl_->cx, JSGC_TOTAL_CHUNKS);
+    const std::uint64_t chunkBytes = JS_GetGCParameter(impl_->cx, JSGC_CHUNK_BYTES);
     return HeapStatistics{.usedBytes = JS_GetGCParameter(impl_->cx, JSGC_BYTES),
-                          .totalBytes = JS_GetGCParameter(impl_->cx, JSGC_BYTES),
+                          .totalBytes = chunks * chunkBytes,
                           .limitBytes = JS_GetGCParameter(impl_->cx, JSGC_MAX_BYTES)};
 }
 

@@ -231,6 +231,28 @@ class Local {
         return detail::DefineProperty(context, slot_, key.slot(), value.slot(), attributes);
     }
 
+    /// An accessor property on this one object: `getter` runs on every read
+    /// and `setter`, if there is one, on every write, each handed `data`.
+    /// V8's `Object::SetAccessor` - for an object not stamped from a template,
+    /// such as one instance that carries a member its class does not.
+    ///
+    /// It installs the same property `ObjectTemplate::SetAccessor` does: an
+    /// accessor with real getter and setter functions, so
+    /// `Object.getOwnPropertyDescriptor` reports `get` and `set` on both
+    /// engines. With no setter it is read-only and `ReadOnly` adds nothing.
+    ///
+    /// The callbacks are recorded for the life of the isolate, as a template's
+    /// declarations are, so this is for objects made a bounded number of times
+    /// - once per realm, say - and not for something made on every call.
+    [[nodiscard]] std::optional<bool> SetAccessor(const Context& context, std::string_view name,
+                                                  AccessorGetterCallback getter,
+                                                  AccessorSetterCallback setter = nullptr, CallbackData data = {},
+                                                  PropertyAttribute attributes = PropertyAttribute::None) const
+        requires std::derived_from<T, Object>
+    {
+        return detail::SetAccessorProperty(context, slot_, name, getter, setter, data, attributes);
+    }
+
     [[nodiscard]] std::optional<bool> Has(const Context& context, const Local<Name>& key) const
         requires std::derived_from<T, Object>
     {

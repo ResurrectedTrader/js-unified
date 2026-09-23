@@ -246,6 +246,33 @@ bool AccessorSetterTrampoline(JSContext* cx, unsigned argc, JS::Value* vp) {
 
 }  // namespace
 
+bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& name, CallbackRecord* record,
+                    PropertyAttribute attributes) {
+    JS::RootedObject getter(cx);
+    JS::RootedObject setter(cx);
+    if (record->getter != nullptr) {
+        getter = NewAccessorFunction(cx, &AccessorGetterTrampoline, record, name);
+        if (getter == nullptr) {
+            return false;
+        }
+    }
+    if (record->setter != nullptr) {
+        setter = NewAccessorFunction(cx, &AccessorSetterTrampoline, record, name);
+        if (setter == nullptr) {
+            return false;
+        }
+    }
+    JS::RootedId id(cx);
+    JS::RootedString text(cx, MakeRawString(cx, name));
+    if (text == nullptr || !JS_StringToId(cx, text, &id)) {
+        return false;
+    }
+    // JSPROP_READONLY is meaningless on an accessor, and SpiderMonkey rejects
+    // it, so the ReadOnly bit is carried by the absence of a setter instead.
+    const unsigned native = ToNativeAttributes(attributes) & ~static_cast<unsigned>(JSPROP_READONLY);
+    return JS_DefinePropertyById(cx, target, id, getter, setter, native);
+}
+
 // ---------------------------------------------------------------------------
 // Replaying a template's declarations onto a real object
 // ---------------------------------------------------------------------------
@@ -331,32 +358,8 @@ bool ApplyEntry(JSContext* cx, const Context& context, JS::HandleObject target, 
             return JS_DefinePropertyById(cx, target, id, function, ToNativeAttributes(PropertyAttribute::DontEnum));
         }
 
-        case TemplateEntry::Kind::Accessor: {
-            JS::RootedObject getter(cx);
-            JS::RootedObject setter(cx);
-            if (entry.record->getter != nullptr) {
-                getter = NewAccessorFunction(cx, &AccessorGetterTrampoline, entry.record, entry.name);
-                if (getter == nullptr) {
-                    return false;
-                }
-            }
-            if (entry.record->setter != nullptr) {
-                setter = NewAccessorFunction(cx, &AccessorSetterTrampoline, entry.record, entry.name);
-                if (setter == nullptr) {
-                    return false;
-                }
-            }
-            JS::RootedId id(cx);
-            JS::RootedString name(cx, MakeRawString(cx, entry.name));
-            if (name == nullptr || !JS_StringToId(cx, name, &id)) {
-                return false;
-            }
-            // JSPROP_READONLY is meaningless on an accessor, and SpiderMonkey
-            // rejects it, so the ReadOnly bit is carried by the absence of a
-            // setter instead.
-            unsigned attributes = ToNativeAttributes(entry.attributes) & ~static_cast<unsigned>(JSPROP_READONLY);
-            return JS_DefinePropertyById(cx, target, id, getter, setter, attributes);
-        }
+        case TemplateEntry::Kind::Accessor:
+            return DefineAccessor(cx, target, entry.name, entry.record, entry.attributes);
 
         case TemplateEntry::Kind::Child: {
             JS::RootedObject function(cx);

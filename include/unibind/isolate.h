@@ -807,6 +807,28 @@ class Isolate {
     ///     calls in a `TryCatch` and report failure to the embedder.
     void PostJob(JobCallback callback, CallbackData data) noexcept;
 
+    /// `PostJob`, but not before `delayInSeconds` have passed - V8's
+    /// `TaskRunner::PostDelayedTask`, for the timer an embedder would otherwise
+    /// keep beside the isolate.
+    ///
+    /// Everything `PostJob` says holds, and the delay adds exactly one thing: a
+    /// floor, measured on a steady clock from this call. Once it has passed the
+    /// job is posted work like any other, and runs at the first `PumpJobs`
+    /// after that - **nothing wakes the thread when it falls due**, any more
+    /// than posted work wakes it. An embedder that sleeps between pumps bounds
+    /// how late a job can be by how long it sleeps.
+    ///
+    ///   * Delayed jobs run in the order they fall due, and two that fall due
+    ///     at the same moment in the order they were posted. Relative to
+    ///     undelayed work, one joins the back of the queue at the first pump
+    ///     after it falls due - so work posted before that pump runs first,
+    ///     whenever it was posted.
+    ///   * A delay of zero, a negative one, or a NaN is no delay: the job is
+    ///     posted as it would be by `PostJob`.
+    ///   * Callable from any thread. Still waiting when the isolate is
+    ///     destroyed means dropped, as for any posted work.
+    void PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept;
+
     /// Run everything pending - promise continuations and posted work - until
     /// there is nothing left.
     ///

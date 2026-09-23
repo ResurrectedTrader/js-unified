@@ -35,6 +35,7 @@ set(UNIBIND_CAPABILITIES
     "HEAP|RequestGarbageCollection@Isolate,GetHeapStatistics@Isolate"
     "SYMBOLS|MakeSymbol,MakeSymbolFor,GetWellKnownSymbol,SymbolDescription"
     "PROPERTY_ATTRIBUTES|GetPropertyAttributes"
+    "OBJECT_ACCESSORS|SetAccessorProperty"
     "TEMPLATES|NewObjectTemplate,NewFunctionTemplate,TemplateSetConstant,TemplateSetMethod,TemplateSetAccessor,TemplateSetTemplate,TemplateSetClassName,TemplateInherit,TemplatePrototype,TemplateInstance,TemplateNewInstance,TemplateGetFunction,TemplateHasInstance"
     "SYMBOL_METHODS|TemplateSetSymbolMethod,GetWellKnownSymbol"
     "INTERCEPTORS|TemplateSetNamedHandler,TemplateSetIndexedHandler,NewObjectTemplate,TemplateNewInstance"
@@ -61,6 +62,10 @@ set(UNIBIND_CAPABILITIES
     # text form is STACK_TRACE above and is older.
     "STACK_FRAMES|CaptureStack,TryCatchStackFrames"
 
+    # Where a caught exception was raised, with the line's text - including a
+    # syntax error, which has no stack frame to read it from.
+    "MESSAGE_LOCATION|TryCatchLocation"
+
     # Bytes out of one compile, into the next.
     "CODE_CACHE|CompileScriptWithCache,ScriptUsedCodeCache,ScriptCreateCodeCache"
 
@@ -78,6 +83,7 @@ set(UNIBIND_CAPABILITIES
     # "look now". Separate rows because a backend can arrive at them separately.
     "PROMISES|MakePromise,ResolvePromise,RejectPromise,PromiseStateOf,PumpJobs@Isolate"
     "JOBS|PostJob@Isolate,PumpJobs@Isolate"
+    "DELAYED_JOBS|PostDelayedJob@Isolate,PumpJobs@Isolate"
     "INTERRUPTS|RequestInterrupt@Isolate"
 
     # The observable half of the workerThreads hint.

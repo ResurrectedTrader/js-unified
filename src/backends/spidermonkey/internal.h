@@ -43,8 +43,10 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -126,6 +128,10 @@ struct Isolate::Impl {
     };
     std::mutex jobMutex;
     std::vector<PostedJob> jobs;
+    /// `PostDelayedJob`'s work, keyed on when it falls due. A multimap keeps
+    /// jobs that fall due together in the order they were posted, which is
+    /// the order the header promises. Moved into `jobs` by `PumpJobs`.
+    std::multimap<std::chrono::steady_clock::time_point, PostedJob> delayedJobs;
 
     /// Interrupt callbacks asked for with `Isolate::RequestInterrupt`, run once
     /// each the next time the engine checks. Same sharing story as the jobs.
@@ -178,6 +184,17 @@ struct Isolate::Impl {
     /// so `unibind/isolate.h` makes it a rule and this counter is what
     /// diagnoses breaking it, in a checked build, where it happens.
     std::int32_t embedderRefs = 0;
+
+    /// The text of every script compiled through `Script`, by resource name,
+    /// and the line number its first line was compiled as. SpiderMonkey keeps a
+    /// copy of its own but offers no way to read a line of it back, and
+    /// `TryCatch::Location` promises the line a runtime error came from, as V8
+    /// gives it. The latest compile under a name is the one quoted.
+    struct RetainedSource {
+        std::string text;
+        std::int32_t firstLine = 1;
+    };
+    std::unordered_map<std::string, RetainedSource> sources;
 };
 
 namespace detail {
@@ -705,6 +722,13 @@ class RealmGuard {
 
 /// Records the callback pair for the isolate and hands back a stable address.
 [[nodiscard]] CallbackRecord* StoreCallback(Isolate& isolate, CallbackRecord record);
+
+/// Define `name` on `target` as an accessor property whose getter and setter -
+/// whichever `record` has - are native functions carrying `record`. What a
+/// template's accessor declaration becomes on each instance, and what
+/// `Object::SetAccessor` makes on one object.
+[[nodiscard]] bool DefineAccessor(JSContext* cx, JS::HandleObject target, const std::string& name,
+                                  CallbackRecord* record, PropertyAttribute attributes);
 
 /// The trampoline every native function declared through this API goes
 /// through. Recovers its `CallbackRecord` from the callee's reserved slot.

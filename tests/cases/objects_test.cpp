@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,7 +33,82 @@ bool Contains(const std::vector<std::string>& keys, std::string_view wanted) {
     return std::ranges::find(keys, wanted) != keys.end();
 }
 
+/// The native state behind one accessor property, and a record of what the
+/// callbacks were asked.
+struct Cell {
+    std::int32_t value = 0;
+    int reads = 0;
+    int writes = 0;
+    std::string lastName;
+};
+
+void ReadCell(const ub::Local<ub::Name>& property, const ub::PropertyCallbackInfo& info) {
+    auto* cell = info.Data<Cell>();
+    ++cell->reads;
+    if (auto name = property.To<ub::String>()) {
+        cell->lastName = name->Utf8Value();
+    }
+    info.GetReturnValue().Set(cell->value);
+}
+
+void WriteCell(const ub::Local<ub::Name>& /*property*/, const ub::Local<ub::Value>& value,
+               const ub::PropertyCallbackInfo& info) {
+    auto* cell = info.Data<Cell>();
+    ++cell->writes;
+    if (auto asInt = value.ToInt32(info.GetContext())) {
+        cell->value = *asInt;
+    }
+}
+
 }  // namespace
+
+UNIBIND_TEST_CASE(OBJECT_ACCESSORS, "objects: an accessor on one object runs native code on every read and write") {
+    ub_test::Fixture fixture;
+
+    auto object = ub::Object::New(fixture.context);
+    REQUIRE(object.has_value());
+    Cell cell{.value = 7};
+    CHECK(object->SetAccessor(fixture.context, "level", &ReadCell, &WriteCell, ub::CallbackData::For(cell)) ==
+          std::optional<bool>(true));
+    ub_test::Expose(fixture.context, "thing", *object);
+
+    CHECK(ub_test::EvalInt(fixture.context, "thing.level") == 7);
+    CHECK(ub_test::EvalInt(fixture.context, "thing.level = 12; thing.level + 1") == 13);
+    CHECK(cell.value == 12);
+    CHECK(cell.writes == 1);
+    CHECK(cell.reads == 2);
+    CHECK(cell.lastName == "level");
+
+    // A real accessor on both engines, not a data property that happens to
+    // call back: the descriptor has the two functions.
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        (function () {
+            const d = Object.getOwnPropertyDescriptor(thing, 'level');
+            return typeof d.get === 'function' && typeof d.set === 'function' && !('value' in d);
+        })()
+    )"));
+}
+
+UNIBIND_TEST_CASE(OBJECT_ACCESSORS, "objects: an accessor with no setter is read-only") {
+    ub_test::Fixture fixture;
+
+    auto object = ub::Object::New(fixture.context);
+    REQUIRE(object.has_value());
+    Cell cell{.value = 3};
+    CHECK(object->SetAccessor(fixture.context, "fixed", &ReadCell, nullptr, ub::CallbackData::For(cell)) ==
+          std::optional<bool>(true));
+    ub_test::Expose(fixture.context, "thing", *object);
+
+    CHECK(ub_test::EvalTruth(fixture.context, R"(
+        (function () {
+            'use strict';
+            try { thing.fixed = 9; return false; }
+            catch (e) { return e instanceof TypeError; }
+        })()
+    )"));
+    CHECK(ub_test::EvalInt(fixture.context, "thing.fixed") == 3);
+    CHECK(cell.writes == 0);
+}
 
 TEST_CASE("objects: a property set from native reads back from script and back again") {
     ub_test::Fixture fixture;

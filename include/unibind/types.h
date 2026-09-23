@@ -223,12 +223,36 @@ struct ScriptOrigin {
     int columnOffset = 0;
 };
 
-/// Engine-independent heap figures. Engines measure different things; only
-/// `usedBytes` is comparable across them, and even that only as a trend.
+/// Heap figures, named after V8's `v8::HeapStatistics`.
+///
+/// Engines measure different things; only `usedBytes` is comparable across
+/// them, and even that only as a trend. The first three every engine reports.
+/// The rest are the figures V8 gives and SpiderMonkey has no cheap answer for -
+/// its only source is a full memory report that walks the heap, which is not
+/// something a statistics call should cost - so they are empty there rather
+/// than zero, which would be a claim.
 struct HeapStatistics {
+    /// Bytes occupied by live and not-yet-collected objects.
     std::uint64_t usedBytes = 0;
+    /// Bytes the collector has reserved for the heap, used or not.
     std::uint64_t totalBytes = 0;
+    /// The ceiling the heap may grow to.
     std::uint64_t limitBytes = 0;
+
+    /// Of `totalBytes`, how much is backed by physical memory.
+    std::optional<std::uint64_t> physicalBytes;
+    /// Memory held outside the heap on the heap's behalf - array buffer
+    /// backing stores, chiefly.
+    std::optional<std::uint64_t> externalBytes;
+    /// What the engine has allocated through `malloc` for itself, and the
+    /// highest figure it has recorded. V8 records its peak only at certain
+    /// points, so the current figure can briefly be the larger of the two.
+    std::optional<std::uint64_t> mallocedBytes;
+    std::optional<std::uint64_t> peakMallocedBytes;
+    /// The pool persistent handles (`Global<T>`, and the engine's own) live
+    /// in: how much of it is in use, and how large it is.
+    std::optional<std::uint64_t> usedGlobalHandlesBytes;
+    std::optional<std::uint64_t> totalGlobalHandlesBytes;
 };
 
 /// One frame of a JavaScript stack, as both engines can describe it.
@@ -251,6 +275,20 @@ struct StackFrame {
     std::string scriptName;
     std::int32_t lineNumber = 0;
     std::int32_t columnNumber = 0;
+};
+
+/// Where a caught exception was raised: V8's `v8::Message` -
+/// `GetScriptResourceName`, `GetLineNumber`, `GetStartColumn` and
+/// `GetSourceLine` - read in one call. See `TryCatch::Location`.
+///
+/// `lineNumber` and `columnNumber` follow `StackFrame`: 1-based, 0 when the
+/// engine did not say. `sourceLine` is the text of that line without its line
+/// terminator, empty when the source is not available.
+struct MessageLocation {
+    std::string scriptName;
+    std::int32_t lineNumber = 0;
+    std::int32_t columnNumber = 0;
+    std::optional<std::string> sourceLine;
 };
 
 /// TRANSITIONAL. `Maybe<T>` was a rename of `std::optional<T>` and is being

@@ -30,12 +30,6 @@
 
 namespace ub {
 
-// --- accessors -------------------------------------------------------------
-
-using AccessorGetterCallback = void (*)(const Local<Name>& property, const PropertyCallbackInfo& info);
-using AccessorSetterCallback = void (*)(const Local<Name>& property, const Local<Value>& value,
-                                        const PropertyCallbackInfo& info);
-
 // --- interceptors ----------------------------------------------------------
 //
 // A catch-all for *any* property on an object, named or indexed. Each hook

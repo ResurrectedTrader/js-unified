@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -185,6 +186,11 @@ void CountedIterate(const ub::CallbackInfo& info) {
         return;
     }
     IterateCounter(*self, info);
+}
+
+/// An accessor one instance carries and its class does not.
+void ReadExtra(const ub::Local<ub::Name>& /*property*/, const ub::PropertyCallbackInfo& info) {
+    info.GetReturnValue().Set(*info.Data<std::int32_t>());
 }
 
 /// Declares the class the rest of this file uses.
@@ -522,6 +528,29 @@ UNIBIND_TEST_CASE2(CLASSES, SYMBOL_METHODS,
             catch (e) { return e instanceof TypeError; }
         })()
     )"));
+}
+
+UNIBIND_TEST_CASE2(CLASSES, OBJECT_ACCESSORS, "classes: one instance can carry an accessor its class does not") {
+    Counter::Reset();
+    ub_test::Fixture fixture;
+
+    const auto cls = DeclareCounter(fixture.iso());
+    ub_test::Expose(fixture.context, "Counter", *cls.GetConstructor(fixture.context));
+
+    std::int32_t extra = 99;
+    auto special = cls.Wrap(fixture.context, std::make_shared<Counter>(4));
+    REQUIRE(special.has_value());
+    CHECK(special->SetAccessor(fixture.context, "extra", &ReadExtra, nullptr, ub::CallbackData::For(extra)) ==
+          std::optional<bool>(true));
+    ub_test::Expose(fixture.context, "special", *special);
+
+    // Its own member, and every member of its class, still there.
+    CHECK(ub_test::EvalInt(fixture.context, "special.extra") == 99);
+    CHECK(ub_test::EvalInt(fixture.context, "special.increment(); special.value") == 5);
+    CHECK(ub_test::EvalTruth(fixture.context, "special instanceof Counter"));
+    CHECK(ub::Class<Counter>::Unwrap(*special) != nullptr);
+    // And no other instance has it.
+    CHECK(ub_test::EvalTruth(fixture.context, "new Counter(1).extra === undefined"));
 }
 
 // ---------------------------------------------------------------------------

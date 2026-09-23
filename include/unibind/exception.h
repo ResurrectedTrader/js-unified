@@ -142,6 +142,28 @@ class TryCatch {
         return detail::TryCatchStackFrames(State(), context);
     }
 
+    /// Where the caught exception was raised, and the text of that line.
+    ///
+    /// For an `Error`, where it was made; for any other thrown value, where it
+    /// was thrown; for a syntax error, the offending position in the source
+    /// being compiled - which is the case this exists for beside `StackFrames`,
+    /// because a script that never compiled has no frame to report. It is what
+    /// an embedder prints as `file:line: message` followed by the line itself.
+    ///
+    /// Empty when nothing was caught, on a termination, and when the engine
+    /// has no position - a value thrown by native code with no script running.
+    ///
+    /// **`sourceLine` needs the source.** V8 keeps every script's text and
+    /// reads the line back from it. SpiderMonkey keeps its own copy but offers
+    /// no way to read a line of it back, and quotes the line only for a
+    /// compile error - so its backend keeps a second copy of the text of every
+    /// script compiled through `Script`, per isolate, and quotes from that. Code
+    /// that was not compiled through `Script` (`eval`, `new Function`) has a
+    /// line on V8 and none on SpiderMonkey.
+    [[nodiscard]] std::optional<MessageLocation> Location(const Context& context) const {
+        return detail::TryCatchLocation(State(), context);
+    }
+
     /// Let the exception continue outwards when this handler closes, instead
     /// of stopping here.
     void ReThrow() noexcept { detail::TryCatchReThrow(State()); }

@@ -119,6 +119,36 @@ UNIBIND_TEST_CASE(HEAP, "isolate: heap figures are reported and only the trend m
     MESSAGE("used bytes went from ", before.usedBytes, " to ", after.usedBytes, "; limit ", after.limitBytes);
 }
 
+UNIBIND_TEST_CASE(HEAP, "isolate: the heap figures an engine reports agree with each other") {
+    ub_test::Fixture fixture;
+    {
+        ub::HandleScope scope(fixture.iso());
+        for (int i = 0; i < 2000; ++i) {
+            (void)ub::Object::New(fixture.context);
+        }
+    }
+    const auto stats = fixture.iso().GetHeapStatistics();
+
+    // What every engine reports: reserved space holds what is in use, under a
+    // ceiling that is above both.
+    CHECK(stats.usedBytes > 0);
+    CHECK(stats.totalBytes >= stats.usedBytes);
+    CHECK(stats.limitBytes >= stats.totalBytes);
+
+    // The rest are empty where an engine has no answer, and consistent where
+    // it has one - which is all a portable case can say about them.
+    // Not "peak is at least current": V8 raises its peak only at certain
+    // points, and reports a current figure above it in between.
+    if (stats.usedGlobalHandlesBytes && stats.totalGlobalHandlesBytes) {
+        CHECK(*stats.totalGlobalHandlesBytes >= *stats.usedGlobalHandlesBytes);
+    }
+    CHECK(stats.mallocedBytes.has_value() == stats.peakMallocedBytes.has_value());
+    CHECK(stats.usedGlobalHandlesBytes.has_value() == stats.totalGlobalHandlesBytes.has_value());
+    MESSAGE("optional figures reported: physical=", stats.physicalBytes.has_value(),
+            " external=", stats.externalBytes.has_value(), " malloced=", stats.mallocedBytes.has_value(),
+            " globalHandles=", stats.usedGlobalHandlesBytes.has_value());
+}
+
 UNIBIND_TEST_CASE(HEAP, "isolate: asking for a collection is safe whether or not one happens") {
     ub_test::Fixture fixture;
 

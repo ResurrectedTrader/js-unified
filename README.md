@@ -21,7 +21,7 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | Public API | complete: values, objects, accessors, interceptors, symbols, classes with native state, exceptions, realms, promises and jobs, termination, binary data, structured clone, compiled-code caching, engine-fault reporting |
 | V8 15.6 | implements all of it |
 | SpiderMonkey 153.3.0esr | implements all of it except the near-heap-limit hook, which its engine does not have - a call to that one does not link there, on purpose |
-| Tests | one suite, written once against `ub::`: 264 cases, green on both backends, every case compared backend against backend with no divergences |
+| Tests | one suite, written once against `ub::`: 276 cases, green on both backends, every case compared backend against backend with no divergences |
 | Not here | a debugger, and cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
@@ -124,16 +124,16 @@ to refuse the fetch outright and be told what to unpack where.
 bump repoints the tag, the asset and the directory together rather than
 silently reusing the old library.
 
-The number `ctest` prints is a little larger than 242 and depends on the tree,
+The number `ctest` prints is a little larger than 276 and depends on the tree,
 because it registers the suite's cases *and* a few things that cannot be cases
-among others: the whole suite again in one process, three checks that each need
-a process of their own (plus two more in a Debug build, which are the two
+among others: the whole suite again in one process, four checks that each need
+a process of their own (five on V8, which adds `unibind/interop/v8.h`'s) (plus two more in a Debug build, which are the two
 checked-build deaths), the benchmark, and the
 cross-backend `parity` comparison (which only compares what has actually been
-built). **242 cases is the figure that means the same thing everywhere** - it is
+built). **276 cases is the figure that means the same thing everywhere** - it is
 what the test binary itself reports, on either backend. The assertion count is not: a case may assert a
-different number of times on each engine, so V8 counts 8034 and SpiderMonkey
-8043, and neither number is the one to compare a run against.
+different number of times on each engine, so V8 counts 8441 and SpiderMonkey
+8414, and neither number is the one to compare a run against.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
 engine archives were built with, and therefore the one a consumer links
@@ -493,6 +493,10 @@ const std::uint32_t length = array->Length();
 const auto keys = object->GetOwnPropertyNames(context, {.includeSymbols = true});
 (void)object->DefineOwnProperty(context, *name, *name, ub::PropertyAttribute::ReadOnly);
 const auto prototype = object->GetPrototype(context);
+
+// A property that runs native code on every read (and write, given a setter) -
+// on this one object, where a template would put it on every instance.
+(void)object->SetAccessor(context, "level", &ReadLevel, &WriteLevel, ub::CallbackData::For(state));
 ```
 
 Bulk numeric data goes across in one crossing rather than N:
@@ -651,6 +655,7 @@ Catching:
             return;                                   // a stop, not a throw: section 9
         }
         const std::string message = caught.Message(context).value_or("<none>");
+        const auto where = caught.Location(context);       // script, line, column, the line's text
         const auto frames = caught.StackFrames(context);   // function, script, line
         const auto human = caught.StackTrace(context);     // the engine's own text
         const ub::Local<ub::Value> thrown = caught.Exception();
@@ -671,7 +676,8 @@ into the engine on the way out.
 Two portability notes the suite had to learn: engines word their built-in
 messages differently, so ask script `e.constructor.name` rather than parsing a
 message; and `StackTrace` text is not parseable across engines, which is what
-`StackFrames` is for.
+`StackFrames` is for. `Location` is the one to print a syntax error with: a
+script that never compiled has no frame, but it does have a line.
 
 ### 7. Interceptors: an object that answers for every property
 
@@ -812,6 +818,11 @@ first, then posted work, then round again, so work that settles a promise sees
 its continuations in the same pump. Posting does not wake anything: **posted work
 runs when the script thread next pumps, and nothing accelerates that.** Whatever
 is still queued when the isolate is destroyed is dropped, not run.
+
+`PostDelayedJob(callback, data, delayInSeconds)` is the same with a floor on
+when: V8's `PostDelayedTask`, for the timer you would otherwise keep beside the
+isolate. It still runs only at a pump, so an embedder that sleeps between pumps
+decides how late it can be.
 
 ### 9. Stopping a runaway script
 

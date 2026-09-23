@@ -126,6 +126,10 @@ std::optional<bool> SetIndex(const Context& context, Slot object, std::uint32_t 
 /// Installs a data property with explicit attributes, bypassing setters.
 std::optional<bool> DefineProperty(const Context& context, Slot object, Slot key, Slot value,
                                    PropertyAttribute attributes);
+/// Installs an accessor property with native getter and setter functions.
+std::optional<bool> SetAccessorProperty(const Context& context, Slot object, std::string_view name,
+                                        AccessorGetterCallback getter, AccessorSetterCallback setter, CallbackData data,
+                                        PropertyAttribute attributes);
 std::optional<bool> HasProperty(const Context& context, Slot object, Slot key);
 std::optional<bool> HasOwnProperty(const Context& context, Slot object, Slot key);
 std::optional<bool> DeleteProperty(const Context& context, Slot object, Slot key);
@@ -259,6 +263,7 @@ Slot TryCatchException(const TryCatchState& state, Isolate& isolate) noexcept;
 std::optional<std::string> TryCatchMessage(const TryCatchState& state, const Context& context);
 std::optional<std::string> TryCatchStackTrace(const TryCatchState& state, const Context& context);
 std::optional<std::vector<StackFrame>> TryCatchStackFrames(const TryCatchState& state, const Context& context);
+std::optional<MessageLocation> TryCatchLocation(const TryCatchState& state, const Context& context);
 void TryCatchReThrow(TryCatchState& state) noexcept;
 void TryCatchReset(TryCatchState& state) noexcept;
 

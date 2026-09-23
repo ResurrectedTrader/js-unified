@@ -17,11 +17,13 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -158,6 +160,10 @@ struct Isolate::Impl {
     std::atomic<bool> terminating{false};
     std::mutex work;
     std::deque<std::pair<JobCallback, CallbackData>> jobs;
+    /// `PostDelayedJob`'s work, keyed on when it falls due. A multimap keeps
+    /// jobs that fall due together in the order they were posted, which is
+    /// the order the header promises. Moved into `jobs` by `PumpJobs`.
+    std::multimap<std::chrono::steady_clock::time_point, std::pair<JobCallback, CallbackData>> delayedJobs;
     std::deque<std::pair<InterruptCallback, CallbackData>> interrupts;
     /// Contexts, scripts and `Global<T>` roots the embedder is still holding.
     ///
@@ -1808,12 +1814,13 @@ void TemplateSetSymbolMethod(TemplateRec* tpl, WellKnownSymbol key, FunctionCall
     RawTemplate(tpl)->Set(RawWellKnownSymbol(owner, key), MethodTemplate(owner, callback, data), v8::DontEnum);
 }
 
-void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetterCallback getter,
-                         AccessorSetterCallback setter, CallbackData data, PropertyAttribute attributes) {
-    Isolate& owner = *tpl->owner;
-    v8::HandleScope scope(Raw(owner));
-    v8::Local<v8::String> key = RawString(owner, name);
+namespace {
 
+/// The record an accessor's two functions carry, kept for the life of the
+/// isolate: a template's accessor is replayed onto every instance it makes,
+/// and an object's is reachable for as long as the object is.
+[[nodiscard]] AccessorRecord* StoreAccessor(Isolate& owner, v8::Local<v8::String> key, AccessorGetterCallback getter,
+                                            AccessorSetterCallback setter, CallbackData data) {
     auto owned = std::make_unique<AccessorRecord>();
     owned->owner = &owner;
     owned->getter = getter;
@@ -1822,6 +1829,25 @@ void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetter
     owned->name.Reset(Raw(owner), key);
     AccessorRecord* record = owned.get();
     owner.impl().accessors.push_back(std::move(owned));
+    return record;
+}
+
+/// An accessor property has no [[Writable]]: a getter with no setter IS the
+/// read-only form, so ReadOnly here would be a contradiction rather than a
+/// restriction. Drop it instead of handing V8 a nonsensical descriptor.
+[[nodiscard]] PropertyAttribute AccessorAttributes(PropertyAttribute attributes) noexcept {
+    return static_cast<PropertyAttribute>(static_cast<uint8_t>(attributes) &
+                                          ~static_cast<uint8_t>(PropertyAttribute::ReadOnly));
+}
+
+}  // namespace
+
+void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetterCallback getter,
+                         AccessorSetterCallback setter, CallbackData data, PropertyAttribute attributes) {
+    Isolate& owner = *tpl->owner;
+    v8::HandleScope scope(Raw(owner));
+    v8::Local<v8::String> key = RawString(owner, name);
+    AccessorRecord* record = StoreAccessor(owner, key, getter, setter, data);
 
     v8::Local<v8::FunctionTemplate> read;
     v8::Local<v8::FunctionTemplate> write;
@@ -1834,12 +1860,32 @@ void TemplateSetAccessor(TemplateRec* tpl, std::string_view name, AccessorGetter
                                           v8::Local<v8::Signature>(), 1, v8::ConstructorBehavior::kThrow);
     }
 
-    // An accessor property has no [[Writable]]: a getter with no setter IS the
-    // read-only form, so ReadOnly here would be a contradiction rather than a
-    // restriction. Drop it instead of handing V8 a nonsensical descriptor.
-    const auto usable = static_cast<PropertyAttribute>(static_cast<uint8_t>(attributes) &
-                                                       ~static_cast<uint8_t>(PropertyAttribute::ReadOnly));
-    RawTemplate(tpl)->SetAccessorProperty(key, read, write, RawAttributes(usable));
+    RawTemplate(tpl)->SetAccessorProperty(key, read, write, RawAttributes(AccessorAttributes(attributes)));
+}
+
+std::optional<bool> SetAccessorProperty(const Context& context, Slot object, std::string_view name,
+                                        AccessorGetterCallback getter, AccessorSetterCallback setter, CallbackData data,
+                                        PropertyAttribute attributes) {
+    Isolate& owner = IsolateFor(object);
+    v8::Local<v8::Context> raw = Raw(context);
+    v8::Local<v8::String> key = RawString(owner, name);
+    AccessorRecord* record = StoreAccessor(owner, key, getter, setter, data);
+
+    v8::Local<v8::Function> read;
+    v8::Local<v8::Function> write;
+    if (getter != nullptr &&
+        !v8::Function::New(raw, &AccessorGetTrampoline, Pointer(owner, record), 0, v8::ConstructorBehavior::kThrow)
+             .ToLocal(&read)) {
+        return std::nullopt;
+    }
+    if (setter != nullptr &&
+        !v8::Function::New(raw, &AccessorSetTrampoline, Pointer(owner, record), 1, v8::ConstructorBehavior::kThrow)
+             .ToLocal(&write)) {
+        return std::nullopt;
+    }
+    Resolve(object).As<v8::Object>()->SetAccessorProperty(key, read, write,
+                                                          RawAttributes(AccessorAttributes(attributes)));
+    return true;
 }
 
 void TemplateSetTemplate(TemplateRec* tpl, std::string_view name, TemplateRec* value, PropertyAttribute attributes) {
@@ -2596,6 +2642,32 @@ std::optional<std::vector<StackFrame>> TryCatchStackFrames(const TryCatchState& 
     return FramesOf(owner, trace);
 }
 
+std::optional<MessageLocation> TryCatchLocation(const TryCatchState& state, const Context& context) {
+    if (TryCatchHasTerminated(state)) {
+        return std::nullopt;
+    }
+    Isolate& owner = OwnerOf(context);
+    v8::HandleScope scope(Raw(owner));
+    v8::Local<v8::Message> message = state.tryCatch.Message();
+    if (message.IsEmpty()) {
+        return std::nullopt;
+    }
+    v8::Local<v8::Context> raw = Raw(context);
+    MessageLocation location;
+    v8::Local<v8::Value> resource = message->GetScriptResourceName();
+    if (!resource.IsEmpty() && resource->IsString()) {
+        location.scriptName = Utf8Of(Raw(owner), resource);
+    }
+    location.lineNumber = message->GetLineNumber(raw).FromMaybe(0);
+    // V8 counts columns from zero; `MessageLocation` does not.
+    location.columnNumber = message->GetStartColumn(raw).FromMaybe(-1) + 1;
+    v8::Local<v8::String> line;
+    if (message->GetSourceLine(raw).ToLocal(&line)) {
+        location.sourceLine = Utf8Of(Raw(owner), line);
+    }
+    return location;
+}
+
 void TryCatchReThrow(TryCatchState& state) noexcept {
     state.tryCatch.ReThrow();
 }
@@ -3112,7 +3184,13 @@ HeapStatistics Isolate::GetHeapStatistics() const noexcept {
     impl_->isolate->GetHeapStatistics(&stats);
     return HeapStatistics{.usedBytes = stats.used_heap_size(),
                           .totalBytes = stats.total_heap_size(),
-                          .limitBytes = stats.heap_size_limit()};
+                          .limitBytes = stats.heap_size_limit(),
+                          .physicalBytes = stats.total_physical_size(),
+                          .externalBytes = stats.external_memory(),
+                          .mallocedBytes = stats.malloced_memory(),
+                          .peakMallocedBytes = stats.peak_malloced_memory(),
+                          .usedGlobalHandlesBytes = stats.used_global_handles_size(),
+                          .totalGlobalHandlesBytes = stats.total_global_handles_size()};
 }
 
 void Isolate::RequestGarbageCollection() noexcept {
@@ -3197,6 +3275,21 @@ void Isolate::PostJob(JobCallback callback, CallbackData data) noexcept {
     impl_->jobs.emplace_back(callback, data);
 }
 
+void Isolate::PostDelayedJob(JobCallback callback, CallbackData data, double delayInSeconds) noexcept {
+    // `!(x > 0)` rather than `x <= 0`, so that a NaN is no delay too.
+    if (!(delayInSeconds > 0)) {
+        PostJob(callback, data);
+        return;
+    }
+    if (callback == nullptr) {
+        return;
+    }
+    const auto due = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                            std::chrono::duration<double>(delayInSeconds));
+    const std::scoped_lock guard(impl_->work);
+    impl_->delayedJobs.emplace(due, std::make_pair(callback, data));
+}
+
 void Isolate::PumpJobs() {
     // Engine jobs, then posted work, then round again - so a job that settles a
     // promise sees its continuations in the same pump. A termination stops the
@@ -3208,6 +3301,14 @@ void Isolate::PumpJobs() {
         CallbackData payload;
         {
             const std::scoped_lock guard(impl_->work);
+            // Whatever has fallen due joins the queue first, in the order it
+            // fell due, so it runs in this pump.
+            const auto now = std::chrono::steady_clock::now();
+            auto& delayed = impl_->delayedJobs;
+            while (!delayed.empty() && delayed.begin()->first <= now) {
+                impl_->jobs.push_back(delayed.begin()->second);
+                delayed.erase(delayed.begin());
+            }
             if (impl_->jobs.empty()) {
                 return;
             }

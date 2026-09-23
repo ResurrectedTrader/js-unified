@@ -7,6 +7,7 @@
 /// the embedder supplied, and that a stack exists. See docs/testing.md.
 
 #include <array>
+#include <optional>
 #include <string>
 
 #include "support/harness.h"
@@ -254,6 +255,76 @@ TEST_CASE("exceptions: a syntax error is a failed compile, not a crash") {
     tryCatch.Reset();
 
     CHECK(ub_test::EvalInt(fixture.context, "3 + 3") == 6);
+}
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "exceptions: a runtime error says where it was raised and quotes the line") {
+    ub_test::Fixture fixture;
+
+    const auto script = ub::Script::Compile(fixture.context, "const fine = 1;\n  null.property;\nconst after = 2;",
+                                            {.resourceName = "where.js"});
+    REQUIRE(script.has_value());
+
+    ub::TryCatch tryCatch(fixture.iso());
+    CHECK_FALSE(script->Run(fixture.context).has_value());
+    REQUIRE(tryCatch.HasCaught());
+
+    const auto location = tryCatch.Location(fixture.context);
+    REQUIRE(location.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(location->scriptName == "where.js");
+    CHECK(location->lineNumber == 2);
+    CHECK(location->columnNumber > 0);
+    CHECK(location->sourceLine == std::optional<std::string>("  null.property;"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "exceptions: a syntax error has a location though it has no stack") {
+    ub_test::Fixture fixture;
+
+    ub::TryCatch tryCatch(fixture.iso());
+    // Compiled as though it started on line 11, as a script with a preamble
+    // would be: the location counts from there, and the quoted line is still
+    // the right one.
+    const auto script = ub::Script::Compile(fixture.context, "let ok = 1;\nlet = = 2;",
+                                            {.resourceName = "broken.js", .lineOffset = 10});
+    CHECK_FALSE(script.has_value());
+    REQUIRE(tryCatch.HasCaught());
+
+    const auto location = tryCatch.Location(fixture.context);
+    REQUIRE(location.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(location->scriptName == "broken.js");
+    CHECK(location->lineNumber == 12);
+    CHECK(location->sourceLine == std::optional<std::string>("let = = 2;"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "exceptions: a thrown value that is not an error is placed where it was thrown") {
+    ub_test::Fixture fixture;
+
+    const auto script =
+        ub::Script::Compile(fixture.context, "function f() {\n  throw 42;\n}\nf();", {.resourceName = "value.js"});
+    REQUIRE(script.has_value());
+
+    ub::TryCatch tryCatch(fixture.iso());
+    CHECK_FALSE(script->Run(fixture.context).has_value());
+    REQUIRE(tryCatch.HasCaught());
+
+    const auto location = tryCatch.Location(fixture.context);
+    REQUIRE(location.has_value());
+    // NOLINTBEGIN(bugprone-unchecked-optional-access) - REQUIRE above guarantees has_value
+    CHECK(location->scriptName == "value.js");
+    CHECK(location->lineNumber == 2);
+    CHECK(location->sourceLine == std::optional<std::string>("  throw 42;"));
+    // NOLINTEND(bugprone-unchecked-optional-access)
+}
+
+UNIBIND_TEST_CASE(MESSAGE_LOCATION, "exceptions: a handler that caught nothing has no location") {
+    ub_test::Fixture fixture;
+
+    const ub::TryCatch tryCatch(fixture.iso());
+    CHECK(ub_test::EvalInt(fixture.context, "1 + 1") == 2);
+    CHECK_FALSE(tryCatch.Location(fixture.context).has_value());
 }
 
 TEST_CASE("exceptions: catching one does not disturb the next") {

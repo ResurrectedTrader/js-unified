@@ -77,6 +77,14 @@ struct CallbackRecord;
 /// comes in through `CallbackData`, not through a capture.
 using FunctionCallback = void (*)(const CallbackInfo& info);
 
+/// The two halves of an accessor property, installed by
+/// `ObjectTemplate::SetAccessor` on every instance or by `Object::SetAccessor`
+/// on one object. The property's name arrives as `property`, so one pair of
+/// callbacks can serve several names.
+using AccessorGetterCallback = void (*)(const Local<Name>& property, const PropertyCallbackInfo& info);
+using AccessorSetterCallback = void (*)(const Local<Name>& property, const Local<Value>& value,
+                                        const PropertyCallbackInfo& info);
+
 /// Work posted to an isolate's thread with `Isolate::PostJob` and run by
 /// `Isolate::PumpJobs`. It is not inside a call, so it gets the isolate and its
 /// embedder pointer and nothing else - no receiver, no arguments, no return
