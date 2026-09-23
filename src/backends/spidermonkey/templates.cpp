@@ -807,10 +807,18 @@ bool InterceptorHandler::ownPropertyKeys(JSContext* cx, JS::HandleObject proxy, 
             continue;
         }
         JS::RootedValue element(cx);
-        JS::RootedObject array(cx, Unwrapped(Resolve(keys->slot())));
-        if (array == nullptr) {
+        // Wrapped into this realm rather than unwrapped out of its own: a hook
+        // may make its array in another realm, and reading an object from a
+        // compartment that is not the current one is a compartment mismatch -
+        // asserted by a debug engine, and undefined behaviour in a release one.
+        JS::RootedValue listed(cx, Resolve(keys->slot()));
+        if (!listed.isObject()) {
             continue;
         }
+        if (!JS_WrapValue(cx, &listed)) {
+            return false;
+        }
+        JS::RootedObject array(cx, &listed.toObject());
         std::uint32_t length = 0;
         if (!JS::GetArrayLength(cx, array, &length)) {
             return false;

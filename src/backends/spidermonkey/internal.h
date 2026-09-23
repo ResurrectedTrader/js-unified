@@ -351,7 +351,17 @@ struct Frame {
     Frame& operator=(const Frame&) = delete;
     Frame(Frame&&) = delete;
     Frame& operator=(Frame&&) = delete;
-    ~Frame() = default;
+    /// A closed frame's epoch is one no handle of it carries, so a handle that
+    /// outlived it is diagnosed whether or not a later frame reused the storage.
+    /// An optimised build usually does reuse it and an unoptimised one usually
+    /// does not, and without this the check caught only the first. Volatile,
+    /// because a store in a destructor to an object that is about to end is
+    /// exactly the store an optimiser may drop.
+    ~Frame() {
+#if UNIBIND_HANDLE_CHECKS
+        *static_cast<volatile std::uint32_t*>(&epoch) = ~epoch;
+#endif
+    }
 
     /// `NO_SLOT` when the frame could not grow. The caller turns that into an
     /// *empty* handle - never into a slot that reads as a value, which would
@@ -410,10 +420,17 @@ struct ContextRec {
 /// the only thing on this engine that can be turned into bytes and back. So it
 /// is what the code cache encodes, and encoding it is free of a re-parse
 /// because the rec is already holding it.
+///
+/// `script` is instantiated in the realm that compiled it and runs only there:
+/// a `JSScript` belongs to one realm, and executing it with another one
+/// entered is a realm mismatch - a debug engine asserts, a release one runs it
+/// on borrowed invariants. `global` is that realm, so that a run elsewhere
+/// can tell and instantiate the stencil into the realm it is run in instead.
 struct ScriptRec {
     Isolate* owner = nullptr;
     RefPtr<JS::Stencil> stencil;
     JS::PersistentRooted<JSScript*> script;
+    JS::PersistentRootedObject global;
 
     /// Whether the blob handed to `CompileScriptWithCache` was actually used.
     /// False for a compile with no blob, and false for a blob the engine
@@ -609,6 +626,21 @@ struct CallbackState {
     }
     return &scratch.toObject();
 }
+
+/// How every global an isolate makes is created: a realm in a compartment of
+/// its own, and every one of them in the one zone.
+///
+/// The compartment is what keeps realms apart, and it stays per realm. The
+/// zone is what strings and atoms belong to, and a handle belongs to the
+/// isolate rather than to a realm, so a string made in one realm is read, keyed
+/// on and passed from any other. Across zones that is not allowed: a string is
+/// a zone's cell, and an atom is only kept alive in a zone that has marked it.
+/// A debug engine asserts on the first read ("atom is marked white for zone",
+/// a zone mismatch); a release one reads it, and its collector may later free
+/// an atom a realm of another zone still names. One zone per isolate is what
+/// makes "a value belongs to the isolate" true of strings without wrapping
+/// each one at every use.
+[[nodiscard]] JS::RealmOptions IsolateRealmOptions() noexcept;
 
 /// The isolate's own realm, made the first time something needs one. Null if
 /// it could not be made, which is the only failure this has.

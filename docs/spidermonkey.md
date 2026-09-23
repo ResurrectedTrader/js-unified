@@ -271,7 +271,22 @@ instance rather than of whatever stands in for it in the current realm.
 
 Operations given no `Context` at all - `ArrayLength`, the `Is<T>` questions,
 strict and same-value equality - enter a realm the value is legal in instead,
-because the realm that happens to be current need not be one of them. Equality
+because the realm that happens to be current need not be one of them. For
+an object that is its own realm, except for a cross-compartment wrapper, which
+has none - it belongs to a compartment, and the realm entered is one in that
+compartment. A question asked of the object *behind* a wrapper is asked in that
+object's realm, not the wrapper's.
+
+**Realms get a compartment each, and share one zone.** Every global an isolate
+makes is created with `setNewCompartmentInSystemZone`. The compartment is what
+keeps realms apart and stays per realm; the zone is what strings and atoms
+belong to, and since a handle belongs to the isolate, a string made in one realm
+is read, keyed on and passed from every other. Across zones that is not
+allowed - a string is its zone's cell, and an atom is only kept alive in a zone
+that has marked it - so with a zone per realm every such read would have had to
+copy the string or mark the atom first, and a missed one is a use-after-free a
+release engine does not report. One zone per isolate makes it true by
+construction. Equality
 between two handles from different realms picks the left one's realm and wraps
 the right into it.
 
@@ -421,6 +436,11 @@ reach a vector base that is almost always inline in the scope object itself.
   exactly one in exactly the predicted direction, which is what made the
   diagnosis certain. Anyone adding a define to this backend should assume
   `js-config.h` is incomplete rather than authoritative.
+- **A debug engine needs two more: `DEBUG` and `MOZ_DIAGNOSTIC_ASSERT_ENABLED`.**
+  `js-config.h` insists on the first and says nothing of the second, which lays
+  `JS::AutoAssertNoGC` out differently (5.10). All of these live in one CMake
+  function, `unibind_spidermonkey_definitions`, which every target that includes
+  the engine's headers calls.
 - **MSVC 14.44 is a floor, not a preference.** This library was compiled
   against that toolset's STL and calls helpers that ship only in its own
   `libcpmt.lib`, so an older one fails at link with undefined `__std_*`; the
@@ -712,15 +732,23 @@ design sketched here was a stencil plus a small cache of instantiated
 `JSScript*`s keyed by realm, in a hidden reserved slot on the realm's global -
 the shape the template materialisation cache already uses, so it is traced by
 the engine and dies with the realm, with no bookkeeping to get wrong when a
-context is released. It was not built. The rec still holds the one `JSScript`
-that was instantiated into the realm which compiled it, and `RunScript` opens a
-`JSAutoRealm` on the realm it was handed and executes that script there. It
-needs no rebinding to do so - decision 10 costs this backend nothing, where V8
-pays a `BindToCurrentContext` per run - and `scripts: a script sees the globals
-of the realm it runs in` is what holds both backends to it.
+context is released. It was not built. The rec holds the one `JSScript` that was
+instantiated into the realm which compiled it, and `RunScript` executes that
+script only in that realm. Run in any other, it instantiates the stencil again,
+*there*, and executes that - an instantiation per foreign run, not a parse, and
+nothing kept, so a script run once in a sandbox does not keep the sandbox alive
+for as long as the script. `scripts: a script sees the globals of the realm it
+runs in` is what holds both backends to decision 10.
 
-What the cache would change is therefore where an instantiated script lives, not
-what a run does. It is recorded because it is a real option with a shape the
+It used to execute the one `JSScript` in whatever realm it was handed, and a
+release engine lets it: the result is even right, because a global script
+resolves its globals through the environment it is run against. But a
+`JSScript` belongs to its realm, and a debug engine stops at
+`JS_ExecuteScript` with "Realm mismatch" - the release build was running on
+invariants it had not been given. The debug suite is what found it (5.10).
+
+What the cache would change is therefore what a run in a foreign realm costs,
+not what it does. It is recorded because it is a real option with a shape the
 realm-keyed template cache has already proven, and because a backend author
 looking at the same `RefPtr` will have the same idea.
 
@@ -786,9 +814,14 @@ real capability for symmetry's sake.
 `heapLimitBytes` and `stackLimitBytes` are both genuinely per-isolate here and
 both mean what the header says: `JS_NewContext(maxBytes)` for the first, and
 `JS_SetNativeStackQuota` - measured from wherever it is called, which is
-`Isolate::New` - for the second. `JS::ThreadStackQuotaForSize` exists to
-subtract the margin the engine needs in order to build and throw the
-`RangeError`, and is used rather than passing the raw figure.
+`Isolate::New` - for the second. The figure passed is the stack less the margin
+the engine needs in order to build and throw its error once it has decided it
+is out: `JS::ThreadStackQuotaForSize` for a stack over 320 KiB, which takes a
+tenth. Below that a tenth is less than `js::MinimumStackLimitMargin` (32 KiB),
+which a debug engine asserts and a release one accepts with a margin too small
+for its periodic recursion check to be sure of; so a smaller stack keeps the
+32 KiB whole instead. The suite's 128 KiB case is one of those, and the debug
+engine is what said so.
 
 ### 5.6.1 What is legal inside an interrupt callback, measured
 
@@ -906,3 +939,38 @@ object to call it on. That a program compiled once links against this backend
 anyway, and is told no at run time, is the point (decision 29) - and it is why
 this is not decision 19's link error, which would have made a program that
 merely *offers* a DevTools port impossible to build against this engine.
+
+### 5.10 What the debug engine found
+
+The suite is run against the engine's debug build too (`UNIBIND_ENGINE_FLAVOR=debug`,
+a Debug configuration; CI runs it on every push). Every engine assertion it hit
+was a backend bug that the release engine had been quietly tolerating, and none
+of them was the engine's:
+
+- **It did not link.** `JS::AutoAssertNoGC` is an empty class with inline members
+  unless `MOZ_DIAGNOSTIC_ASSERT_ENABLED` is defined, in which case it carries the
+  context it asserts against and its constructor and destructor are the
+  library's. A debug engine is built with it, and `js-config.h` does not say so -
+  `ENABLE_EXPLICIT_RESOURCE_MANAGEMENT`'s trap again - so the backend laid the
+  class out at the wrong size and the link reported only "duplicate symbol".
+  `unibind_spidermonkey_definitions` in `cmake/UnibindEngines.cmake` is now the
+  one list of what a translation unit including these headers must define.
+- **A script ran in a realm it did not belong to** ("Realm mismatch" at
+  `JS_ExecuteScript`): 5.4.1.
+- **A wrapper's realm was entered** (`!IsCrossCompartmentWrapper` at
+  `JSAutoRealm`), and an unwrapped object was then used from the wrapper's
+  compartment ("Compartment mismatch"): the no-`Context` questions in section 2.
+  Answering them right needs a realm the object is legal in, and a wrapper has
+  none.
+- **An interceptor's key list was read across compartments.** An enumerator may
+  make its array in another realm; it is wrapped into the current one now,
+  rather than unwrapped out of its own.
+- **Strings crossed zones** ("atom is marked white for zone"): section 2, and
+  why realms now share one.
+- **A 128 KiB stack left too small a margin** (`ThreadStackQuotaForSize`): 5.6.
+- **The checked build's stale-handle diagnosis relied on the optimiser.** It
+  compared the handle's epoch with whatever the dead frame's storage held, which
+  diagnoses the mistake only if a later frame has reused that storage - which an
+  optimised build does and an unoptimised one mostly does not. A closing frame
+  now writes an epoch no handle of it carries, so the diagnosis holds in every
+  build.

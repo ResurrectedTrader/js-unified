@@ -41,6 +41,8 @@
 // For JS::ThreadStackQuotaForSize, which lives with the frontend-context API
 // rather than with JS_SetNativeStackQuota.
 #include <js/experimental/CompileScript.h>
+// For MinimumStackLimitMargin, the least margin that quota may leave.
+#include <js/friend/StackLimits.h>
 
 namespace ub {
 namespace detail {
@@ -116,10 +118,15 @@ const JSClass RECORD_HOLDER_CLASS = {"ub::CallbackRecord", JSCLASS_HAS_RESERVED_
 /// realm the value is legal in. A handle belongs to an isolate rather than to
 /// a realm, so the realm that happens to be current need not be one the value
 /// can be operated on from.
+///
+/// An object is legal in its own realm - except a cross-compartment wrapper,
+/// which has no realm: it belongs to a compartment, and any realm in that
+/// compartment is one it may be operated on from. Entering "the wrapper's
+/// realm" is what a debug engine asserts against and a release one quietly
+/// does something else with.
 class ValueRealm {
    public:
-    ValueRealm(JSContext* cx, const JS::Value& value) noexcept
-        : realm_(cx, value.isObject() ? &value.toObject() : JS::CurrentGlobalOrNull(cx)) {}
+    ValueRealm(JSContext* cx, const JS::Value& value) noexcept : realm_(cx, RealmFor(cx, value)) {}
 
     ValueRealm(const ValueRealm&) = delete;
     ValueRealm& operator=(const ValueRealm&) = delete;
@@ -128,6 +135,18 @@ class ValueRealm {
     ~ValueRealm() = default;
 
    private:
+    [[nodiscard]] static JSObject* RealmFor(JSContext* cx, const JS::Value& value) noexcept {
+        if (!value.isObject()) {
+            return JS::CurrentGlobalOrNull(cx);
+        }
+        JSObject* object = &value.toObject();
+        if (!js::IsCrossCompartmentWrapper(object)) {
+            return object;
+        }
+        JSObject* global = js::GetFirstGlobalInCompartment(JS::GetCompartment(object));
+        return global != nullptr ? global : JS::CurrentGlobalOrNull(cx);
+    }
+
     JSAutoNullableRealm realm_;
 };
 
@@ -158,12 +177,18 @@ bool Terminating(const Context& context) noexcept {
     return Terminating(OwnerOf(context));
 }
 
+JS::RealmOptions IsolateRealmOptions() noexcept {
+    JS::RealmOptions options;
+    options.creationOptions().setNewCompartmentInSystemZone();
+    return options;
+}
+
 JSObject* UtilityGlobal(Isolate& isolate) noexcept {
     JSContext* cx = Raw(isolate);
     if (isolate.impl().utility != nullptr) {
         return isolate.impl().utility;
     }
-    JS::RealmOptions options;
+    const JS::RealmOptions options = IsolateRealmOptions();
     JS::RootedObject global(cx, JS_NewGlobalObject(cx, &GLOBAL_CLASS, nullptr, JS::FireOnNewGlobalHook, options));
     if (global == nullptr) {
         JS_ClearPendingException(cx);
@@ -401,7 +426,10 @@ ValueKind KindOf(Slot value) noexcept {
             return ValueKind::Function;
         }
         JSContext* cx = Raw(IsolateFor(value));
-        ValueRealm realm(cx, raw);
+        // The object behind any wrapper, asked in its own realm: a question
+        // about what it is belongs to it, and a wrapper's realm is not one the
+        // unwrapped object may be used from.
+        ValueRealm realm(cx, JS::ObjectValue(*object));
         JS::RootedObject rooted(cx, object);
         bool isArray = false;
         // A revoked proxy answers this by throwing, and this is a noexcept
@@ -453,8 +481,8 @@ bool IsType(Slot value, TypeCode type) noexcept {
                 return false;
             }
             JSContext* cx = Raw(IsolateFor(value));
-            ValueRealm realm(cx, raw);
             JS::RootedObject object(cx, Unwrapped(raw));
+            ValueRealm realm(cx, JS::ObjectValue(*object));
             bool isArray = false;
             // As in `KindOf`: a revoked proxy throws rather than answering, and
             // a query that says `noexcept` must not leave that behind for
@@ -486,8 +514,8 @@ bool IsType(Slot value, TypeCode type) noexcept {
                 return false;
             }
             JSContext* cx = Raw(IsolateFor(value));
-            ValueRealm realm(cx, raw);
             JS::RootedObject object(cx, Unwrapped(raw));
+            ValueRealm realm(cx, JS::ObjectValue(*object));
             return JS::IsPromiseObject(object);
         }
         case TypeCode::External:
@@ -1902,8 +1930,8 @@ std::uint32_t ArrayLength(Slot array) noexcept {
     if (!raw.isObject()) {
         return 0;
     }
-    ValueRealm realm(cx, raw);
     JS::RootedObject object(cx, Unwrapped(raw));
+    ValueRealm realm(cx, JS::ObjectValue(*object));
     std::uint32_t length = 0;
     if (!JS::GetArrayLength(cx, object, &length)) {
         JS_ClearPendingException(cx);
@@ -2661,7 +2689,7 @@ void TryCatchReset(TryCatchState& state) noexcept {
 
 ContextRec* NewContext(Isolate& isolate) {
     JSContext* cx = Raw(isolate);
-    JS::RealmOptions options;
+    const JS::RealmOptions options = IsolateRealmOptions();
     JS::RootedObject global(cx, JS_NewGlobalObject(cx, &GLOBAL_CLASS, nullptr, JS::FireOnNewGlobalHook, options));
     if (global == nullptr) {
         return nullptr;
@@ -2769,10 +2797,11 @@ ScriptRec* RecFromStencil(JSContext* cx, const Context& context, RefPtr<JS::Sten
     auto* rec = new ScriptRec{.owner = &OwnerOf(context),
                               .stencil = std::move(stencil),
                               .script = JS::PersistentRooted<JSScript*>(cx),
-
+                              .global = JS::PersistentRootedObject(cx),
                               .usedCache = usedCache};
     ++rec->owner->impl().embedderRefs;
     rec->script = script;
+    rec->global = GlobalOf(context);
     return rec;
 }
 
@@ -2913,6 +2942,24 @@ Maybe<Slot> RunScript(const Context& context, ScriptRec* script) {
         return std::nullopt;
     }
     JS::RootedScript rooted(cx, script->script.get());
+    // A script belongs to the realm that instantiated it. Run in another, it is
+    // instantiated again, there, from the stencil: that is what "compile once,
+    // run in every realm" (docs/status.md decision 10) costs on this engine -
+    // an instantiation, not a parse. It is not kept, so that a script run once
+    // in a realm does not keep that realm alive for as long as the script.
+    if (script->global.get() != GlobalOf(context)) {
+        const JS::InstantiateOptions instantiateOptions;
+        rooted = JS::InstantiateGlobalStencil(cx, instantiateOptions, script->stencil.get());
+        if (rooted == nullptr) {
+            return std::nullopt;
+        }
+        // The same retained text, so that `TryCatch::Location` quotes it from
+        // here too; the engine's reference hook counts the second holder.
+        const JS::Value kept = JS::GetScriptPrivate(script->script.get());
+        if (!kept.isUndefined()) {
+            JS::SetScriptPrivate(rooted, kept);
+        }
+    }
     JS::RootedValue result(cx);
     if (!JS_ExecuteScript(cx, rooted, &result)) {
         return std::nullopt;
@@ -3178,6 +3225,26 @@ std::size_t UsableStackBytes(std::size_t wanted) noexcept {
     return wanted < usable ? wanted : usable;
 }
 
+/// The quota to give the engine for a stack of `bytes`: the stack less the
+/// margin the engine needs to still build and throw its "too much recursion"
+/// once it has decided it is out.
+///
+/// `ThreadStackQuotaForSize` takes that margin as a tenth of the stack, and it
+/// only means it for a stack of more than ten times `MinimumStackLimitMargin` -
+/// 320 KiB. Below that a tenth is less than the engine's own minimum, which a
+/// debug engine asserts and a release one accepts, leaving a margin too small
+/// for its periodic recursion check to be sure of catching the overrun. So a
+/// smaller stack keeps the minimum margin whole, and the quota is what is left
+/// - or half the stack, when the stack is too small to leave anything after it.
+[[nodiscard]] JS::NativeStackSize StackQuotaFor(std::size_t bytes) noexcept {
+    constexpr std::size_t MARGIN = js::MinimumStackLimitMargin;
+    constexpr std::size_t PROPORTIONAL_FROM = 10 * MARGIN;
+    if (bytes > PROPORTIONAL_FROM) {
+        return JS::ThreadStackQuotaForSize(bytes);
+    }
+    return bytes > 2 * MARGIN ? bytes - MARGIN : bytes / 2;
+}
+
 /// How `Isolate::TerminateExecution` actually stops a script.
 ///
 /// SpiderMonkey has no terminate call. Returning `false` from an interrupt
@@ -3410,11 +3477,11 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
     // the engine never reaches, so runaway recursion walks off the end and the
     // process dies - the exact failure `stackLimitBytes` exists to turn into a
     // RangeError. Asking the OS is the only way to know; SpiderMonkey has no
-    // opinion and will set whatever it is given. `ThreadStackQuotaForSize` then
+    // opinion and will set whatever it is given. `StackQuotaFor` then
     // takes off the margin the engine needs to still be able to build and throw
     // the error once it has decided it is out of stack.
     if (options.stackLimitBytes != 0) {
-        JS_SetNativeStackQuota(impl->cx, JS::ThreadStackQuotaForSize(UsableStackBytes(options.stackLimitBytes)));
+        JS_SetNativeStackQuota(impl->cx, StackQuotaFor(UsableStackBytes(options.stackLimitBytes)));
     }
     // Without a job queue the engine has nowhere to put a promise continuation.
     // The internal one queues them and runs nothing until `js::RunJobs`, which

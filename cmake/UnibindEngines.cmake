@@ -207,3 +207,39 @@ function(unibind_provide_engine engine)
     # and it stays empty unless someone sets it.
     set(${variable} "${unibindEngineDir}" PARENT_SCOPE)
 endfunction()
+
+# What a translation unit that includes SpiderMonkey's headers has to define, so
+# that it lays the engine's types out as the library was built to. Applied to
+# every target that includes them - the backend and the fatal-path test - so
+# there is one list and not two to drift apart.
+#
+# STATIC_JS_API and XP_WIN are not optional: the headers lay types out
+# differently without them, and the mismatch mostly does not show up as a
+# compile error. MOZ_STATIC_JS is the same switch under mozilla-config's name.
+#
+# ENABLE_EXPLICIT_RESOURCE_MANAGEMENT is the trap. The prebuilt library was
+# compiled with it, but js-config.h - which is the header bundle's record of
+# what the build enabled - does not mention it. It gates an enumerator in the
+# middle of JSExnType (JSEXN_SUPPRESSEDERR) and entries in JSProtoKey and
+# JS::SymbolCode, so without it every enumerator after that point means
+# something different here from what it means inside the library: asking for a
+# TypeError produces a SyntaxError. It compiles cleanly either way. See
+# docs/spidermonkey.md.
+#
+# A debug engine adds two. DEBUG, because it is configured with --enable-debug
+# and its js-config.h refuses to be included without it. And
+# MOZ_DIAGNOSTIC_ASSERT_ENABLED, which is the same trap again: a debug build
+# turns diagnostic assertions on, js-config.h does not say so, and the public
+# headers lay types out by it - `JS::AutoAssertNoGC` carries the context it
+# asserts against and defines its constructor and destructor in the library,
+# instead of being an empty class with inline ones. Without it the backend
+# builds an object of the wrong size, and the link says only "duplicate symbol",
+# because the inline constructor meets the library's out-of-line one.
+function(unibind_spidermonkey_definitions target)
+    target_compile_definitions(${target} PRIVATE
+        STATIC_JS_API MOZ_STATIC_JS XP_WIN ENABLE_EXPLICIT_RESOURCE_MANAGEMENT)
+    string(TOLOWER "${UNIBIND_ENGINE_FLAVOR}" flavour)
+    if(flavour STREQUAL "debug")
+        target_compile_definitions(${target} PRIVATE DEBUG MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    endif()
+endfunction()

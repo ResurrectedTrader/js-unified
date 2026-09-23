@@ -31,38 +31,14 @@ target_include_directories(unibind_backend_spidermonkey SYSTEM PRIVATE
     "${UNIBIND_SPIDERMONKEY_DIR}/include")
 target_include_directories(unibind_backend_spidermonkey PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-# STATIC_JS_API and XP_WIN are not optional: the headers lay types out
-# differently without them, and the mismatch mostly does not show up as a
-# compile error. MOZ_STATIC_JS is the same switch under mozilla-config's name.
-#
-# ENABLE_EXPLICIT_RESOURCE_MANAGEMENT is the trap. The prebuilt library was
-# compiled with it, but js-config.h - which is the header bundle's record of
-# what the build enabled - does not mention it. It gates an enumerator in the
-# middle of JSExnType (JSEXN_SUPPRESSEDERR) and entries in JSProtoKey and
-# JS::SymbolCode, so without it every enumerator after that point means
-# something different here from what it means inside the library: asking for a
-# TypeError produces a SyntaxError. It compiles cleanly either way. See
-# docs/spidermonkey.md.
-target_compile_definitions(unibind_backend_spidermonkey PRIVATE
-    STATIC_JS_API
-    MOZ_STATIC_JS
-    XP_WIN
-    ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN)
+# The engine's own defines. Not one of them is optional, and most of them change
+# how the headers lay types out without a compile error to say so - see
+# unibind_spidermonkey_definitions in cmake/UnibindEngines.cmake for each.
+unibind_spidermonkey_definitions(unibind_backend_spidermonkey)
+target_compile_definitions(unibind_backend_spidermonkey PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 # The engine and the system libraries it was built against, as listed in
 # dependencies/README.md.
-# A debug engine is configured with --enable-debug, and its js-config.h refuses
-# to be included without DEBUG: the public headers lay some types out
-# differently with it, so compiling against them without it would be an ABI
-# mismatch rather than a style choice. The flavor is what says which engine this
-# is, so it is what decides.
-string(TOLOWER "${UNIBIND_ENGINE_FLAVOR}" unibindSpiderMonkeyFlavor)
-if(unibindSpiderMonkeyFlavor STREQUAL "debug")
-    target_compile_definitions(unibind_backend_spidermonkey PRIVATE DEBUG)
-endif()
-
 target_link_libraries(unibind_backend_spidermonkey PUBLIC
     "${UNIBIND_SPIDERMONKEY_DIR}/spidermonkey.lib"
     mincore ws2_32 advapi32 user32 ole32 oleaut32 shell32 userenv
