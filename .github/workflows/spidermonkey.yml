@@ -70,6 +70,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # vcpkg.json pins a builtin-baseline; the image's vcpkg clone can be older
+      # than it, and vcpkg reads the baseline out of that commit.
+      - name: Fetch the vcpkg baseline the manifest pins
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch --quiet origin $baseline
+
       - name: Report the toolsets, and refuse an image with no ClangCL
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -112,6 +119,13 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+
+      # vcpkg.json pins a builtin-baseline; the image's vcpkg clone can be older
+      # than it, and vcpkg reads the baseline out of that commit.
+      - name: Fetch the vcpkg baseline the manifest pins
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch --quiet origin $baseline
 
       - name: Report the free space
         run: |
