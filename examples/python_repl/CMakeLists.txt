@@ -66,13 +66,31 @@ set_tests_properties(example.python_repl.timeout-stops-a-runaway-loop PROPERTIES
     LABELS "example" TIMEOUT 60
     PASS_REGULAR_EXPRESSION "terminated by --timeout.*exit code: 1")
 
-# An interactive session with its input piped in: expressions, a multi-line
-# def, an exception, a command, and :quit. The expected output is one ordered
-# pattern, so the lines have to come out in this order to pass.
+# An interactive session with its input piped in (tests/session.txt):
+# expressions, `_`, a multi-line def ended by a blank line, a traceback, a
+# class, an interceptor, a greeter, a command and :quit. Piped input is echoed
+# after the prompt, so the output reads as the session would on a console.
+#
+# These are the lines that must come out, in this order; anything may sit
+# between two of them, and a line ending may be CRLF.
+set(session_lines
+    ">>> 6 \* 7"   "42"
+    ">>> _ \+ 1"   "43"
+    ">>> def fib\(n\):"   "\.\.\.     return n if n < 2 else"   "\.\.\. "
+    ">>> \[fib\(i\) for i in range\(10\)\]"   "\[0, 1, 1, 2, 3, 5, 8, 13, 21, 34\]"
+    ">>> 1 / 0"   "Traceback \(most recent call last\):"   "ZeroDivisionError: division by zero"
+    ">>> Counter\(5\)\.increment\(\)"   "6"
+    ">>> host\.env\.mode"   "'interactive'"
+    ">>> greet\(\"REPL\"\)"   "'Hi, REPL!'"
+    ">>> :heap"   "used [0-9]+ B"
+    ">>> :quit"   "exit code: 0")
+list(JOIN session_lines "\r?\n(.*\r?\n)?" session_pattern)
+
 add_test(NAME example.python_repl.session
          COMMAND "${CMAKE_COMMAND}" -DREPL=${repl} "-DINPUT=${data}/session.txt"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run.cmake")
 set_tests_properties(example.python_repl.session PROPERTIES
     LABELS "example" TIMEOUT 60
-    PASS_REGULAR_EXPRESSION
-    ">>> 6 \\* 7\n42\n.*>>> def fib\\(n\\):\n\\.\\.\\. .*\n\\.\\.\\. \n>>> \\[fib\\(i\\) for i in range\\(10\\)\\]\n\\[0, 1, 1, 2, 3, 5, 8, 13, 21, 34\\]\n.*ZeroDivisionError: division by zero.*>>> _ \\+ 1\n43\n.*Counter\\(5\\)\\.increment\\(\\)\n6\n.*:quit\nexit code: 0")
+    PASS_REGULAR_EXPRESSION "${session_pattern}"
+    # :quit ends the session; the line after it must never be evaluated.
+    FAIL_REGULAR_EXPRESSION "never evaluated")
