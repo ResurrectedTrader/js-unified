@@ -365,12 +365,15 @@ function(_unibind_provide_python)
     # The engine's other link inputs, relative to the prefix, release flavour -
     # what the install tree's package files name beside python3X.lib.
     set(UNIBIND_PYTHON_DEP_LIB_NAMES "${depNames}" PARENT_SCOPE)
-    # What the core and its built-in modules call in Windows itself:
+    # What the core, its built-in modules and openssl call in Windows itself:
     #   version shlwapi pathcch bcrypt advapi32 user32 kernel32 ole32 oleaut32 - the core
-    #   ws2_32 iphlpapi rpcrt4 - _socket, select, _overlapped (and _uuid: rpcrt4)
+    #   ws2_32 - _socket, select, _overlapped, _multiprocessing, _ssl, openssl
+    #   iphlpapi - _socket          rpcrt4 - _socket, _uuid, _msi
+    #   crypt32 - _ssl, openssl     winmm - winsound
+    #   msi cabinet - _msi          wbemuuid propsys - _wmi
     set(UNIBIND_PYTHON_SYSTEM_LIBS
         version ws2_32 shlwapi pathcch bcrypt advapi32 user32 kernel32 ole32 oleaut32
-        iphlpapi rpcrt4 PARENT_SCOPE)
+        iphlpapi rpcrt4 crypt32 winmm msi cabinet wbemuuid propsys PARENT_SCOPE)
     set(UNIBIND_PYTHON_STDLIB "${stdlib}" PARENT_SCOPE)
     set(UNIBIND_PYTHON_VERSION "${version}" PARENT_SCOPE)
     message(STATUS "unibind: CPython ${version} (static, /MT) at ${prefix}")
