@@ -682,7 +682,7 @@ class Session {
 
     static void ReportStop(StopReason reason) {
         if (reason == StopReason::Timeout) {
-            Err("TimeoutError: stopped after {} s (terminated by --timeout)\n", gSupervisor.Timeout().value_or(0));
+            Err("TimeoutError: stopped by the watchdog after {} s\n", gSupervisor.Timeout().value_or(0));
         } else {
             Err("KeyboardInterrupt (terminated)\n");
         }

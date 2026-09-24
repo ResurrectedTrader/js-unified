@@ -1292,7 +1292,8 @@ tools/headers_only/ compiles every public header alone, and instantiates the
                     rather than compiled
 tests/              one suite, written against ub:: only, run against both
                     backends and compared - see tests/README.md
-examples/           a consumer, built against an installed prefix
+examples/           embed: a consumer, built against an installed prefix;
+                    python_repl: a Python prompt over the CPython backend
 packaging/          unibind.props and the CMake package, for consumers
 docs/               decisions, including the ones that were rejected, and
                     gotchas.md, which is the one to read first

@@ -64,7 +64,7 @@ add_test(NAME example.python_repl.timeout-stops-a-runaway-loop
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run.cmake")
 set_tests_properties(example.python_repl.timeout-stops-a-runaway-loop PROPERTIES
     LABELS "example" TIMEOUT 60
-    PASS_REGULAR_EXPRESSION "terminated by --timeout.*exit code: 1")
+    PASS_REGULAR_EXPRESSION "TimeoutError: stopped by the watchdog after 1 s.*exit code: 1")
 
 # An interactive session with its input piped in (tests/session.txt):
 # expressions, `_`, a multi-line def ended by a blank line, a traceback, a
