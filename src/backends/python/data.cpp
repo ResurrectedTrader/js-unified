@@ -578,6 +578,24 @@ struct DataViewObject {
     return true;
 }
 
+/// A new bytearray of `size` bytes, contents unspecified. New reference, or
+/// null with `MemoryError` pending.
+///
+/// Never `PyByteArray_FromStringAndSize(nullptr, size)`: in CPython 3.12,
+/// when the storage cannot be had, that frees the half-made object before it
+/// has set `ob_exports`, and `bytearray`'s deallocator reads the uninitialised
+/// field - "SystemError: deallocated bytearray object has exported buffers",
+/// printed as unraisable whenever the stale memory happens to be positive. An
+/// empty bytearray is made whole, and growing it fails cleanly.
+[[nodiscard]] PyObject* NewByteArray(Py_ssize_t size) noexcept {
+    PyObject* buffer = PyByteArray_FromStringAndSize(nullptr, 0);
+    if (buffer != nullptr && size > 0 && PyByteArray_Resize(buffer, size) != 0) {
+        Py_DECREF(buffer);
+        return nullptr;
+    }
+    return buffer;
+}
+
 /// A new, private, zero-filled bytearray of `count` elements of `type`.
 [[nodiscard]] PyObject* NewZeroedBuffer(ElementType type, Py_ssize_t count) noexcept {
     const Py_ssize_t size = SizeOf(type);
@@ -585,7 +603,7 @@ struct DataViewObject {
         PyErr_Format(RangeErrorClass(), "TypedArray length %zd is too large", count);
         return nullptr;
     }
-    PyObject* buffer = PyByteArray_FromStringAndSize(nullptr, count * size);
+    PyObject* buffer = NewByteArray(count * size);
     if (buffer != nullptr && count > 0) {
         std::memset(PyByteArray_AS_STRING(buffer), 0, static_cast<std::size_t>(count * size));
     }
@@ -1404,7 +1422,7 @@ std::optional<Slot> MakeArrayBuffer(const Context& context, std::span<const std:
     if (bytes.size() > byteLength || byteLength > static_cast<std::size_t>(PY_SSIZE_T_MAX)) {
         return std::nullopt;
     }
-    PyObject* buffer = PyByteArray_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(byteLength));
+    PyObject* buffer = NewByteArray(static_cast<Py_ssize_t>(byteLength));
     if (buffer == nullptr) {
         // "Empty, with nothing thrown": a length this engine cannot allocate is
         // an answer, not an exception.

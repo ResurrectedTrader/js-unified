@@ -859,8 +859,10 @@ class ApiOp {
 // ---------------------------------------------------------------------------
 
 /// Give the native a class instance carries back, exactly once: here, on the
-/// isolate's thread - which is the only thread this interpreter's objects die
-/// on - unless teardown already has.
+/// isolate's thread, unless teardown already has. An instance that dies on a
+/// thread a script started leaves its native in `liveNatives`, for `~Isolate`
+/// to give back on the isolate's thread: a native is the embedder's object,
+/// and is never destroyed on a thread the embedder did not make.
 void ReleaseBox(ObjectInstance* object) noexcept {
     NativeBox* box = std::exchange(object->box, nullptr);
     if (box == nullptr) {
@@ -1955,10 +1957,17 @@ std::uint32_t ArrayLength(Slot array) noexcept {
 NativeBox* GetNativeBox(Slot object) noexcept {
     Isolate& isolate = IsolateFor(object);
     PyObject* value = Resolve(object);
-    if (isolate.impl().nativesReleased || !IsObjectInstance(isolate, value)) {
+    Isolate::Impl& impl = isolate.impl();
+    if (impl.nativesReleased || !IsObjectInstance(isolate, value)) {
         return nullptr;
     }
-    return AsInstance(value)->box;
+    NativeBox* box = AsInstance(value)->box;
+    // While `~Isolate` gives the natives back, one may already be gone while
+    // its instance lives on: only a box still waiting its turn is real.
+    if (box != nullptr && impl.nativesTearingDown && !impl.liveNatives.contains(box)) {
+        return nullptr;
+    }
+    return box;
 }
 
 bool InitObjectTypes(Isolate& isolate, PyObject* module) noexcept {

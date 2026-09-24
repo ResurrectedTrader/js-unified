@@ -354,8 +354,24 @@ struct RuntimeState {
     /// 32 calls for the whole interpreter and refuses the 33rd, so this one is
     /// never queued twice.
     std::atomic<bool> scheduled{false};
-    /// Teardown has begun: nothing is accepted, `Service` does nothing.
+    /// Teardown has begun: nothing is accepted, `Service` does nothing on the
+    /// isolate's own thread.
     std::atomic<bool> closed{false};
+
+    /// The isolate's thread, by its OS id - which is how `Service` and the
+    /// monitoring callback, run on whichever of the interpreter's threads
+    /// trips the check first, tell it from a thread a script started.
+    DWORD ownerThread = 0;
+    /// Stop every thread of the interpreter but the isolate's own: set by
+    /// `~Isolate` while it waits for the threads a script started
+    /// (`StopScriptThreads`). Unlike `terminating` it is honoured after
+    /// `closed`, and needs nothing from the isolate, so that it goes on
+    /// stopping threads an isolate had to abandon; see `~Isolate`.
+    std::atomic<bool> stopThreads{false};
+    /// `unibind.Terminated`, strong, for raising on a thread that cannot find
+    /// the isolate's `Types`. Dropped when the last thread has been waited
+    /// for - or never, if the interpreter is abandoned with threads in it.
+    PyObject* threadStop = nullptr;
 
     std::mutex interruptMutex;
     std::deque<RuntimeInterrupt> interrupts;
@@ -413,9 +429,11 @@ namespace {
 
 int Service(void* arg);
 
-/// Queue `Service` unless it already is. Any thread.
-void Schedule(RuntimeState& runtime) noexcept {
-    if (runtime.closed.load(std::memory_order_acquire)) {
+/// Queue `Service` unless it already is. Any thread. `evenIfClosed` is for the
+/// stop `~Isolate` puts on the threads a script started, which outlives
+/// `closed`.
+void Schedule(RuntimeState& runtime, bool evenIfClosed = false) noexcept {
+    if (!evenIfClosed && runtime.closed.load(std::memory_order_acquire)) {
         return;
     }
     if (!runtime.scheduled.exchange(true)) {
@@ -503,14 +521,34 @@ void RunInterrupts(RuntimeState& runtime) noexcept {
 /// The tool id is claimed once per isolate at setup; 3 and 4 are the ids
 /// CPython leaves unassigned. If a script's own debugger holds both, the stop
 /// still works - by the pending call alone, with the two gaps above.
-PyObject* MonitoringCallback(PyObject* /*self*/, PyObject* const* /*args*/, Py_ssize_t /*count*/) {
-    Isolate* isolate = CurrentIsolate();
-    if (isolate != nullptr) {
-        RuntimeState* runtime = isolate->impl().runtime.get();
-        if (runtime != nullptr && !runtime->closed.load(std::memory_order_acquire) && Terminating(*isolate)) {
-            PyErr_SetNone(isolate->impl().types.terminated);
-            return nullptr;
-        }
+///
+/// The callback is the interpreter's, not the thread's: it fires on every
+/// thread that runs Python in this interpreter, including threads a script
+/// started. It is bound to the isolate's `RuntimeState` rather than finding the
+/// isolate through the thread, so that a stop in force - the embedder's, or the
+/// one `~Isolate` puts on those threads - stops them too.
+constexpr const char* RUNTIME_CAPSULE = "unibind.runtime";
+
+/// Whether a stop applies to the thread asking. The isolate's own thread
+/// honours `terminating` until teardown closes the runtime; every other thread
+/// honours it too, and `stopThreads` besides, which outlives the isolate.
+[[nodiscard]] bool StopApplies(RuntimeState& runtime) noexcept {
+    const bool closed = runtime.closed.load(std::memory_order_acquire);
+    if (!closed && Terminating(*runtime.isolate)) {
+        return true;
+    }
+    return GetCurrentThreadId() != runtime.ownerThread && runtime.stopThreads.load(std::memory_order_acquire);
+}
+
+PyObject* MonitoringCallback(PyObject* self, PyObject* const* /*args*/, Py_ssize_t /*count*/) {
+    auto* runtime = static_cast<RuntimeState*>(PyCapsule_GetPointer(self, RUNTIME_CAPSULE));
+    if (runtime == nullptr) {
+        PyErr_Clear();
+        Py_RETURN_NONE;
+    }
+    if (runtime->threadStop != nullptr && StopApplies(*runtime)) {
+        PyErr_SetNone(runtime->threadStop);
+        return nullptr;
     }
     Py_RETURN_NONE;
 }
@@ -542,7 +580,9 @@ void ClaimMonitoring(RuntimeState& runtime) noexcept {
     }
     const long line = MonitoringEvent(monitoring, "LINE");
     const long call = MonitoringEvent(monitoring, "CALL");
-    PyObject* callback = PyCFunction_NewEx(&monitoringCallbackDef, nullptr, nullptr);
+    PyObject* self = PyCapsule_New(&runtime, RUNTIME_CAPSULE, nullptr);
+    PyObject* callback = self == nullptr ? nullptr : PyCFunction_NewEx(&monitoringCallbackDef, self, nullptr);
+    Py_XDECREF(self);
     if (line < 0 || call < 0 || callback == nullptr) {
         Py_XDECREF(callback);
         PyErr_Clear();
@@ -600,17 +640,54 @@ void SetMonitoring(RuntimeState& runtime, bool armed) noexcept {
     }
 }
 
+/// `Service` on a thread a script started. Interrupts belong to the isolate's
+/// thread (`Isolate::RequestInterrupt`), so they are left queued, and the call
+/// is queued again so that the isolate's thread finds them at its next check -
+/// until it does, a check on this thread comes back here, which costs a lock
+/// and nothing else. A stop is raised here as on the isolate's thread.
+int ServiceScriptThread(RuntimeState& runtime) noexcept {
+    if (runtime.threadStop != nullptr && StopApplies(runtime)) {
+        Schedule(runtime, /*evenIfClosed=*/true);
+        SetMonitoring(runtime, true);
+        PyErr_SetNone(runtime.threadStop);
+        return -1;
+    }
+    if (!runtime.closed.load(std::memory_order_acquire)) {
+        bool waiting = false;
+        {
+            const std::lock_guard<std::mutex> lock(runtime.interruptMutex);
+            waiting = !runtime.interrupts.empty();
+        }
+        if (waiting) {
+            Schedule(runtime);
+        }
+    }
+    return 0;
+}
+
 int Service(void* arg) {
     auto& runtime = *static_cast<RuntimeState*>(arg);
     // Cleared first, so that a request made from here on queues us again.
     runtime.scheduled.store(false);
+    // Pending calls run on whichever of the interpreter's threads checks first.
+    if (GetCurrentThreadId() != runtime.ownerThread) {
+        return ServiceScriptThread(runtime);
+    }
     if (runtime.closed.load(std::memory_order_acquire)) {
+        // A stop `~Isolate` put on the script's threads outlives `closed`;
+        // keep it queued for them.
+        if (runtime.stopThreads.load(std::memory_order_acquire)) {
+            Schedule(runtime, /*evenIfClosed=*/true);
+        }
         return 0;
     }
     Isolate& isolate = *runtime.isolate;
     if (!Terminating(isolate)) {
         RunInterrupts(runtime);
         if (!Terminating(isolate)) {
+            if (runtime.stopThreads.load(std::memory_order_acquire)) {
+                Schedule(runtime, /*evenIfClosed=*/true);
+            }
             return 0;
         }
     }
@@ -621,19 +698,20 @@ int Service(void* arg) {
 }
 
 /// `sys.unraisablehook` for the isolate: `Terminated` reaching the top of a
-/// finalizer - a `__del__`, a coroutine being closed - while a stop is in force
-/// is the stop working, not an error to print. Everything else goes to the
-/// default hook. A builtin rather than a Python function on purpose: a Python
-/// one would meet `Terminated` itself on entry, while a stop is in force,
-/// which is exactly when it is needed.
-PyObject* UnraisableHook(PyObject* /*self*/, PyObject* unraisable) {
-    Isolate* isolate = CurrentIsolate();
-    if (isolate != nullptr && isolate->impl().types.terminated != nullptr) {
+/// finalizer - a `__del__`, a coroutine being closed - or of a thread a script
+/// started, while a stop is in force, is the stop working, not an error to
+/// print. Everything else goes to the default hook. A builtin rather than a
+/// Python function on purpose: a Python one would meet `Terminated` itself on
+/// entry, while a stop is in force, which is exactly when it is needed. Bound
+/// to `unibind.Terminated` (`self`), because it runs on those threads too,
+/// where there is no isolate to look the type up in.
+PyObject* UnraisableHook(PyObject* self, PyObject* unraisable) {
+    if (self != nullptr) {
         PyObject* value = PyObject_GetAttrString(unraisable, "exc_value");
         if (value == nullptr) {
             PyErr_Clear();
         } else {
-            const bool stop = PyErr_GivenExceptionMatches(value, isolate->impl().types.terminated) != 0;
+            const bool stop = PyErr_GivenExceptionMatches(value, self) != 0;
             Py_DECREF(value);
             if (stop) {
                 Py_RETURN_NONE;
@@ -685,10 +763,33 @@ import weakref as _weakref
 # JavaScript promise that was resolved with a thenable.
 _following = _weakref.WeakSet()
 
+import threading as _threading
+
+# The isolate's loop is the thread's current loop, and stays it. `asyncio.run`
+# makes a loop of its own and, closing it, sets the current loop to None -
+# after which `get_event_loop()`, `Future()` and `ensure_future()` in the next
+# script would raise "There is no current event loop". So the policy falls back
+# to the isolate's loop, on the isolate's thread, whenever none is set: a
+# script that sets one of its own still gets that one.
+_isolate_loop = None
+_isolate_thread = None
+
+class _Policy(type(_asyncio.get_event_loop_policy())):
+    def get_event_loop(self):
+        loop = _isolate_loop
+        if (self._local._loop is None and loop is not None and not loop.is_closed()
+                and _threading.get_ident() == _isolate_thread):
+            self.set_event_loop(loop)
+        return super().get_event_loop()
+
 def new_loop(quiet):
+    global _isolate_loop, _isolate_thread
     loop = _asyncio.SelectorEventLoop()
     loop.set_exception_handler(quiet)
+    _asyncio.set_event_loop_policy(_Policy())
     _asyncio.set_event_loop(loop)
+    _isolate_loop = loop
+    _isolate_thread = _threading.get_ident()
     return loop
 
 def _follow(source, target):
@@ -724,6 +825,7 @@ def reject(future, error):
     return True
 
 def close_loop(loop):
+    global _isolate_loop
     # Dropped, not run: nothing is stepped again. Closing each coroutine
     # keeps an unstarted one from warning that it was never awaited, and a
     # suspended one gets the GeneratorExit its garbage collection would have
@@ -735,6 +837,7 @@ def close_loop(loop):
         except BaseException:
             pass
     loop.close()
+    _isolate_loop = None
     _asyncio.set_event_loop(None)
 )PY";
 
@@ -1053,9 +1156,14 @@ bool InitRuntimeTypes(Isolate& isolate, PyObject* /*module*/) noexcept {
         }
         state->isolate = &isolate;
         state->interp = impl.interp;
+        state->ownerThread = GetCurrentThreadId();
         impl.runtime.reset(state);
     }
-    PyObject* hook = PyCFunction_NewEx(&unraisableHookDef, nullptr, nullptr);
+    RuntimeState& runtime = *impl.runtime;
+    if (runtime.threadStop == nullptr) {
+        runtime.threadStop = Py_XNewRef(impl.types.terminated);
+    }
+    PyObject* hook = PyCFunction_NewEx(&unraisableHookDef, impl.types.terminated, nullptr);
     if (hook == nullptr) {
         return false;
     }
@@ -1165,6 +1273,144 @@ void IsolateRuntimeTeardown(Isolate& isolate) noexcept {
     if (runtime->account != nullptr && tAccount == runtime->account) {
         tAccount = nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Threads a script started
+//
+// `allow_threads` is on - asyncio resolves names on a worker thread, and a
+// stdlib without `threading` is not the stdlib - so a script can start threads
+// in the isolate's interpreter, and `Py_EndInterpreter` must not run while one
+// is alive: it is a fatal error ("not the last thread"), and for a
+// `threading.Thread` CPython would first join it, forever if it never ends.
+// So `~Isolate` stops them first and waits for them.
+//
+// They share the isolate's GIL, so they run only while the isolate's thread
+// runs Python or sits in a blocking call; idle, the isolate holds the GIL and
+// they wait. Stopping one is the ordinary stop, delivered to that thread: the
+// pending call and the monitoring events fire on whichever thread checks.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// How long `~Isolate` waits for the threads a script started to end once
+/// they have been told to stop. Stopped Python ends at its next check; this is
+/// for a thread inside a blocking call - `time.sleep`, a socket read - which
+/// sees the stop only when the call returns.
+constexpr std::chrono::milliseconds THREAD_GRACE{2000};
+
+[[nodiscard]] bool OtherThreads(Isolate& isolate) noexcept {
+    const Isolate::Impl& impl = isolate.impl();
+    // The list changes only under the runtime's own lock, and a thread
+    // leaves it while holding the GIL - which this thread holds.
+    for (PyThreadState* ts = PyInterpreterState_ThreadHead(impl.interp); ts != nullptr; ts = PyThreadState_Next(ts)) {
+        if (ts != impl.tstate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool StopScriptThreads(Isolate& isolate, bool wait) noexcept {
+    if (!OtherThreads(isolate)) {
+        return true;
+    }
+    RuntimeState* runtime = RuntimeOf(isolate);
+    if (runtime == nullptr) {
+        return false;
+    }
+    runtime->stopThreads.store(true, std::memory_order_release);
+    Schedule(*runtime, /*evenIfClosed=*/true);
+    SetMonitoring(*runtime, true);
+    const auto deadline = std::chrono::steady_clock::now() + (wait ? THREAD_GRACE : std::chrono::milliseconds{0});
+    bool alone = false;
+    for (;;) {
+        // The GIL goes for a moment each round: the threads need it to meet
+        // the stop, and to finish.
+        PyThreadState* self = PyEval_SaveThread();
+        Sleep(1);
+        PyEval_RestoreThread(self);
+        alone = !OtherThreads(isolate);
+        if (alone || std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        Schedule(*runtime, /*evenIfClosed=*/true);
+    }
+    if (alone) {
+        runtime->stopThreads.store(false, std::memory_order_release);
+        if (!Terminating(isolate) || runtime->closed.load(std::memory_order_acquire)) {
+            SetMonitoring(*runtime, false);
+        }
+    }
+    return alone;
+}
+
+namespace {
+
+/// Once no thread a script started is left: forget the stop that was for
+/// them, and what `Py_EndInterpreter` would otherwise wait on.
+void FinishWithScriptThreads(RuntimeState* runtime) noexcept {
+    if (runtime != nullptr) {
+        runtime->stopThreads.store(false, std::memory_order_release);
+        Py_CLEAR(runtime->threadStop);
+    }
+    // `Py_EndInterpreter` joins every non-daemon `threading.Thread` by
+    // acquiring and releasing each one's lock in `threading._shutdown_locks`.
+    // Every such thread has ended by now - this runs only once the thread
+    // ending the interpreter is its last - but a lock can still be held: a
+    // stop that landed inside `Thread.join()`, between its `acquire()` and its
+    // `release()`, leaves the lock acquired, because a stopped thread runs no
+    // `except` block (the one CPython has there for exactly this, for
+    // Ctrl-C). Acquiring it again would wait forever. Nothing is left to wait
+    // for, so the list is dropped.
+    PyObject* pending = PyErr_GetRaisedException();
+    if (PyObject* modules = PyImport_GetModuleDict(); modules != nullptr) {
+        if (PyObject* module = PyDict_GetItemString(modules, "threading"); module != nullptr) {  // borrowed
+            PyObject* locks = PyObject_GetAttrString(module, "_shutdown_locks");
+            if (locks != nullptr && PySet_Check(locks)) {
+                (void)PySet_Clear(locks);
+            }
+            Py_XDECREF(locks);
+        }
+    }
+    PyErr_Clear();
+    if (pending != nullptr) {
+        PyErr_SetRaisedException(pending);
+    }
+}
+
+}  // namespace
+
+void ReleaseScriptThreadStop(Isolate& isolate) noexcept {
+    FinishWithScriptThreads(RuntimeOf(isolate));
+}
+
+RuntimeState* AbandonRuntime(Isolate& isolate) noexcept {
+    // Queued pending calls and the monitoring callback of the interpreter
+    // being left behind point at this state; it stays, stopping whatever
+    // those threads run once their blocking calls return.
+    return isolate.impl().runtime.release();
+}
+
+bool EndAbandonedInterpreter(PyThreadState* tstate, RuntimeState* runtime) noexcept {
+    PyEval_RestoreThread(tstate);
+    bool alone = true;
+    for (PyThreadState* ts = PyInterpreterState_ThreadHead(PyThreadState_GetInterpreter(tstate)); ts != nullptr;
+         ts = PyThreadState_Next(ts)) {
+        if (ts != tstate) {
+            alone = false;
+        }
+    }
+    if (!alone) {
+        (void)PyEval_SaveThread();
+        return false;
+    }
+    FinishWithScriptThreads(runtime);
+    Py_EndInterpreter(tstate);
+    DestroyRuntimeState(runtime);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

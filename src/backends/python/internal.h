@@ -164,6 +164,14 @@ struct Isolate::Impl {
     /// native called from Python finds the realm the call came from: the
     /// calling frame's globals.
     std::unordered_map<PyObject*, detail::ContextRec*> realms;
+    /// The dictionary watcher (PEP 669's sibling, `PyDict_AddWatcher`) that
+    /// tells a realm its dictionary is being deallocated; see `ContextRec`.
+    /// -1 when none could be had.
+    int realmWatcher = -1;
+    /// Set while `~Isolate` gives the natives back: `GetNativeBox` then answers
+    /// only for a box still in `liveNatives`, because a native's destructor
+    /// can run script that reaches an instance whose box went a moment ago.
+    bool nativesTearingDown = false;
 
     /// `Context`, `Script` and `Global` objects the embedder still holds.
     /// Diagnosed in `~Isolate` in a checked build.
@@ -305,11 +313,19 @@ static_assert(alignof(Frame) <= UNIBIND_FRAME_STORAGE_ALIGN, "UNIBIND_FRAME_STOR
 ///
 /// **Lifetime.** Two things keep a realm alive: the embedder's `Context`
 /// references (`refs`), and the dictionary itself. While `refs` is non-zero the
-/// record holds a strong reference to the dictionary. The dictionary holds the
-/// record through a capsule stored under `__unibind_realm__`, whose destructor
-/// deletes the record - so a function defined in a realm the embedder has let
-/// go still finds its realm when it calls a native, for exactly as long as the
-/// dictionary lives, and the record goes with it.
+/// record holds a strong reference to the dictionary. Once it is zero the
+/// record lives exactly as long as the dictionary does - a function defined in
+/// a realm the embedder has let go still finds its realm when it calls a
+/// native, through its `__globals__` - and is deleted when the dictionary is
+/// deallocated, which the isolate's dictionary watcher (`realmWatcher`)
+/// reports.
+///
+/// A watcher rather than anything stored *in* the dictionary, because the
+/// dictionary is script's: a record hung on one of its keys goes when script
+/// clears the dictionary (`globals().clear()`) - while a `Context` still
+/// names it - and outlives it when script copies it (`dict(globals())`),
+/// leaving the realm map pointing at a dead dictionary's address for the
+/// next one allocated there to inherit.
 struct ContextRec {
     Isolate* owner = nullptr;
     PyObject* globals = nullptr;  ///< borrowed while refs == 0, strong while refs > 0
@@ -556,6 +572,30 @@ struct ObjectInstance {
 void IsolateRuntimeTeardown(Isolate& isolate) noexcept;
 /// `~Isolate`, same moment: bindings drop per-realm caches, give back natives.
 void IsolateBindingsTeardown(Isolate& isolate) noexcept;
+
+/// `~Isolate`, first thing: stop every thread a script started in the
+/// isolate's interpreter and wait for them to end - for up to a couple of
+/// seconds if `wait`, else for a moment. True once the isolate's thread is the
+/// interpreter's only one, which `Py_EndInterpreter` requires. runtime.cpp.
+[[nodiscard]] bool StopScriptThreads(Isolate& isolate, bool wait) noexcept;
+/// Drop what stopping those threads kept, once none is left. runtime.cpp.
+void ReleaseScriptThreadStop(Isolate& isolate) noexcept;
+/// Take the runtime state off the isolate, which is about to leave its
+/// interpreter behind with threads still in it: those may yet run the pending
+/// call and the monitoring callback that point at the state, so it lives on,
+/// until `EndAbandonedInterpreter`. runtime.cpp.
+[[nodiscard]] RuntimeState* AbandonRuntime(Isolate& isolate) noexcept;
+/// At `~Platform`, on the platform's thread: end an interpreter an isolate
+/// left behind, through the thread state it left, if its threads have all
+/// ended since - true - or leave it as it is. runtime.cpp.
+[[nodiscard]] bool EndAbandonedInterpreter(PyThreadState* tstate, RuntimeState* runtime) noexcept;
+
+/// `Isolate::New`: the dictionary watcher that ends a realm with its globals,
+/// and the interpreter's note of which isolate it belongs to. core.cpp.
+[[nodiscard]] bool InstallRealmWatcher(Isolate& isolate) noexcept;
+/// Unhook both and delete every realm record still alive, for an interpreter
+/// that will not be ended. core.cpp.
+void ForgetRealms(Isolate& isolate) noexcept;
 
 /// Drop every strong reference in `Types`. module.cpp.
 void ReleaseTypes(Isolate& isolate) noexcept;

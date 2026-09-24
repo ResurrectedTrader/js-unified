@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 
 #include "internal.h"
@@ -26,6 +27,17 @@ struct PlatformState {
     PyThreadState* mainThread = nullptr;
     EngineFaultCallback onFault = nullptr;
     CallbackData faultData;
+    /// Interpreters isolates had to leave behind, with a thread of a script's
+    /// still inside a call that had not returned (`~Isolate`). Ended at
+    /// `~Platform` if their threads have finished by then; CPython will not
+    /// finalise while one is left.
+    struct Abandoned {
+        PyThreadState* tstate = nullptr;
+        detail::RuntimeState* runtime = nullptr;
+    };
+    std::mutex abandonedMutex;
+    std::vector<Abandoned> abandoned;
+    std::atomic<bool> abandonedUnrecorded{false};
 };
 
 PlatformState gPlatform;
@@ -138,6 +150,24 @@ Platform::~Platform() {
     if (!gPlatform.initialized) {
         return;
     }
+    // Interpreters isolates left behind: ended now if their threads have, and
+    // if one still has a thread inside a call that never returned, CPython
+    // cannot be finalised at all - `Py_FinalizeEx` is a fatal error with a
+    // sub-interpreter left - so it is left as it is, for the process to end.
+    bool finalizable = !gPlatform.abandonedUnrecorded.load();
+    {
+        const std::lock_guard<std::mutex> lock(gPlatform.abandonedMutex);
+        for (const PlatformState::Abandoned& left : gPlatform.abandoned) {
+            if (!detail::EndAbandonedInterpreter(left.tstate, left.runtime)) {
+                finalizable = false;
+            }
+        }
+        gPlatform.abandoned.clear();
+    }
+    if (!finalizable) {
+        gPlatform.initialized = false;
+        return;
+    }
     PyEval_RestoreThread(gPlatform.mainThread);
     Py_FinalizeEx();
     gPlatform.mainThread = nullptr;
@@ -218,10 +248,13 @@ std::unique_ptr<Isolate> Isolate::New(const IsolateOptions& options) {
     state.interp = PyThreadState_GetInterpreter(tstate);
     tCurrentIsolate = isolate.get();
 
-    if (!detail::ImportModule(*isolate) || !detail::IsolateRuntimeSetup(*isolate, options)) {
+    if (!detail::InstallRealmWatcher(*isolate) || !detail::ImportModule(*isolate) ||
+        !detail::IsolateRuntimeSetup(*isolate, options)) {
         PyErr_Clear();
         detail::IsolateRuntimeTeardown(*isolate);
+        detail::ReleaseScriptThreadStop(*isolate);
         detail::ReleaseTypes(*isolate);
+        detail::ForgetRealms(*isolate);
         Py_EndInterpreter(tstate);
         state.tstate = nullptr;
         tCurrentIsolate = nullptr;
@@ -242,6 +275,10 @@ Isolate::~Isolate() {
 
     if (state.tstate != nullptr) {
         PyErr_Clear();
+        // Threads a script started go first, while everything they could
+        // still reach is there: stopped, and waited for (runtime.cpp,
+        // "Threads a script started").
+        bool alone = detail::StopScriptThreads(*this, /*wait=*/true);
         detail::IsolateRuntimeTeardown(*this);
         detail::IsolateBindingsTeardown(*this);
         PyErr_Clear();
@@ -252,16 +289,54 @@ Isolate::~Isolate() {
         // that garbage gives its natives back through the ordinary path.
         PyGC_Collect();
         PyErr_Clear();
-        std::unordered_set<detail::NativeBox*> survivors;
-        survivors.swap(state.liveNatives);
-        for (detail::NativeBox* box : survivors) {
+        // One at a time, each out of the set before it is destroyed. A
+        // native's destructor can run script - releasing its last reference
+        // to a Python object runs that object's `__del__` - and that script can
+        // reach another instance still waiting here, or the one going now:
+        // `GetNativeBox` answers only for boxes still in the set while this
+        // runs, so it never hands out one already destroyed, and a native made
+        // meanwhile joins the set and goes too.
+        state.nativesTearingDown = true;
+        while (!state.liveNatives.empty()) {
+            const auto next = state.liveNatives.begin();
+            detail::NativeBox* box = *next;
+            state.liveNatives.erase(next);
             box->destroy(box);
+            PyErr_Clear();
         }
         state.nativesReleased = true;
         PyErr_Clear();
 
         detail::ReleaseTypes(*this);
-        Py_EndInterpreter(state.tstate);
+        // A finalizer that ran just now may have started a thread too.
+        alone = alone ? detail::StopScriptThreads(*this, /*wait=*/true) : detail::StopScriptThreads(*this, false);
+        if (alone) {
+            detail::ReleaseScriptThreadStop(*this);
+            Py_EndInterpreter(state.tstate);
+            // A realm whose dictionary the interpreter never freed.
+            for (const auto& realm : state.realms) {
+                delete realm.second;
+            }
+            state.realms.clear();
+        } else {
+            // A thread is still inside a call that has not returned - a lock
+            // nobody will release, a read nothing will answer - and ending the
+            // interpreter under it is a fatal error. So the interpreter is
+            // left behind instead: nothing in it can reach this isolate any
+            // more, the stop stays on its threads for when their calls
+            // return, and this thread lets go of it and its GIL. `~Platform`
+            // ends it, if its threads have ended by then.
+            detail::ForgetRealms(*this);
+            PlatformState::Abandoned left{.tstate = state.tstate, .runtime = detail::AbandonRuntime(*this)};
+            (void)PyEval_SaveThread();
+            try {
+                const std::lock_guard<std::mutex> lock(gPlatform.abandonedMutex);
+                gPlatform.abandoned.push_back(left);
+            } catch (...) {
+                // Not recorded: it can never be ended, and so nor can CPython.
+                gPlatform.abandonedUnrecorded = true;
+            }
+        }
         state.tstate = nullptr;
     }
     tCurrentIsolate = nullptr;
@@ -381,12 +456,16 @@ Frame* CurrentFrame(Isolate& isolate) noexcept {
 
 // --- globals -------------------------------------------------------------------
 
+// The reference is taken only once the node exists: a `new (std::nothrow)`
+// that fails never evaluates its initialiser, so a reference taken there would
+// not have been taken at all, and releasing it on failure would release one
+// the value's other owners hold.
 GlobalNode* MakeGlobal(Isolate& isolate, Slot value) {
-    auto* node = new (std::nothrow) GlobalNode{&isolate, Py_NewRef(Resolve(value))};
+    auto* node = new (std::nothrow) GlobalNode{&isolate, nullptr};
     if (node == nullptr) {
-        Py_DECREF(Resolve(value));
         return nullptr;
     }
+    node->value = Py_NewRef(Resolve(value));
     ++isolate.impl().embedderRefs;
     return node;
 }
@@ -395,11 +474,11 @@ GlobalNode* DuplicateGlobal(GlobalNode* node) {
     if (node == nullptr) {
         return nullptr;
     }
-    auto* copy = new (std::nothrow) GlobalNode{node->owner, Py_NewRef(node->value)};
+    auto* copy = new (std::nothrow) GlobalNode{node->owner, nullptr};
     if (copy == nullptr) {
-        Py_DECREF(node->value);
         return nullptr;
     }
+    copy->value = Py_NewRef(node->value);
     ++node->owner->impl().embedderRefs;
     return copy;
 }
@@ -445,30 +524,99 @@ bool GlobalSameValueSlot(const GlobalNode* lhs, Slot rhs) noexcept {
 
 namespace {
 
-constexpr const char* REALM_CAPSULE = "unibind.realm";
-constexpr const char* REALM_KEY = "__unibind_realm__";
+/// Where an interpreter's dictionary (`PyInterpreterState_GetDict`) keeps the
+/// isolate it belongs to, for code that runs on a thread with no isolate of
+/// its own - a thread a script started - and has to find it.
+constexpr const char* ISOLATE_KEY = "unibind.isolate";
+constexpr const char* ISOLATE_CAPSULE = "unibind.isolate";
 
-/// The dictionary is going: so is the realm. Runs only once the embedder holds
-/// no `Context` for it, because while one does the record holds the
-/// dictionary.
-void RealmCapsuleDestructor(PyObject* capsule) {
-    auto* rec = static_cast<ContextRec*>(PyCapsule_GetPointer(capsule, REALM_CAPSULE));
-    if (rec == nullptr) {
-        PyErr_Clear();
-        return;
+/// The isolate whose interpreter is running on this thread, or null.
+[[nodiscard]] Isolate* IsolateOfThisInterpreter() noexcept {
+    PyInterpreterState* interp = PyInterpreterState_Get();
+    if (Isolate* here = CurrentIsolate(); here != nullptr && here->impl().interp == interp) {
+        return here;
     }
-    Isolate::Impl& state = rec->owner->impl();
-    state.realms.erase(rec->globals);
+    PyObject* dict = PyInterpreterState_GetDict(interp);  // borrowed
+    PyObject* capsule = dict == nullptr ? nullptr : PyDict_GetItemString(dict, ISOLATE_KEY);  // borrowed
+    if (capsule == nullptr || !PyCapsule_IsValid(capsule, ISOLATE_CAPSULE)) {
+        return nullptr;
+    }
+    return static_cast<Isolate*>(PyCapsule_GetPointer(capsule, ISOLATE_CAPSULE));
+}
+
+/// The isolate's dictionary watcher. Every realm's globals are watched, and
+/// the one event that matters is the last: the dictionary is going, and its
+/// realm goes with it. That can only happen once the embedder holds no
+/// `Context` for it, because while one does the record holds the dictionary.
+///
+/// Called for every change to a watched dictionary - every global a script
+/// assigns - so everything but a deallocation is turned away first thing.
+int RealmWatcher(PyDict_WatchEvent event, PyObject* dict, PyObject* /*key*/, PyObject* /*value*/) {
+    if (event != PyDict_EVENT_DEALLOCATED) {
+        return 0;
+    }
+    Isolate* isolate = IsolateOfThisInterpreter();
+    if (isolate == nullptr) {
+        return 0;
+    }
+    Isolate::Impl& state = isolate->impl();
+    const auto found = state.realms.find(dict);
+    if (found == state.realms.end()) {
+        return 0;
+    }
+    ContextRec* rec = found->second;
+    assert(rec->refs == 0 && "a realm's dictionary went while a Context still held it");
+    state.realms.erase(found);
     if (state.entered == rec) {
         state.entered = nullptr;
     }
-    Py_CLEAR(rec->templateCache);
+    // Nothing in the record is a reference: its dictionary was borrowed.
     delete rec;
+    return 0;
 }
 
 }  // namespace
 
+bool InstallRealmWatcher(Isolate& isolate) noexcept {
+    Isolate::Impl& state = isolate.impl();
+    PyObject* dict = PyInterpreterState_GetDict(state.interp);  // borrowed
+    PyObject* capsule = PyCapsule_New(&isolate, ISOLATE_CAPSULE, nullptr);
+    const bool stored = dict != nullptr && capsule != nullptr && PyDict_SetItemString(dict, ISOLATE_KEY, capsule) == 0;
+    Py_XDECREF(capsule);
+    if (!stored) {
+        return false;
+    }
+    state.realmWatcher = PyDict_AddWatcher(&RealmWatcher);
+    return state.realmWatcher >= 0;
+}
+
+void ForgetRealms(Isolate& isolate) noexcept {
+    Isolate::Impl& state = isolate.impl();
+    // Nothing may find its way back to this isolate from here on: not a
+    // dictionary going, and not a thread asking the interpreter for it.
+    if (state.realmWatcher >= 0) {
+        if (PyDict_ClearWatcher(state.realmWatcher) != 0) {
+            PyErr_Clear();
+        }
+        state.realmWatcher = -1;
+    }
+    if (PyObject* dict = PyInterpreterState_GetDict(state.interp); dict != nullptr) {
+        if (PyDict_DelItemString(dict, ISOLATE_KEY) != 0) {
+            PyErr_Clear();
+        }
+    }
+    state.entered = nullptr;
+    for (const auto& realm : state.realms) {
+        delete realm.second;
+    }
+    state.realms.clear();
+}
+
 ContextRec* NewContext(Isolate& isolate) {
+    Isolate::Impl& state = isolate.impl();
+    if (state.realmWatcher < 0) {
+        return nullptr;
+    }
     PyObject* globals = PyDict_New();
     if (globals == nullptr) {
         PyErr_Clear();
@@ -481,36 +629,30 @@ ContextRec* NewContext(Isolate& isolate) {
     }
     PyObject* builtins = PyImport_ImportModule("builtins");
     PyObject* name = PyUnicode_FromString("__main__");
-    PyObject* capsule = PyCapsule_New(rec, REALM_CAPSULE, &RealmCapsuleDestructor);
-    const bool ok = builtins != nullptr && name != nullptr && capsule != nullptr &&
+    const bool ok = builtins != nullptr && name != nullptr &&
                     PyDict_SetItemString(globals, "__builtins__", builtins) == 0 &&
-                    PyDict_SetItemString(globals, "__name__", name) == 0 &&
-                    PyDict_SetItemString(globals, REALM_KEY, capsule) == 0;
+                    PyDict_SetItemString(globals, "__name__", name) == 0;
     Py_XDECREF(builtins);
     Py_XDECREF(name);
-    if (!ok) {
+    bool registered = false;
+    if (ok) {
+        try {
+            registered = state.realms.emplace(globals, rec).second;
+        } catch (const std::bad_alloc&) {
+        }
+    }
+    // Watched only once it is in the map, so that the watcher never sees a
+    // realm dictionary it cannot find.
+    if (!registered || PyDict_Watch(state.realmWatcher, globals) != 0) {
         PyErr_Clear();
-        if (capsule != nullptr) {
-            // The capsule deletes the record when it goes; keep it from doing
-            // that to a record we are about to delete ourselves.
-            PyCapsule_SetDestructor(capsule, nullptr);
-            Py_DECREF(capsule);
+        if (registered) {
+            state.realms.erase(globals);
         }
         Py_DECREF(globals);
         delete rec;
         return nullptr;
     }
-    Py_DECREF(capsule);
-    try {
-        isolate.impl().realms.emplace(globals, rec);
-    } catch (const std::bad_alloc&) {
-        // Unreachable through a live Context; the dictionary still owns the
-        // record through its capsule, so letting it go frees both.
-        rec->refs = 0;
-        Py_DECREF(globals);
-        return nullptr;
-    }
-    ++isolate.impl().embedderRefs;
+    ++state.embedderRefs;
     return rec;
 }
 
