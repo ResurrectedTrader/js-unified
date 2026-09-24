@@ -21,6 +21,7 @@ add_executable(unibind_python_tests
     templates_test.cpp
     interceptors_test.cpp
     classes_test.cpp
+    stress_test.cpp
     stdlib_test.cpp
     lifetimes_test.cpp
     lifetimes_natives_test.cpp
@@ -32,6 +33,14 @@ add_executable(unibind_python_tests
 target_include_directories(unibind_python_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(unibind_python_tests PRIVATE unibind::unibind doctest::doctest)
 
+# Every isolate costs CPython 3.12 memory it never gives back (docs/python.md),
+# and a 32-bit program that makes a few hundred of them - as this one does - can
+# fill the 2 GB a process gets by default. Large-address-aware, it gets 4 GB on
+# 64-bit Windows.
+if(UNIBIND_ARCH STREQUAL "x86")
+    target_link_options(unibind_python_tests PRIVATE "/LARGEADDRESSAWARE")
+endif()
+
 if(EXISTS "${doctest_DIR}/doctest.cmake")
     include("${doctest_DIR}/doctest.cmake")
     doctest_discover_tests(unibind_python_tests
@@ -42,12 +51,5 @@ else()
     set_tests_properties(python.suite PROPERTIES TIMEOUT 300 LABELS "suite")
 endif()
 
-# Every isolate costs the process some ten megabytes that CPython 3.12 never
-# gives back (it keeps a sub-interpreter's arenas when the interpreter ends),
-# and the suite makes a few hundred of them: more than a 32-bit process has
-# address space for. On x86 each case runs in a process of its own, above, and
-# only there.
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    add_test(NAME python.whole-suite-in-one-process COMMAND unibind_python_tests)
-    set_tests_properties(python.whole-suite-in-one-process PROPERTIES TIMEOUT 900 LABELS "suite")
-endif()
+add_test(NAME python.whole-suite-in-one-process COMMAND unibind_python_tests)
+set_tests_properties(python.whole-suite-in-one-process PROPERTIES TIMEOUT 900 LABELS "suite")

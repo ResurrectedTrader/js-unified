@@ -506,7 +506,12 @@ TEST_CASE("clone: a well-framed payload that is not a clone is refused before an
 
 TEST_CASE("clone: deep nesting costs heap, not stack") {
     Fixture f;
-    Run(f.context, "deep = []\ncursor = deep\nfor _ in range(200000):\n    cursor.append([])\n    cursor = cursor[0]");
+    // Deep enough that recursion would blow the stack. Not as deep on x86,
+    // where a graph this size and its blob take a real share of a 32-bit
+    // address space the rest of the suite also needs.
+    const std::string depth = sizeof(void*) == 8 ? "200000" : "50000";
+    Run(f.context,
+        "deep = []\ncursor = deep\nfor _ in range(" + depth + "):\n    cursor.append([])\n    cursor = cursor[0]");
     const Blob blob = Encode(f.context, Eval(f.context, "deep"));
     const auto clone = Decode(f.context, blob);
     CHECK(Encode(f.context, clone) == blob);

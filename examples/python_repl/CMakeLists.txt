@@ -11,6 +11,14 @@
 
 add_executable(unibind_python_repl main.cpp host.cpp host.h demo.py)
 target_link_libraries(unibind_python_repl PRIVATE unibind::unibind)
+
+# Every isolate costs CPython 3.12 memory it never gives back (docs/python.md),
+# and a 32-bit program that makes a few hundred of them - as this one does - can
+# fill the 2 GB a process gets by default. Large-address-aware, it gets 4 GB on
+# 64-bit Windows.
+if(UNIBIND_ARCH STREQUAL "x86")
+    target_link_options(unibind_python_repl PRIVATE "/LARGEADDRESSAWARE")
+endif()
 target_compile_definitions(unibind_python_repl PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN
     # Where --demo looks when there is no demo.py next to the program.
