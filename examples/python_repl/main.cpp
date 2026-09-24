@@ -1062,6 +1062,10 @@ int wmain(int argc, wchar_t** argv) {
     // UTF-8 for what this program prints; Python writes to a console in UTF-16
     // on its own.
     SetConsoleOutputCP(CP_UTF8);
+    // A process can start with Ctrl-C ignored - inherited from a parent that
+    // made a new process group, as some shells do. Undo that first: this
+    // program's Ctrl-C is how a runaway script is stopped.
+    SetConsoleCtrlHandler(nullptr, FALSE);
     SetConsoleCtrlHandler(&OnConsoleControl, TRUE);
 
     std::vector<std::string> args;
