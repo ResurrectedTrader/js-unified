@@ -183,7 +183,8 @@ function(unibind_provide_engine engine)
     if(engine STREQUAL "python")
         _unibind_provide_python()
         foreach(out UNIBIND_PYTHON_DIR UNIBIND_PYTHON_INCLUDE_DIR UNIBIND_PYTHON_LIB_NAME UNIBIND_PYTHON_LIBS
-                    UNIBIND_PYTHON_DEP_LIB_NAMES UNIBIND_PYTHON_SYSTEM_LIBS UNIBIND_PYTHON_STDLIB UNIBIND_PYTHON_VERSION)
+                    UNIBIND_PYTHON_DEP_LIB_NAMES UNIBIND_PYTHON_DEP_DEBUG_LIB_NAMES
+                    UNIBIND_PYTHON_SYSTEM_LIBS UNIBIND_PYTHON_STDLIB UNIBIND_PYTHON_VERSION)
             set(${out} "${${out}}" PARENT_SCOPE)
         endforeach()
         return()
@@ -323,6 +324,7 @@ function(_unibind_provide_python)
     # does not need it either).
     set(libs "")
     set(depNames "")
+    set(depDebugNames "")
     if(EXISTS "${debug}")
         list(APPEND libs "$<$<CONFIG:Debug>:${debug}>" "$<$<NOT:$<CONFIG:Debug>>:${release}>")
     else()
@@ -356,6 +358,10 @@ function(_unibind_provide_python)
         endif()
         file(RELATIVE_PATH depRel "${prefix}" "${depRelease}")
         list(APPEND depNames "${depRel}")
+        if(depDebug)
+            file(RELATIVE_PATH depRel "${prefix}" "${depDebug}")
+        endif()
+        list(APPEND depDebugNames "${depRel}")
     endforeach()
 
     set(UNIBIND_PYTHON_DIR "${prefix}" PARENT_SCOPE)
@@ -365,6 +371,8 @@ function(_unibind_provide_python)
     # The engine's other link inputs, relative to the prefix, release flavour -
     # what the install tree's package files name beside python3X.lib.
     set(UNIBIND_PYTHON_DEP_LIB_NAMES "${depNames}" PARENT_SCOPE)
+    # The same, debug flavour: what a Debug (/MTd) consumer links instead.
+    set(UNIBIND_PYTHON_DEP_DEBUG_LIB_NAMES "${depDebugNames}" PARENT_SCOPE)
     # What the core, its built-in modules and openssl call in Windows itself:
     #   version shlwapi pathcch bcrypt advapi32 user32 kernel32 ole32 oleaut32 - the core
     #   ws2_32 - _socket, select, _overlapped, _multiprocessing, _ssl, openssl
