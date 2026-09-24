@@ -59,3 +59,14 @@ void Expose(const ub::Context& context, std::string_view name, const ub::Local<T
 }
 
 }  // namespace py_test
+
+namespace py_test {
+
+/// The Platform's engine-fault handler for the whole suite (main.cpp). It
+/// counts what arrives, per kind, and allocates nothing.
+void OnEngineFault(const ub::EngineFaultReport& report, ub::CallbackData data);
+
+/// How many `EngineFault::OutOfMemory` reports have arrived, from any isolate.
+[[nodiscard]] std::uint64_t OutOfMemoryReports() noexcept;
+
+}  // namespace py_test

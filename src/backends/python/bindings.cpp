@@ -336,6 +336,11 @@ struct BoundObject {
     // Copied out before the call: the callback may drop the last reference to
     // the function it is running as.
     const FunctionCallback callback = function->callback;
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return nullptr;
+    }
     PyObject* value = Py_XNewRef(function->value);
 
     NativeCall call(isolate, args, static_cast<std::uint32_t>(argc), realm);
@@ -347,6 +352,15 @@ struct BoundObject {
         call.state.hasValue = true;
     }
     Shielded([&] { callback(CallbackInfo(call.state)); });
+    // A stop requested while the native ran - which it may have seen and
+    // returned for - is enforced here, on the way back into script. The eval
+    // breaker would get there too, but only once the requesting thread has
+    // queued the pending call, and a native that returns the instant it sees
+    // the flag can beat that (unibind/isolate.h: the script stops when it
+    // returns).
+    if (PyErr_Occurred() == nullptr && Terminating(isolate)) {
+        RaiseStop(isolate);
+    }
     if (PyErr_Occurred() != nullptr) {
         return nullptr;
     }
@@ -693,6 +707,11 @@ CallbackRecord* StoreAccessorRecord(Isolate& isolate, AccessorGetterCallback get
 
 PyObject* RunAccessorGetter(Isolate& isolate, const CallbackRecord& record, PyObject* key, PyObject* receiver,
                             PyObject* holder) noexcept {
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return nullptr;
+    }
     HookCall call(isolate, receiver, holder, record.data);
     const Local<Name> name = call.Handle<Name>(NameOf(isolate, key));
     if (PyErr_Occurred() != nullptr) {
@@ -707,6 +726,11 @@ PyObject* RunAccessorGetter(Isolate& isolate, const CallbackRecord& record, PyOb
 
 bool RunAccessorSetter(Isolate& isolate, const CallbackRecord& record, PyObject* key, PyObject* value,
                        PyObject* receiver, PyObject* holder) noexcept {
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return false;
+    }
     HookCall call(isolate, receiver, holder, record.data);
     const Local<Name> name = call.Handle<Name>(NameOf(isolate, key));
     const Local<Value> incoming = call.Handle<Value>(Py_NewRef(value));
@@ -729,6 +753,11 @@ Hook InterceptGet(Isolate& isolate, TemplateRec* shape, PyObject* key, PyObject*
     const bool isIndex = AsIndex(key, &index);
     if (isIndex ? shape->indexed.getter == nullptr : shape->named.getter == nullptr) {
         return Hook::Declined;
+    }
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return Hook::Failed;
     }
     HookCall call(isolate, receiver, holder, isIndex ? shape->indexed.data : shape->named.data);
     Intercepted answer = Intercepted::No;
@@ -759,6 +788,11 @@ Hook InterceptSet(Isolate& isolate, TemplateRec* shape, PyObject* key, PyObject*
     if (isIndex ? shape->indexed.setter == nullptr : shape->named.setter == nullptr) {
         return Hook::Declined;
     }
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return Hook::Failed;
+    }
     HookCall call(isolate, receiver, receiver, isIndex ? shape->indexed.data : shape->named.data);
     const Local<Value> incoming = call.Handle<Value>(Py_NewRef(value));
     Intercepted answer = Intercepted::No;
@@ -785,6 +819,11 @@ Hook InterceptQuery(Isolate& isolate, TemplateRec* shape, PyObject* key, PyObjec
     const bool isIndex = AsIndex(key, &index);
     if (isIndex ? shape->indexed.query == nullptr : shape->named.query == nullptr) {
         return Hook::Declined;
+    }
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return Hook::Failed;
     }
     HookCall call(isolate, receiver, receiver, isIndex ? shape->indexed.data : shape->named.data);
     std::optional<PropertyAttribute> answer;
@@ -813,6 +852,11 @@ Hook InterceptDelete(Isolate& isolate, TemplateRec* shape, PyObject* key, PyObje
     if (isIndex ? shape->indexed.deleter == nullptr : shape->named.deleter == nullptr) {
         return Hook::Declined;
     }
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return Hook::Failed;
+    }
     HookCall call(isolate, receiver, receiver, isIndex ? shape->indexed.data : shape->named.data);
     std::optional<bool> answer;
     if (isIndex) {
@@ -840,6 +884,11 @@ bool InterceptEnumerate(Isolate& isolate, TemplateRec* shape, PyObject* receiver
         if (named ? !(shape->hasNamed && shape->named.enumerator != nullptr)
                   : !(shape->hasIndexed && shape->indexed.enumerator != nullptr)) {
             continue;
+        }
+        // Native recursion never passes CPython's own recursion count; the
+        // stack itself is the limit (IsolateOptions::stackLimitBytes).
+        if (StackExhausted(isolate)) {
+            return false;
         }
         HookCall call(isolate, receiver, receiver, named ? shape->named.data : shape->indexed.data);
         std::optional<Local<Array>> listed;
@@ -1508,12 +1557,26 @@ void DestroyBox(NativeBox* box) noexcept {
         return Py_NewRef(Py_None);
     }
     ContextRec* realm = CallingRealm(isolate);
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return nullptr;
+    }
     NativeCall call(isolate, args, static_cast<std::uint32_t>(argc), realm);
     call.state.thisSlot = call.Push(ReceiverFor(isolate, receiver, realm));
     call.state.holderSlot = call.state.thisSlot;
     call.state.data = tpl->callbackData;
     const FunctionCallback callback = tpl->callback;
     Shielded([&] { callback(CallbackInfo(call.state)); });
+    // A stop requested while the native ran - which it may have seen and
+    // returned for - is enforced here, on the way back into script. The eval
+    // breaker would get there too, but only once the requesting thread has
+    // queued the pending call, and a native that returns the instant it sees
+    // the flag can beat that (unibind/isolate.h: the script stops when it
+    // returns).
+    if (PyErr_Occurred() == nullptr && Terminating(isolate)) {
+        RaiseStop(isolate);
+    }
     if (PyErr_Occurred() != nullptr) {
         return nullptr;
     }
@@ -1555,6 +1618,11 @@ bool IsTemplateMadeType(Isolate& isolate, PyTypeObject* type) noexcept {
 /// is discarded, because what comes out of a `Class<T>` must carry a `T`.
 PyObject* ConstructTemplate(Isolate& isolate, PyTypeObject* type, TemplateRec* tpl, PyObject* const* args,
                             std::size_t argc, bool isConstruct) noexcept {
+    // Native recursion never passes CPython's own recursion count; the
+    // stack itself is the limit (IsolateOptions::stackLimitBytes).
+    if (StackExhausted(isolate)) {
+        return nullptr;
+    }
     ClassRec* owner = tpl->ownerClass;
     if (owner != nullptr && owner->constructor == nullptr) {
         PyErr_Format(PyExc_TypeError, "%s cannot be constructed from script", owner->name.c_str());

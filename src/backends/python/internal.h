@@ -402,6 +402,10 @@ void CatchPendingException(Isolate& isolate) noexcept;
     return isolate.impl().terminating.load(std::memory_order_acquire);
 }
 
+/// Raise `unibind.Terminated`, unless an exception is already pending.
+/// runtime.cpp.
+void RaiseStop(Isolate& isolate) noexcept;
+
 /// Around every operation that may run Python code. `Open()` is false - and
 /// the operation must answer empty without running anything - while a
 /// termination is in force; the destructor hands any exception the operation
@@ -415,7 +419,17 @@ class ScriptGate {
     ScriptGate& operator=(ScriptGate&&) = delete;
     ~ScriptGate() { CatchPendingException(*isolate_); }
 
-    [[nodiscard]] bool Open() const noexcept { return !Terminating(*isolate_); }
+    /// Refusing raises `unibind.Terminated`, so that the `TryCatch` around the
+    /// operation reports `HasTerminated` - a stop that was remembered while
+    /// idle is still a stop, as `unibind/isolate.h` says - and a native that
+    /// asked on script's behalf hands the stop back to the script.
+    [[nodiscard]] bool Open() const noexcept {
+        if (!Terminating(*isolate_)) {
+            return true;
+        }
+        RaiseStop(*isolate_);
+        return false;
+    }
 
    private:
     Isolate* isolate_;
@@ -449,6 +463,14 @@ void RaiseValue(Isolate& isolate, PyObject* value) noexcept;
 /// exception pending. runtime.cpp - a script that uses top-level `await`
 /// evaluates to one of these.
 [[nodiscard]] PyObject* SpawnCoroutine(Isolate& isolate, PyObject* coroutine) noexcept;
+
+/// True, with `RecursionError` pending, when this thread's stack has reached
+/// the floor `IsolateOptions::stackLimitBytes` set. runtime.cpp. For native
+/// paths that recurse without entering CPython's evaluation loop - a callback
+/// calling a native function directly, say - which CPython's own recursion
+/// count does not see: call it on the way in and fail the call if it answers
+/// true.
+[[nodiscard]] bool StackExhausted(Isolate& isolate) noexcept;
 
 // --- platform --------------------------------------------------------------------
 
