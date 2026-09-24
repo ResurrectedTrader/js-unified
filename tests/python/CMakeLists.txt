@@ -21,10 +21,19 @@ add_executable(unibind_python_tests
     templates_test.cpp
     interceptors_test.cpp
     classes_test.cpp
+    stress_test.cpp
     stdlib_test.cpp)
 
 target_include_directories(unibind_python_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(unibind_python_tests PRIVATE unibind::unibind doctest::doctest)
+
+# Every isolate costs CPython 3.12 memory it never gives back (docs/python.md),
+# and a 32-bit program that makes a few hundred of them - as this one does - can
+# fill the 2 GB a process gets by default. Large-address-aware, it gets 4 GB on
+# 64-bit Windows.
+if(UNIBIND_ARCH STREQUAL "x86")
+    target_link_options(unibind_python_tests PRIVATE "/LARGEADDRESSAWARE")
+endif()
 
 if(EXISTS "${doctest_DIR}/doctest.cmake")
     include("${doctest_DIR}/doctest.cmake")
