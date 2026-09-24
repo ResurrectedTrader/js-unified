@@ -16,7 +16,7 @@ way in.
 
 ## The ones you will not diagnose from the symptom
 
-Sixteen of these give a wrong answer and no error at all. The seventeenth gives
+Seventeen of these give a wrong answer and no error at all. The eighteenth gives
 an error that blames something else entirely, which is the same problem wearing
 a disguise.
 
@@ -38,6 +38,7 @@ a disguise.
 | An empty list that a callback treats as false (CPython) | [`ToBoolean`, `ToString` and `LooseEquals` are Python's](#toboolean-tostring-and-looseequals-are-pythons) |
 | A native's `SetNull()` that a script's `is None` misses (CPython) | [`None` is `undefined`, and `null` is something else](#none-is-undefined-and-null-is-something-else) |
 | One realm's monkey-patch showing up in another (CPython) | [Realms of one isolate share their modules](#realms-of-one-isolate-share-their-modules) |
+| A script's background thread that gets nothing done (CPython) | [A thread the script started dies with its isolate, and runs only while script does](#a-thread-the-script-started-dies-with-its-isolate-and-runs-only-while-script-does) |
 | A test case that passes without running | [A test case's name may not contain `;`](#a-test-cases-name-may-not-contain-) |
 
 ---
@@ -1035,15 +1036,38 @@ after each did not run. The same goes for a blocking `socket.recv`, a lock, a
 subprocess wait. It is decision 15's rule about blocking natives, reached from
 the Python side.
 
-### A thread the script started is not stopped, and holds up `~Isolate`
+### A thread the script started dies with its isolate, and runs only while script does
 
-**A hang, at teardown.** `threading` works in an isolate, but `TerminateExecution`
-stops the isolate's own thread, not the ones its script started: a thread
-spinning in `while True: pass` went on running after the script that started it
-was stopped, and after the cancel. And `~Isolate` joins every thread the script
-left running - CPython's `Py_EndInterpreter` does - so an isolate whose script
-left a thread in a loop never finishes being destroyed. A script that starts a
-thread has to stop and join it itself.
+**Silent: work that simply stops happening.** `threading` works in an isolate,
+within limits that are easy to miss:
+
+- **It runs only while the isolate's thread lets it.** The two share a GIL, so a
+  script's thread runs while the isolate's thread is running Python or blocked
+  in a call - and not at all between scripts, however long the embedder waits
+  before the next `Evaluate` or `PumpJobs`. "Background" work happens only in the
+  foreground.
+- **It cannot touch anything of `unibind`'s.** A bound function, a class, a
+  `unibind.Object` attribute: each raises `RuntimeError: unibind: no isolate on
+  this thread` there. Hand results back through plain Python objects.
+- **A stop reaches it.** `TerminateExecution` stops every thread of the isolate's
+  interpreter, uncatchably, with no `finally` run.
+- **`~Isolate` ends it.** Teardown stops a script's threads and waits up to two
+  seconds for them. Plain CPython would run them to completion; here they are cut
+  off, so work a script wants finished it must `join()` before the script ends.
+- **One stuck in a call that never returns is left behind, not waited for.** The
+  isolate abandons its interpreter with the thread in it rather than hang or
+  crash, and if that thread has still not finished by `~Platform`, CPython is
+  never finalized - the process ends with it initialized.
+
+### A stop leaves Python's own cleanup undone
+
+**Silent.** No Python runs while a stop is in force, anywhere in the interpreter,
+and that includes code nobody thinks of as the script's. A weakref callback does
+not run, so a `WeakSet` whose members went during a stop goes on counting them.
+An `except` or `finally` that would have released a lock does not run, so a lock
+can stay held: a stop inside `Thread.join()` leaves the thread's bookkeeping
+unfinished, and `is_alive()` answers true for a thread that has ended. After a
+cancel, do not trust state that a stopped script was in the middle of changing.
 
 ### No daemon threads, so some of the standard library fails
 
@@ -1053,18 +1077,16 @@ people meet: on Windows it reads the pipes on daemon threads, and raises
 `RuntimeError: daemon threads are disabled in this interpreter` after the child
 has started. Without capturing it works, and so does `os.system`.
 
-### `asyncio.run` leaves the script with no event loop
+### `asyncio.run` runs on a loop of its own, not the isolate's
 
-**Loud, in the next script.** The isolate's own loop is set as its thread's
-current one, which is what lets a script call `asyncio.get_event_loop()` or
-`asyncio.ensure_future()` at the top level. `asyncio.run()` works, but when it
-returns it clears the current loop, and from then on those two raise
-`RuntimeError: There is no current event loop`. Promises and top-level `await`
-still work - the backend holds the loop itself - but no script can name it again.
-Top-level `await` is the better tool in an embedding: it runs on the isolate's
-loop, which `PumpJobs` drives. `asyncio.run()` inside a script that also uses
-top-level `await` is `RuntimeError: asyncio.run() cannot be called from a running
-event loop`.
+**Loud, in one case.** `asyncio.run()` works, on a fresh loop it makes and closes
+- which is fine, and afterwards `asyncio.get_event_loop()`, `asyncio.Future()` and
+`asyncio.ensure_future()` find the isolate's loop again. What does not work is
+`asyncio.run()` inside a script that uses top-level `await`: the whole script is
+then a task on the isolate's loop, and it is `RuntimeError: asyncio.run() cannot
+be called from a running event loop`, as in plain Python. Top-level `await` is the
+better tool in an embedding anyway: it runs on the isolate's loop, which
+`PumpJobs` drives, so its promises are ones C++ can see.
 
 ### The isolate's loop cannot run subprocesses
 
@@ -1104,11 +1126,23 @@ and the environment the moment a script says `import os`, and removing things fr
 `builtins` does not take any of it away. Run only Python you would run as the
 host process, or contain the process with the operating system.
 
-### The MSBuild property sheet does not know this backend
+### A debug CPython can report heap corruption with isolates on several threads
 
-**Loud: every engine symbol undefined.** `unibind.props` has branches for `v8` and
-`spidermonkey` only, so `UnibindBackend=python` adds no engine libraries to the
-link. Consume a python prefix through `find_package(unibind COMPONENTS python)`.
+**Loud, and not yours.** With more than a couple of isolates running at once on
+different threads, a `Py_DEBUG` CPython's debug heap has reported a block freed
+by an interpreter whose allocator did not make it, and then crashed - inside
+CPython, reproducible with nothing evaluated. It is a known issue under
+investigation; a release CPython has not shown it in any run. If a Debug build of
+an embedding that runs many isolates concurrently dies in `_CrtIsValidHeapPointer`,
+this is the first suspect.
+
+### A 32-bit program runs out of address space after a few hundred isolates
+
+**Silent, then everything crawls.** Every isolate keeps about 9.5 MB for good
+(above), and an x86 process has 2 GB by default: the suite's x86 executable got
+into trouble after about 190 isolates, with allocations slowing and threads
+failing to start rather than a clean error. Link with `/LARGEADDRESSAWARE`, and
+keep isolates long-lived.
 
 ---
 
@@ -1120,8 +1154,9 @@ link. Consume a python prefix through `find_package(unibind COMPONENTS python)`.
 each case with CTest by name, and CMake splits a name at `;` as it splits any
 list. The case becomes two CTest tests, each asking the runner for a name that
 matches nothing, and a filter that matches nothing passes. The whole-suite-in-one-
-process test still runs it, which is the only reason anyone would notice. The
-parity reporter's `|` is the other character a name may not hold.
+process test still runs it, which is the only reason anyone would notice - and how
+two cases in the python suite were found not to have been running under `ctest`.
+The parity reporter's `|` is the other character a name may not hold.
 
 ### Add a row to `tests/cmake/Capabilities.cmake` when you add an operation
 

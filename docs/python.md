@@ -27,7 +27,7 @@ The short answer, in three parts:
 
 The shared suite in `tests/cases/` is written in JavaScript source as much as in
 C++, so it does not run here and the parity comparison does not include this
-backend. It has a suite of its own - `tests/python/`, 217 cases - written the
+backend. It has a suite of its own - `tests/python/`, 261 cases - written the
 same way: against `ub::` only, with Python as the script language. Every
 behaviour below that a test pins names the test.
 
@@ -76,7 +76,7 @@ the allocators - and nothing else.
 | `use_main_obmalloc` | 0 | required by an own GIL |
 | `check_multi_interp_extensions` | 1 | an extension module that keeps state in C globals is refused rather than shared between interpreters - section 10 |
 | `allow_fork`, `allow_exec` | 0 | an embedded engine does not replace its host process: `os.execv` raises `RuntimeError` |
-| `allow_threads` | 1 | `threading` works - with the costs in section 11 |
+| `allow_threads` | 1 | `threading` works - within the limits in section 6.4 |
 | `allow_daemon_threads` | 0 | a daemon thread would outlive the interpreter it runs in |
 
 The thread state the new interpreter comes with is **never detached**. It stays
@@ -157,25 +157,41 @@ a handler opens is parked and put back when it closes.
 ### 1.4 A realm is a globals dictionary
 
 `Context::New` makes a `dict` holding `__builtins__` (the `builtins` module),
-`__name__ == "__main__"`, and a capsule under `__unibind_realm__`.
-`Context::GlobalObject()` **is that dictionary**, and every script run in the
-realm runs with it as both its globals and its locals. So what native sets on
-the global object is a global to script, and `globals()` in script is what
-native reads (`objects: a dict is its items, the realm's globals among them`).
-The backend's own entries - anything named `__unibind_*` - are left out of every
-key listing. The global object's prototype is `null`: a dict has no
+and `__name__ == "__main__"`. `Context::GlobalObject()` **is that dictionary**,
+and every script run in the realm runs with it as both its globals and its
+locals. So what native sets on the global object is a global to script, and
+`globals()` in script is what native reads (`objects: a dict is its items, the
+realm's globals among them`). The backend's own entries - anything named
+`__unibind_*`, which today is the template cache (section 4.2) - are left out of
+every key listing. The global object's prototype is `null`: a dict has no
 `[[Prototype]]`.
 
 **Lifetime.** Two things keep a realm alive: the embedder's `Context`
-references, and the dictionary itself. While a `Context` exists the record holds
-a strong reference to the dictionary; the dictionary holds the record through
-the capsule, whose destructor deletes it. So a function defined in a realm whose
-last `Context` the embedder has released still finds its realm when it calls a
-native - for exactly as long as something keeps its `__globals__` alive, and the
-record goes with the dictionary (`functions: a native called from a realm whose
-Context was released still has its realm`). No cycle through C++ is involved,
-which is what lets the collector free a realm at all; the template cache lives
-*inside* the globals for the same reason (section 4.2).
+references, and the dictionary itself. While a `Context` exists the realm's
+record holds a strong reference to the dictionary. Once none does, the record
+lives exactly as long as the dictionary: a function defined in a realm whose last
+`Context` the embedder has released still finds its realm when it calls a native,
+through its `__globals__`, for as long as something keeps those alive
+(`functions: a native called from a realm whose Context was released still has
+its realm`, `lifetimes: a callback that keeps its Context brings a released realm
+back, whole`).
+
+What tells the record its dictionary has gone is a **dictionary watcher**
+(`PyDict_AddWatcher`, one per isolate), which reports the dictionary's
+deallocation, and nothing else the backend acts on. The record is deleted then,
+and its entry in the isolate's dictionary-to-realm map goes with it. Nothing of
+the backend's is stored *in* the dictionary to keep the record, and that is the
+point: the dictionary is script's. An earlier version hung the record on a
+capsule under one of its keys, and script broke it both ways - `globals().clear()`
+freed the record while a `Context` still named the realm, a use-after-free; and
+a copy, `dict(globals())`, kept the capsule alive after the realm's own dictionary
+had gone, so the map pointed at a dead address that the next dictionary allocated
+there inherited, and a native called from that one found the wrong realm
+(`lifetimes: script that empties its own globals does not take the realm's record
+with it`, `lifetimes: a copy of a realm's globals that outlives the realm confuses
+no later realm`). No reference cycle runs through C++ either way, which is what
+lets the collector free a realm at all; the template cache lives *inside* the
+globals for the same reason.
 
 A native's `GetContext()` is, in order: the realm of the innermost operation that
 was handed a `Context`, if no Python code has run since it began; the realm whose
@@ -473,11 +489,13 @@ type** derived from `unibind.Object`, whose metaclass is `unibind.TemplateType`
 
 The type is made the first time a realm asks for it and cached **in that
 realm's globals**, under a key of the backend's own. The obvious place, the
-realm's C++ record, would have been a reference nothing can see: globals →
-capsule → record → cache → type → prototype → a function script stored there →
-its `__globals__` is a cycle no collection can break, and the realm would have
-lived until its isolate did. Inside the globals every one of those references is
-visible, and the cache goes with its realm like everything else in it. One
+realm's C++ record, would have been a reference nothing can see: record → cache
+→ type → prototype → a function script stored there → its `__globals__` would
+keep the dictionary, and so the record, alive through a cycle no collection can
+break, and the realm would have lived until its isolate did. Inside the globals
+every one of those references is visible, and the cache goes with its realm like
+everything else in it (`lifetimes: what a template made in a realm goes with the
+realm`). One
 template instantiated into three realms is three types (`templates: one template
 instantiates into several realms, as a type of each`).
 
@@ -571,25 +589,44 @@ reaches zero deallocates the instance there and then, and the box goes with it**
 (`classes: a native goes with its instance's last reference, exactly once`).
 Only instances in a reference cycle wait for the collector - `gc.collect()`,
 `Isolate::RequestGarbageCollection()`, or the isolate going (`classes: instances
-in a cycle are collected by gc.collect(), natives with them`). Deallocation
-happens on the isolate's thread, the only one an interpreter's objects die on,
-so decision 7's "on the isolate's own thread" costs nothing.
+in a cycle are collected by gc.collect(), natives with them`).
+
+**A native is destroyed on the isolate's thread, always** (decision 7). An
+instance can die elsewhere: a `threading.Thread` the script started can drop the
+last reference to one (section 6.4). Its native is then *not* destroyed there -
+a native is the embedder's object, and is never destroyed on a thread the
+embedder did not make - but left in `liveNatives`, and given back at the latest
+by `~Isolate`, on the isolate's thread (`lifetimes: an instance that dies on a
+script's thread gives its native back on the isolate's`).
 
 `~Isolate` gives back the rest in this order, while the interpreter is still
 alive, because a native's destructor is the embedder's code and may release a
-`Context` or a `Global` of its own:
+`Context` or a `Global` of its own - or run script:
 
-1. stop accepting work, drop queued jobs and interrupts, close the event loop
+1. stop the threads the script started, and wait for them (section 6.4);
+2. stop accepting work, drop queued jobs and interrupts, close the event loop
    (section 6);
-2. drop every realm's template cache, so the types, their prototypes and the
+3. drop every realm's template cache, so the types, their prototypes and the
    instances only they kept become unreachable;
-3. `gc.collect()`, so garbage gives its natives back through the ordinary path;
-4. give back every box still alive;
-5. drop the backend's types, and `Py_EndInterpreter`.
+4. `gc.collect()`, so garbage gives its natives back through the ordinary path;
+5. give back every box still alive, **one at a time**, each taken out of
+   `liveNatives` before it is destroyed. A native's destructor can run script -
+   dropping its last reference to a Python object runs that object's `__del__` -
+   and that script can reach another instance still waiting its turn, or the one
+   going now. While this runs, `Unwrap` answers only for a native still waiting,
+   so it never hands out one already destroyed, and a native made meanwhile
+   joins the set and goes too (`lifetimes: natives destroyed at teardown whose
+   destructors run script that reaches other natives`, `lifetimes: a native whose
+   destructor makes another native at teardown - that one goes too`);
+6. check, in a checked build, that the embedder holds no `Context`, `Script` or
+   `Global` (decision 27) - here, after the natives, because a native that owns
+   a realm and a root gives them back by being destroyed;
+7. drop the backend's types, stop any thread a finalizer started meanwhile, and
+   `Py_EndInterpreter` - or leave the interpreter behind (section 6.4).
 
-An instance deallocated after step 4 - during `Py_EndInterpreter`, say, by a
-module being torn down - still carries its box pointer, which is gone; from step
-4 on `Unwrap` answers null for every instance, and a method called on one is the
+An instance deallocated after step 5 - during `Py_EndInterpreter`, say, by a
+module being torn down - still carries its box pointer, which is gone; from then
+on `Unwrap` answers null for every instance, and a method called on one is the
 wrong-receiver `TypeError` (`classes: the isolate gives back every share it
 still holds when it goes`).
 
@@ -641,10 +678,10 @@ empty for one.
 ### 6.1 Termination
 
 CPython has no terminate and no interrupt. What it has is the **pending call**:
-a per-interpreter queue any thread may add to, which the interpreter's thread
-drains at its next *eval-breaker* check - every loop back-edge, every function
-entry, most calls. A pending call that returns -1 with an exception set raises
-that exception there.
+a per-interpreter queue any thread may add to, which whichever of the
+interpreter's threads checks first drains at its next *eval-breaker* check -
+every loop back-edge, every function entry, most calls. A pending call that
+returns -1 with an exception set raises that exception there.
 
 `TerminateExecution` sets the library's own flag first - so every gate on the
 isolate's thread refuses from that instant, the rule decision 15 makes ours to
@@ -673,9 +710,32 @@ exception is easy to swallow:
    pending call alone, with those two gaps.
 
 `Terminated` reaching the top of a finalizer - a `__del__`, a coroutine being
-closed - while a stop is in force is the stop working, not an error, so the
-isolate's `sys.unraisablehook` says nothing about it and passes everything else
-to the default hook.
+closed - or of a thread the script started, while a stop is in force, is the stop
+working, not an error, so the isolate's `sys.unraisablehook` says nothing about
+it and passes everything else to the default hook.
+
+**The stop reaches every thread of the isolate's interpreter**, not only the
+isolate's own: the pending call and the monitoring events fire on whichever
+thread checks, so a `threading.Thread` the script started is stopped with it
+(`teardown: TerminateExecution stops a script's threads too, and an interrupt
+waits for the isolate's thread`). Such a thread is simply ended: the stop is
+uncatchable there as everywhere, so its `finally` blocks do not run.
+
+Two consequences of "no Python runs while a stop is in force" are worth knowing,
+because they reach past the script that was stopped:
+
+- **Python-level cleanup does not happen.** A weakref callback is Python, so
+  while a stop is in force none runs: an object that goes then is gone, but a
+  `weakref.WeakSet` or `WeakValueDictionary` that would have forgotten it from its
+  callback goes on counting it. The same goes for an `except` or `finally` that
+  would have released something.
+- **A standard-library lock can be left held.** A stop that lands between a
+  lock's `acquire()` and its `release()` leaves it acquired, because the
+  `except` block the standard library has there - written for Ctrl-C - does not
+  run. The case that shows it is `Thread.join()`: stopped inside it, the thread's
+  bookkeeping is never finished, and `Thread.is_alive()` answers true for a
+  thread that has ended. `~Isolate` knows about that one lock and does not wait
+  on it (section 6.4); a lock a script's own code held is the script's to lose.
 
 A native that returns the instant it sees `IsExecutionTerminating()` could beat
 the stopping thread's pending call to the next check and let the script run on,
@@ -689,11 +749,8 @@ returns`).
   seconds and `time.sleep(6)` for six before the stop landed; the statement
   after each did not run. They are native code, like an embedder's own callback,
   and decision 15 already says a stop does not reach native code. The same goes
-  for a blocking `socket.recv`, a lock, a `subprocess` wait.
-- **Threads the script started.** The stop is aimed at the isolate's own thread.
-  A `threading.Thread` spinning in `while True: pass` kept running after the
-  script that started it had been stopped, and went on running after the cancel.
-  See section 11 for what that does to `~Isolate`.
+  for a blocking `socket.recv`, a lock, a `subprocess` wait - on the isolate's
+  thread or on one the script started.
 
 ### 6.2 Interrupts
 
@@ -710,6 +767,10 @@ The interpreter's pending-call queue holds 32 calls; `Service` is queued at most
 once at a time, so any number of requests from any number of threads share one
 slot (`interrupts: many requested from many threads while a script runs all run,
 once each`).
+
+An interrupt belongs to the isolate's thread even when a thread the script
+started is the one running Python: the pending call leaves it queued there and
+re-queues itself until the isolate's thread next checks.
 
 ### 6.3 Jobs, promises, and the event loop
 
@@ -756,14 +817,17 @@ loop being the isolate's rather than theirs:
 - **`asyncio.run()` works in a script that has no top-level `await`** - it makes
   a loop of its own (a `ProactorEventLoop`, which the overlay port's patch 0102
   lets a sub-interpreter make), runs it to completion inside the call, and
-  closes it (`stdlib: asyncio - run, sleep and gather`). But **it leaves the
-  thread with no current event loop**: afterwards `asyncio.get_event_loop()` and
-  `asyncio.ensure_future()` at the top level of a later script raise
-  `RuntimeError: There is no current event loop`. The isolate's loop still
-  drives promises and top-level `await` - the backend holds it directly - but a
-  script can no longer name it. In a script that *does* use top-level `await`,
-  `asyncio.run()` is `RuntimeError: asyncio.run() cannot be called from a
-  running event loop`, because the whole script is then a task on that loop.
+  closes it (`stdlib: asyncio - run, sleep and gather`). Closing it sets the
+  thread's current loop to none, which would leave the next script's
+  `asyncio.get_event_loop()`, `asyncio.Future()` and `asyncio.ensure_future()`
+  with nothing to find. So the isolate installs an event-loop policy that falls
+  back to the isolate's own loop, on the isolate's thread, whenever no loop is
+  set: after `asyncio.run()` those three find the isolate's loop again, and a
+  script that sets a loop of its own still gets that one (`teardown: after
+  asyncio.run the isolate's loop is the current one again`). In a script that
+  *does* use top-level `await`, `asyncio.run()` is `RuntimeError: asyncio.run()
+  cannot be called from a running event loop`, as it is in plain Python, because
+  the whole script is then a task on the isolate's loop.
   Measured with the example REPL; no case pins either.
 - **The isolate's loop is a `SelectorEventLoop`**, which on Windows has no
   subprocess or pipe support: `await asyncio.create_subprocess_exec(...)` at the
@@ -773,6 +837,65 @@ loop being the isolate's rather than theirs:
 Posted work (`PostJob`, `PostDelayedJob`) is the other two backends' contract,
 unchanged: ordered, never coalesced, run only by `PumpJobs` with no realm entered
 and no handle scope open, dropped at teardown, and waiting out a stop.
+
+### 6.4 Threads a script starts
+
+`allow_threads` is on: asyncio resolves host names on a worker thread, and a
+standard library without `threading` is not the standard library. So a script can
+start threads in its isolate's interpreter, and what they may do and when they
+end are the backend's to decide.
+
+**They share the isolate's GIL, so they run only while the isolate's thread lets
+them**: while it is running Python (CPython switches threads every few
+milliseconds) or blocked in a call that releases the GIL - `time.sleep`, a
+socket read, `Thread.join()`. Between scripts the isolate's thread holds the GIL
+and a script's threads wait, however long the embedder takes before its next
+`Evaluate` or `PumpJobs`. A thread started to do work "in the background" does
+it only while script is running.
+
+**They cannot use the `unibind` module or anything the embedder bound.** A native
+function, a class constructor, a template's type, an interceptor and every
+attribute of a `unibind.Object` find their isolate through the calling thread,
+and a thread the script started has none: each raises `RuntimeError: unibind: no
+isolate on this thread` (`lifetimes: an instance that dies on a script's thread
+gives its native back on the isolate's`; measured with the example REPL for
+`unibind.Object` and a bound function). Plain Python - lists, dicts, the standard
+library - works on them as anywhere. A native whose instance happens to die on
+one is not destroyed there (section 4.5).
+
+**`TerminateExecution` stops them** along with the isolate's thread (section 6.1).
+
+**`~Isolate` stops them, and waits up to two seconds.** `Py_EndInterpreter` may
+not run while another thread is alive in the interpreter - it is a fatal error -
+and for a `threading.Thread` CPython would first join it, for ever if it never
+ends. So before anything else, `~Isolate` puts a stop on every thread of the
+interpreter but its own, and releases the GIL in short slices so that they can
+meet it and finish. Running Python meets it at its next check; a thread blocked
+in a call meets it when the call returns. A thread still there after two seconds
+is inside a call that has not returned - a sleep longer than that, a lock nobody
+will release, a read nothing will answer:
+
+- **The interpreter is left behind rather than ended under it.** The isolate
+  unhooks everything that leads back to it, gives back its natives as usual, lets
+  go of the interpreter and its GIL, and records it with the platform. The
+  isolate's thread is free for a new isolate at once. The stop stays on the
+  abandoned thread, so when its call returns it ends too (`teardown: a thread in
+  a short blocking call is waited for, and one that sleeps past the grace is left
+  behind`).
+- **`~Platform` ends such an interpreter if its threads have finished by then.**
+  If one still has not, CPython cannot be finalized at all - `Py_FinalizeEx` with a
+  sub-interpreter left is a fatal error - so `~Platform` skips `Py_FinalizeEx` and
+  leaves the process to end with CPython still initialized.
+
+**The trade-off is deliberate: a script's threads die with its isolate.** Plain
+CPython runs non-daemon threads to completion at exit; here an embedder
+destroying an isolate is the one deciding when that isolate's work ends, and an
+isolate whose destruction waited on a script's thread for ever would be a hang the
+embedder could do nothing about. Work a script wants finished, it joins before the
+script ends. A stop that lands on a thread is silent - nothing is printed for it
+(`teardown: a threading.Thread still running Python when the isolate goes is
+stopped, quietly`, `teardown: a raw _thread thread still running when the isolate
+goes is stopped, not fatal`).
 
 ## 7. Heap and stack
 
@@ -788,9 +911,14 @@ most of the interpreter's working memory come from - with hooks that put a
 size. The account is the allocating thread's isolate (one isolate per thread, so
 a thread-local is the whole attribution), and the header is what lets a free, on
 any thread and at any time, credit the right one. 16 bytes keeps every block
-16-aligned, which is what both allocators underneath promise. Accounts are pooled
-and never freed, because a block charged to an isolate can be freed after the
-isolate has gone.
+16-aligned, which is what both allocators underneath promise. An account is never
+freed, because a block charged to an isolate can be freed after the isolate has
+gone; one whose count has fallen back to zero is reused by the next isolate. In
+practice CPython 3.12 never gives *every* block of a sub-interpreter back
+(section 11), so an account is not reused, and **one small allocation per isolate
+stays for the life of the process** - the account itself, tens of bytes - which
+the suite asserts is all the backend keeps (`lifetime: many isolates in sequence
+and on many threads leak nothing of this area's`).
 
 What is and is not counted:
 
@@ -887,6 +1015,19 @@ longer fits reads as a view over nothing - length and offset zero, what decision
 21 asks of a detached buffer (`binary: a view whose buffer shrank reads as a view
 over nothing`). A buffer exported through the buffer protocol cannot be resized
 while the export lives, which is CPython's own rule.
+
+**A buffer too large to allocate is made by growing an empty one**, never with
+`PyByteArray_FromStringAndSize(NULL, n)`. In CPython 3.12 that call, when it
+cannot get the storage, frees the half-made `bytearray` before it has set the
+field that counts buffer exports, and the deallocator reads whatever the
+allocator left there: when that happened to be positive, CPython printed
+`SystemError: deallocated bytearray object has exported buffers` as an
+unraisable exception, after `ArrayBuffer::New` or `TypedArray(..., n)` had
+correctly failed. An empty `bytearray` is made whole, and resizing it fails
+cleanly with `MemoryError`, so an unallocatable buffer is now just empty
+(`lifetimes: a bytearray too large to allocate is refused without a word about
+exported buffers`). Anything else of the embedder's that calls that function
+with a null pointer has the same bug.
 
 **Structured clone** is `marshal` over a graph the backend builds: the value
 becomes a flat list of nodes, each a tag and plain data, with children named by
@@ -1064,8 +1205,11 @@ decides how an embedding is shaped:
   `lifetime: many isolates in sequence and on many threads leak nothing of this
   area's`: about **9.5 MB of process memory kept per isolate** made and destroyed,
   the same with the allocator hooks off, and most of it asyncio, which every
-  isolate imports for its loop. Make isolates long-lived - one per worker thread -
-  not one per request.
+  isolate imports for its loop. Of the backend's own C++ allocations, one small
+  one per isolate stays with it - the heap account those arenas are still charged
+  to (section 7.1); `teardown: isolates in sequence on one thread each give back
+  all they took` counts 101 kept after 100 isolates. Make isolates long-lived -
+  one per worker thread - not one per request.
 
   On **x86** this is a limit, not a cost: a few hundred isolates fill the 2 GB
   address space a 32-bit process gets by default, and a process that close to the
@@ -1073,12 +1217,22 @@ decides how an embedding is shaped:
   The suite's own x86 executable reached that point after about 190 isolates. Link
   a 32-bit program with `/LARGEADDRESSAWARE` (4 GB on 64-bit Windows), as the
   suite and the REPL example are, and still keep isolates long-lived.
-- **`~Isolate` waits for every thread the script started.** `Py_EndInterpreter`
-  joins every non-daemon `threading.Thread` (daemon threads are refused
-  outright, `allow_daemon_threads` being off), and a stop does not reach them
-  (section 6.1). So a script that leaves a thread running makes the isolate's
-  destruction wait for it - for ever, if it never ends. A script that starts a
-  thread has to stop and join it itself.
+- **An interpreter cannot be ended under a thread that is still in it.**
+  `Py_EndInterpreter` with another thread alive is a fatal error, and it joins
+  every non-daemon `threading.Thread` first, for ever if one never ends. Section
+  6.4 is what the backend does about it: stop them, wait two seconds, and leave
+  the interpreter behind - and, at `~Platform`, possibly CPython unfinalized -
+  when one is stuck in a call that never returns.
+- **A debug CPython can report heap corruption with several isolates running at
+  once.** With more than a couple of isolates running concurrently on different
+  threads, a `Py_DEBUG` CPython's debug heap has reported a block freed by an
+  interpreter whose allocator did not make it (`_CrtIsValidHeapPointer`, then an
+  access violation) - inside CPython, with the backend's allocator hooks switched
+  off too, with isolate creation and teardown serialised, and with next to nothing
+  evaluated. It is under investigation and is a known issue of this backend under
+  a debug CPython. **A release CPython has not shown it in any run**; the suite's
+  concurrent cases run two threads rather than eight against a debug build
+  (`CONCURRENT_THREADS` in `teardown_test.cpp`).
 - **No daemon threads** also means library code that makes one fails:
   `subprocess.run(..., capture_output=True)` raises `RuntimeError: daemon threads
   are disabled in this interpreter`, because its Windows implementation reads the
@@ -1135,7 +1289,14 @@ library is a substitute.
     count with stack-pointer checks.
   - asyncio's internals: `loop._ready`, `loop._scheduled`, `loop._run_once`,
     `loop._stopping`, `loop._thread_id`, `asyncio.events._set_running_loop`, and
-    a future's `_state` and `_exception`. `PumpJobs` is built on them.
+    a future's `_state` and `_exception`. `PumpJobs` is built on them. So is
+    the event-loop policy that falls back to the isolate's loop, which reads the
+    default policy's `_local._loop`.
+  - `threading._shutdown_locks`, which `~Isolate` empties once a script's
+    threads have ended, because a stop inside `Thread.join()` can leave one of
+    its locks held and `Py_EndInterpreter` would wait on it for ever.
+  - `PyInterpreterState_ThreadHead` / `PyThreadState_Next`, to see a script's
+    threads, and `PyDict_AddWatcher`, which ends a realm with its dictionary.
   - `PyCodeObject::co_flags`, `PyTracebackObject`, `_PyType_Lookup`,
     `_PyType_Name`, `_PyLong_Sign`.
 - **What 3.13 would change**, from the list above and section 11: sub-interpreter

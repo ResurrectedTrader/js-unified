@@ -31,17 +31,17 @@ const int sum = result->To<ub::Integer>()->Int32Value();   // 2
 | V8 15.6 | JavaScript. Implements all of it |
 | SpiderMonkey 153.3.0esr | JavaScript. Implements all of it except two things its engine does not have: the near-heap-limit hook - a call to that one does not link, on purpose - and the inspector, which links and answers `Supported()` with false |
 | CPython 3.12.13 | **Python.** Implements all of it except the inspector, which links and answers `Supported()` with false; its engine-fault reporting covers running out of heap and a failed bring-up, not a crash inside CPython. Where Python and JavaScript disagree - `None` is `undefined`, a missing attribute is an error to Python - the choice is written down in [`docs/python.md`](docs/python.md) |
-| Tests | the JavaScript suite, written once against `ub::`: 413 cases, green on both JavaScript backends, every case compared backend against backend with no divergences. The CPython backend has a suite of its own, written the same way with Python as the script language: 217 cases |
+| Tests | the JavaScript suite, written once against `ub::`: 413 cases, green on both JavaScript backends, every case compared backend against backend with no divergences. The CPython backend has a suite of its own, written the same way with Python as the script language: 261 cases, plus one opt-in stress case |
 | Not here | cross-realm access control - see [Limits](#limits) |
 
 > **Read [`docs/gotchas.md`](docs/gotchas.md) before you lose a day to one of
 > them.** It is ninety-odd traps indexed by what you were doing when it bit you,
-> and it opens with seventeen you will not diagnose from the symptom: sixteen
+> and it opens with eighteen you will not diagnose from the symptom: seventeen
 > give a *wrong answer and no error at all* - a `TypeError` that arrives as a
 > `SyntaxError`, a cached blob that runs a different script than the one you
 > asked for, a promise continuation that simply never happens, an empty list
 > that a Python callback treats as false - and the
-> seventeenth gives a loud error that blames something else entirely. Ten
+> eighteenth gives a loud error that blames something else entirely. Ten
 > minutes there is the best-value reading in this repository.
 
 **The JavaScript engines do not have the same rules, and the stricter one is
@@ -183,9 +183,10 @@ different number of times on each engine, so V8 counts 10999 and SpiderMonkey
 
 The CPython backend does not run that suite: its cases are JavaScript source as
 much as C++, and the parity comparison leaves this backend out. It runs
-`tests/python/` instead - **217 cases**, the figure `unibind_python_tests.exe`
+`tests/python/` instead - **261 cases**, the figure `unibind_python_tests.exe`
 reports, registered with CTest one per case under `python.` plus the whole suite
-in one process, and six more tests for the example REPL under the label
+in one process, one opt-in stress case that runs only when asked for by name,
+and six more tests for the example REPL under the label
 `example`. [`tests/python/README.md`](tests/python/README.md) says what it covers.
 
 CI pins `windows-2022` and MSVC **14.44** on purpose: that is the toolset both
@@ -202,7 +203,7 @@ Debug against the engine's debug build, whose assertions have caught backend
 bugs no release engine reports (`docs/testing.md`).
 
 The CPython backend has no workflow yet: its suite and the example's checks are
-run locally, x64 Release, before a change lands.
+run locally - Release and Debug on x64, Release on x86 - before a change lands.
 
 Then install a prefix for consumers:
 
@@ -278,13 +279,9 @@ Properties you may set before the import:
 
 | | |
 |---|---|
-| `UnibindBackend` | `v8` or `spidermonkey`. Defaults to whichever the prefix holds, and to `v8` when it holds both. |
+| `UnibindBackend` | `v8`, `spidermonkey` or `python`. Defaults to whichever the prefix holds, preferring them in that order. |
 | `UnibindRoot` | the prefix. Defaults to the props file's own parent, so normally unset. |
-| `UnibindV8Dir`, `UnibindSpiderMonkeyDir` | where your engine lives. Defaults to what the prefix was built against. |
-
-**The props file does not know the CPython backend yet** - it has no `python`
-branch, so a `.vcxproj` that asks for one gets no engine libraries. Consume a
-python prefix through CMake for now.
+| `UnibindV8Dir`, `UnibindSpiderMonkeyDir`, `UnibindPythonDir` | where your engine lives - for CPython, vcpkg's installed triplet directory. Defaults to what the prefix was built against. |
 
 Your project still has to say three things for itself, because they are decided
 before any property sheet is imported: the `Platform` the prefix was installed
@@ -1258,7 +1255,7 @@ boundary, which is the whole point of turning it on.
 ## Gotchas worth knowing before you start
 
 [`docs/gotchas.md`](docs/gotchas.md) is the collection - ninety-odd of them,
-grouped by what you were doing, and opening with the seventeen you will not
+grouped by what you were doing, and opening with the eighteen you will not
 diagnose from the symptom. Five belong here because they are about *getting the
 build to work at all*, which is where a new consumer meets them.
 
@@ -1367,6 +1364,13 @@ process with the operating system ([`docs/python.md`](docs/python.md) section 12
 9.5 MB per isolate made and destroyed, because 3.12 does not free a
 sub-interpreter's arenas (3.13 does). Keep isolates for the life of a worker
 thread rather than making one per request.
+
+**A Python script's threads are second-class, and die with its isolate.** They
+share the isolate's GIL, so they run only while the isolate's thread is running
+Python or blocked in a call; they cannot call anything the embedder bound; a stop
+reaches them; and `~Isolate` stops them rather than wait for them to finish. One
+stuck in a call that never returns makes the isolate leave its interpreter behind
+([`docs/python.md`](docs/python.md) section 6.4).
 
 **No BigInt factory.** The type is recognised (`ValueKind::BigInt`,
 `Is<BigInt>()`) but native cannot make one. A `BigInt64Array` or

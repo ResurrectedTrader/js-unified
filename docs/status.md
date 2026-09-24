@@ -41,7 +41,7 @@ reports a skip where making one asked the allocator for nothing it could refuse.
 - CPython 3.12.13: `src/backends/python/`, and `docs/python.md` for the notes.
   It defines every entry point decisions 1-29 declare, `SetHeapLimitCallback`
   included; `Inspector::Supported()` is false there, as on SpiderMonkey, and
-  `unibind/interop/v8.h` is V8's alone. Its own suite is 217 cases, all green.
+  `unibind/interop/v8.h` is V8's alone. Its own suite is 261 cases, all green.
   Decisions 30-37 are what a second *language* behind the API needed, and not
   one of them changed a public header.
 
@@ -1152,6 +1152,13 @@ what CPython can offer - and it means **realms of one isolate share `sys.modules
 and `builtins`**. On the JavaScript engines a realm has its own built-ins; here
 two sandboxes that must not see each other's module state are two isolates.
 
+**The dictionary is script's, so the backend keeps nothing in it.** A realm's
+record is ended by a dictionary watcher when the dictionary is deallocated, not
+by anything stored under one of its keys: the first version hung the record on a
+capsule in the globals, and `globals().clear()` freed it while a `Context` still
+named the realm, while `dict(globals())` kept it alive past its dictionary so
+that the next dictionary allocated at that address inherited the wrong realm.
+
 The standard library's extension modules that keep state in C globals are
 refused in such an interpreter, by CPython's own check - `ctypes` and XML parsing
 among them - and the pure-Python half of the library is read from disk when the
@@ -1248,9 +1255,19 @@ waits out a stop and runs after the cancel.
 What it cannot reach is the same as everywhere - native code - with a
 Python-shaped addition: **a single long-running builtin is native code**, so
 `sum(range(10**9))` or `time.sleep(60)` runs to its end before the stop lands.
-And a `threading.Thread` the script started is not stopped at all, while
-`~Isolate` waits for it; `docs/python.md` section 11 says what that means for a
-script that starts one.
+
+**The stop is the interpreter's, so it reaches every thread of it** - a
+`threading.Thread` the script started is stopped with the script. And
+**`~Isolate` stops those threads itself** and waits up to two seconds for them,
+because `Py_EndInterpreter` under a live thread is a fatal error and CPython's
+own answer - join it - can wait for ever. A thread still inside a call that has
+not returned after that is not waited for: the isolate leaves its interpreter
+behind, the isolate's thread is free at once, and `~Platform` ends the
+interpreter later if the thread has finished by then - or, if it has not, skips
+`Py_FinalizeEx`, which would be fatal with a sub-interpreter left. The cost is
+chosen in the open: a script's threads die with its isolate, where plain CPython
+would run them to completion. An embedder deciding an isolate's work is over is
+the one that decides (`docs/python.md` section 6.4).
 
 ### 36. A promise is an `asyncio.Future`, and only `PumpJobs` runs the loop (`docs/python.md`)
 

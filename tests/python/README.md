@@ -23,26 +23,35 @@ nothing has to be copied to run it from the build tree.
 
 ## What a run looks like
 
-**217 cases** - the figure the test binary reports, and the one to compare a run
-against (11396 assertions in a Release x64 run, which may differ by build and is
-not the number to compare). `-ltc` lists them, `-tc="objects:*"` runs one area.
+**261 cases** - the figure the test binary reports, and the one to compare a run
+against (120490 assertions in a Release x64 run, most of them the lifetime and
+teardown cases counting references in loops; it differs by build and
+architecture and is not the number to compare). `-ltc` lists them,
+`-tc="objects:*"` runs one area.
+
+One more case is registered but skipped unless asked for by name:
+`stress: making isolates until memory runs out fails cleanly`, which makes
+isolates until `Isolate::New` answers empty. It is too slow and too hard on the
+machine for every run - it runs until memory does - so run it deliberately: `unibind_python_tests -tc="stress:*" --no-skip`. It is
+not among the 261, and CTest does not register it.
 
 Under CTest each case is a test of its own, named `python.<area>: <what it
 pins>`, with the label `suite`, plus one more:
 
 | test | what it is |
 |---|---|
-| `python.whole-suite-in-one-process` | every case in one process, which is the only thing that catches a case quietly depending on another - and, today, the only thing that runs the two cases whose names hold a `;` (below) |
+| `python.whole-suite-in-one-process` | every case in one process, which is the only thing that catches a case quietly depending on another |
 
 The example REPL registers six more, under the label `example`:
 `ctest -C Release -L example` runs its `--demo`, a script with arguments, a
 script that raises and the traceback it prints, a runaway loop stopped by
 `--timeout`, and a piped interactive session
 ([`examples/python_repl/README.md`](../../examples/python_repl/README.md)). A
-plain `ctest` runs both labels: 226 tests.
+plain `ctest` runs both labels: 268 tests.
 
-A full run takes a little under two minutes, most of it cases that stop scripts
-from other threads, make many isolates, or wait for timers on purpose.
+A full run takes about two and a half minutes (Release x64), most of it cases
+that stop scripts from other threads, make and tear down many isolates, or wait
+for timers and thread grace periods on purpose.
 
 ## Areas
 
@@ -62,6 +71,10 @@ Each file is one area, and every case name starts with its area:
 | `serialization_test.cpp` | `clone`: structured clone |
 | `codecache_test.cpp` | `codecache`: the compiled-code cache |
 | `stdlib_test.cpp` | `stdlib`: the extension modules built into the static CPython, and the ones an isolate refuses |
+| `lifetimes_test.cpp` | `lifetimes`: handles, frames, `Global`s and realms counted exactly - references taken and given back, frame and root exhaustion, a realm surviving `globals().clear()` and a copied dict, many realms and scripts leaving the C++ heap where it was, and the `bytearray` that could not be allocated |
+| `lifetimes_natives_test.cpp` | `lifetimes`: when a `Class<T>` native is destroyed - cycles, resurrection, destructors that run script or make natives at teardown, an instance dying on a script's thread - and how long a callback's values live |
+| `teardown_test.cpp` | `teardown`: isolates in sequence and in parallel giving back all they took, threads a script started (stopped by `TerminateExecution`, stopped and waited for by `~Isolate`, left behind when stuck), stops that land on code holding things, and asyncio's current loop after `asyncio.run` |
+| `stress_test.cpp` | `stress`: skipped unless asked for - making isolates until memory runs out |
 
 and the rest of the directory:
 
@@ -71,6 +84,12 @@ main.cpp            the runner: one Platform for the whole run, with an
 support.h/.cpp      the fixture (an isolate, a scope, a realm, entered) and the
                     Eval helpers: Eval, EvalInt, EvalText, EvalTruth, EvalError
 data_support.h      what the binary-data, clone and code-cache cases share
+lifetimes_support.h what the lifetime and teardown cases share
+../support/allocations.cpp   the shared suite's replacement of the global
+                    allocation operators, linked in here too: the lifetime
+                    cases count the backend's own C++ heap with it and make
+                    its allocations fail on purpose. CPython allocates through
+                    malloc, which it does not count
 ```
 
 ## Writing a case
@@ -88,9 +107,14 @@ data_support.h      what the binary-data, clone and code-cache cases share
   stops it - `Stopper` in `runtime_test.cpp` learns that from an interrupt, which
   fires only inside running Python - or it will be testing the compiler.
 - **Keep `;` and `|` out of case names.** CMake splits a name at `;` when CTest
-  registers it, and each half is a filter that matches nothing, which passes. Two
-  names in `runtime_test.cpp` still have one: `jobs: a stop in a job ends the
-  pump; ...` and `jobs: a delay that is zero, negative or not a number is no
-  delay; ...` run only in the whole-suite test.
+  registers it, and each half is a filter that matches nothing, which passes. Two cases
+  in `runtime_test.cpp` had one, and ran only in the whole-suite test until
+  they were renamed.
+- **Run isolates concurrently on two threads, not eight, against a debug
+  CPython.** Its debug heap has reported corruption inside CPython with more
+  than a couple of isolates running at once (`docs/python.md` section 11, a known
+  issue); the concurrent cases size themselves by `NDEBUG`.
+- **Size isolate counts for x86**, where every isolate keeps about 9.5 MB of a
+  32-bit address space for good; the cases that make many scale down there.
 - **A case written against a promise stays red rather than weakened**, as in the
   shared suite.
