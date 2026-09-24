@@ -45,7 +45,7 @@ set_tests_properties(example.python_repl.demo PROPERTIES
 add_test(NAME example.python_repl.script COMMAND ${repl} "${data}/script.py" one two)
 set_tests_properties(example.python_repl.script PROPERTIES
     LABELS "example" TIMEOUT 60
-    PASS_REGULAR_EXPRESSION "argv: \\['[^']*script\\.py', 'one', 'two'\\].*counted to 3.*vector length 5")
+    PASS_REGULAR_EXPRESSION "argv: [[]'[^']*script[.]py', 'one', 'two'[]].*counted to 3.*vector length 5")
 
 # A script that raises: its traceback on stderr, and exit code 1.
 add_test(NAME example.python_repl.script-that-raises COMMAND ${repl} "${data}/raises.py")
@@ -56,7 +56,7 @@ add_test(NAME example.python_repl.script-that-raises-prints-a-traceback
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run.cmake")
 set_tests_properties(example.python_repl.script-that-raises-prints-a-traceback PROPERTIES
     LABELS "example" TIMEOUT 60
-    PASS_REGULAR_EXPRESSION "Traceback \\(most recent call last\\):.*raises\\.py.*in inner.*ValueError: raised on purpose.*exit code: 1")
+    PASS_REGULAR_EXPRESSION "Traceback [(]most recent call last[)]:.*raises[.]py.*in inner.*ValueError: raised on purpose.*exit code: 1")
 
 # The watchdog: an endless loop stopped by --timeout, exit code 1.
 add_test(NAME example.python_repl.timeout-stops-a-runaway-loop
@@ -73,15 +73,18 @@ set_tests_properties(example.python_repl.timeout-stops-a-runaway-loop PROPERTIES
 #
 # These are the lines that must come out, in this order; anything may sit
 # between two of them, and a line ending may be CRLF.
+# (Metacharacters are written as bracket classes - `[*]` rather than `\*` -
+# because a backslash does not survive the trip through a list into the
+# generated CTest file.)
 set(session_lines
-    ">>> 6 \* 7"   "42"
-    ">>> _ \+ 1"   "43"
-    ">>> def fib\(n\):"   "\.\.\.     return n if n < 2 else"   "\.\.\. "
-    ">>> \[fib\(i\) for i in range\(10\)\]"   "\[0, 1, 1, 2, 3, 5, 8, 13, 21, 34\]"
-    ">>> 1 / 0"   "Traceback \(most recent call last\):"   "ZeroDivisionError: division by zero"
-    ">>> Counter\(5\)\.increment\(\)"   "6"
-    ">>> host\.env\.mode"   "'interactive'"
-    ">>> greet\(\"REPL\"\)"   "'Hi, REPL!'"
+    ">>> 6 [*] 7"   "42"
+    ">>> _ [+] 1"   "43"
+    ">>> def fib[(]n[)]:"   "[.][.][.]     return n if n < 2 else"   "[.][.][.] "
+    ">>> [[]fib[(]i[)] for i in range[(]10[)][]]"   "[[]0, 1, 1, 2, 3, 5, 8, 13, 21, 34[]]"
+    ">>> 1 / 0"   "Traceback [(]most recent call last[)]:"   "ZeroDivisionError: division by zero"
+    ">>> Counter[(]5[)][.]increment[(][)]"   "6"
+    ">>> host[.]env[.]mode"   "'interactive'"
+    ">>> greet[(].REPL.[)]"   "'Hi, REPL!'"
     ">>> :heap"   "used [0-9]+ B"
     ">>> :quit"   "exit code: 0")
 list(JOIN session_lines "\r?\n(.*\r?\n)?" session_pattern)
