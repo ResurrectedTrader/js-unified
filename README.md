@@ -1389,8 +1389,8 @@ hooked, so on that backend `Fatal` arrives only for a bring-up that failed.
 
 **Windows only.** x86 and x64 are both built and tested on both JavaScript
 backends, and `CMakeLists.txt` refuses anything else rather than letting it fail
-later. The CPython backend has presets for both; its suite has been run on x64,
-and no CI job runs it yet. Nothing in the *design* is Windows-specific; nothing
+later. The CPython backend has presets for both and its suite passes on both,
+Release and Debug on x64 and Release on x86; no CI job runs it yet. Nothing in the *design* is Windows-specific; nothing
 has been built anywhere else.
 
 ## Layout

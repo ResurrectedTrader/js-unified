@@ -1066,6 +1066,13 @@ decides how an embedding is shaped:
   the same with the allocator hooks off, and most of it asyncio, which every
   isolate imports for its loop. Make isolates long-lived - one per worker thread -
   not one per request.
+
+  On **x86** this is a limit, not a cost: a few hundred isolates fill the 2 GB
+  address space a 32-bit process gets by default, and a process that close to the
+  end does not fail cleanly - every allocation crawls, and threads stop starting.
+  The suite's own x86 executable reached that point after about 190 isolates. Link
+  a 32-bit program with `/LARGEADDRESSAWARE` (4 GB on 64-bit Windows), as the
+  suite and the REPL example are, and still keep isolates long-lived.
 - **`~Isolate` waits for every thread the script started.** `Py_EndInterpreter`
   joins every non-daemon `threading.Thread` (daemon threads are refused
   outright, `allow_daemon_threads` being off), and a stop does not reach them
