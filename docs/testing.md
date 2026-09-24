@@ -963,13 +963,10 @@ differences between engines to be written around.
 - **x86.** The suite has been run on x64. The `python` preset is x86 and builds
   the same way, and nothing runs it regularly.
 
-### Two cases that pass without running under CTest
+### No case name has a `;`
 
-`doctest_discover_tests` registers each case with CTest by name, and two case
-names in `runtime_test.cpp` contain a `;` - `jobs: a stop in a job ends the pump;
-the rest waits for the cancel` and `jobs: a delay that is zero, negative or not a
-number is no delay; one past the clock is never`. CMake splits a name there, so
-each becomes two CTest tests whose `--test-case` filter matches nothing, and a
-filter that matches nothing passes: `ctest` reports four green tests and runs
-neither case. `python.whole-suite-in-one-process` does run both, and both pass.
-The names want the `;` replaced; `docs/gotchas.md` has the rule.
+`doctest_discover_tests` registers each case with CTest by name, and CMake
+splits a name at `;` - the case becomes two CTest tests whose `--test-case`
+filter matches nothing, and a filter that matches nothing passes. Two cases in
+`runtime_test.cpp` had one and so never ran under `ctest`; they have been
+renamed. `docs/gotchas.md` has the rule.

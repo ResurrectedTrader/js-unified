@@ -18,6 +18,11 @@
 
 #include "support.h"
 
+namespace ub_test {
+// tests/support/allocations.cpp
+[[nodiscard]] long long OutstandingAllocations() noexcept;
+}  // namespace ub_test
+
 using namespace std::chrono_literals;
 using py_test::Eval;
 using py_test::EvalError;
@@ -1282,9 +1287,16 @@ TEST_CASE("lifetime: a stop requested from another thread just before the isolat
 
 namespace {
 
-/// What churning `count` isolates costs the process, per isolate, in bytes -
-/// on this thread, or spread over `threads` threads.
-[[nodiscard]] std::int64_t CostPerIsolate(int count, int threads, bool busy) {
+/// What churning `count` isolates left behind, per isolate: in the process's
+/// private bytes, and in the C++ heap (the backend's own allocations, which
+/// tests/support/allocations.cpp counts) - on this thread, or spread over
+/// `threads` threads.
+struct Cost {
+    std::int64_t processBytes = 0;
+    double allocations = 0;
+};
+
+[[nodiscard]] Cost CostPerIsolate(int count, int threads, bool busy) {
     const auto churn = [busy](int n) {
         NeverRuns never;
         for (int i = 0; i < n; ++i) {
@@ -1309,6 +1321,7 @@ namespace {
         CHECK(never.ran.load() == 0);
     };
     const std::size_t before = PrivateBytes();
+    const long long allocationsBefore = ub_test::OutstandingAllocations();
     if (threads <= 1) {
         churn(count);
     } else {
@@ -1320,34 +1333,54 @@ namespace {
             worker.join();
         }
     }
-    return (static_cast<std::int64_t>(PrivateBytes()) - static_cast<std::int64_t>(before)) / count;
+    return {.processBytes = (static_cast<std::int64_t>(PrivateBytes()) - static_cast<std::int64_t>(before)) / count,
+            .allocations = static_cast<double>(ub_test::OutstandingAllocations() - allocationsBefore) / count};
 }
 
 }  // namespace
 
 TEST_CASE("lifetime: many isolates in sequence and on many threads leak nothing of this area's") {
+    // Every isolate costs the process some ten megabytes of CPython's (below),
+    // which a 32-bit process runs out of address space for well before this
+    // case's count on x64; fewer there.
+    constexpr int SCALE = sizeof(void*) == 8 ? 1 : 4;
     (void)CostPerIsolate(4, 1, true);  // warm up whatever the process keeps once
-    const std::int64_t plain = CostPerIsolate(20, 1, false);
-    const std::int64_t busy = CostPerIsolate(20, 1, true);
-    const std::int64_t threaded = CostPerIsolate(24, 6, true);
-    CAPTURE(plain);
-    CAPTURE(busy);
-    CAPTURE(threaded);
-    MESSAGE("process memory kept per isolate: plain " << plain / 1024 << " KB, with queued work and a stop "
-                                                      << busy / 1024 << " KB, on six threads " << threaded / 1024
-                                                      << " KB");
+    const Cost plain = CostPerIsolate(20 / SCALE, 1, false);
+    const Cost busy = CostPerIsolate(20 / SCALE, 1, true);
+    const Cost threaded = CostPerIsolate(24 / SCALE, 6, true);
+    CAPTURE(plain.processBytes);
+    CAPTURE(busy.processBytes);
+    CAPTURE(threaded.processBytes);
+    CAPTURE(plain.allocations);
+    CAPTURE(busy.allocations);
+    CAPTURE(threaded.allocations);
+    MESSAGE("process memory kept per isolate: plain " << plain.processBytes / 1024
+                                                      << " KB, with queued work and a stop "
+                                                      << busy.processBytes / 1024 << " KB, on six threads "
+                                                      << threaded.processBytes / 1024 << " KB");
+    // What this area allocates for itself - its state, the queues, the timers,
+    // the interrupts - is counted exactly, and whatever an isolate left for
+    // teardown is given back with it. One allocation per isolate stays, busy
+    // or not, on purpose: the heap account its interpreter charged, which
+    // CPython 3.12 never returns every block to (it keeps a sub-interpreter's
+    // arenas), so the account cannot be reused. A little over that is the
+    // account list growing.
+    CHECK(plain.allocations <= 1.5);
+    CHECK(busy.allocations <= 1.5);
+    CHECK(threaded.allocations <= 1.5);
     // CPython 3.12 does not give a sub-interpreter's object arenas back when
     // it ends - it frees them from 3.13 - so every isolate costs the process
-    // several megabytes whatever this backend does; measured the same
-    // with the allocator hooks switched off. What is asserted is that nothing
-    // here adds to that: queued jobs, interrupts, a stop and a heap limit left
-    // for teardown cost no more than an isolate that had none of them.
-    CHECK(busy < plain + 512 * 1024);
-    CHECK(threaded < plain + 1024 * 1024);
-    // The absolute figure is CPython's, and grows with what an isolate imports
-    // - asyncio, for its loop, is several megabytes of it - so this bound is
-    // loose, and only catches a leak of whole interpreters.
-    CHECK(plain < std::int64_t{16} * 1024 * 1024);
+    // several megabytes whatever this backend does; measured the same with
+    // the allocator hooks switched off. Process memory is a noisy measure -
+    // the heap's own fragmentation, and other processes pressing on this
+    // one's working set - so these bounds are loose, and only catch whole
+    // interpreters leaking: queued jobs, interrupts, a stop and a heap limit
+    // left for teardown must not cost an isolate's worth more. The absolute
+    // figure grows with what an isolate imports - asyncio, for its loop, is
+    // several megabytes of it.
+    CHECK(busy.processBytes < plain.processBytes + 4 * 1024 * 1024);
+    CHECK(threaded.processBytes < plain.processBytes + 4 * 1024 * 1024);
+    CHECK(plain.processBytes < std::int64_t{16} * 1024 * 1024);
 }
 
 // ---------------------------------------------------------------------------

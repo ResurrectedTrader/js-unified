@@ -222,6 +222,12 @@ std::int64_t UseEverything(int seed) {
     return sum;
 }
 
+/// Every isolate costs the process some ten megabytes of CPython's own - it
+/// keeps a sub-interpreter's arenas when it ends - and a 32-bit process runs
+/// out of address space long before the counts here do on x64.
+constexpr int SEQUENTIAL = sizeof(void*) == 8 ? 100 : 20;
+constexpr int ROUNDS_PER_THREAD = sizeof(void*) == 8 ? 4 : 1;
+
 /// What `UseEverything(seed)` answers when every part of it worked.
 std::int64_t ExpectedSum(int seed) {
     const std::int64_t n = seed % 7 + 1;  // the typed array holds 0 .. n - 1
@@ -230,14 +236,14 @@ std::int64_t ExpectedSum(int seed) {
 
 }  // namespace
 
-TEST_CASE("teardown: a hundred isolates in sequence on one thread each give back all they took") {
+TEST_CASE("teardown: isolates in sequence on one thread each give back all they took") {
     Counted::Reset();
     (void)UseEverything(0);  // first-use statics
     const long long before = ub_test::OutstandingAllocations();
     std::string printed;
     {
         CaptureStderr capture;
-        for (int i = 0; i < 100; ++i) {
+        for (int i = 0; i < SEQUENTIAL; ++i) {
             CHECK(UseEverything(i) == ExpectedSum(i));
         }
         printed = capture.Stop();
@@ -251,7 +257,7 @@ TEST_CASE("teardown: a hundred isolates in sequence on one thread each give back
     // interpreter charged, which CPython 3.12 never gives all its blocks back
     // to (it does not free a sub-interpreter's arenas), so it cannot be reused.
     // Anything past that is the backend's own leak.
-    CHECK(kept <= 100 + 16);
+    CHECK(kept <= SEQUENTIAL + 16);
 }
 
 TEST_CASE("teardown: isolates on eight threads at once, each churning, share nothing") {
@@ -260,7 +266,7 @@ TEST_CASE("teardown: isolates on eight threads at once, each churning, share not
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([t, &failures] {
-            for (int round = 0; round < 4; ++round) {
+            for (int round = 0; round < ROUNDS_PER_THREAD; ++round) {
                 const int seed = t * 10 + round;
                 if (UseEverything(seed) != ExpectedSum(seed)) {
                     ++failures;

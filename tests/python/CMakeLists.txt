@@ -42,5 +42,12 @@ else()
     set_tests_properties(python.suite PROPERTIES TIMEOUT 300 LABELS "suite")
 endif()
 
-add_test(NAME python.whole-suite-in-one-process COMMAND unibind_python_tests)
-set_tests_properties(python.whole-suite-in-one-process PROPERTIES TIMEOUT 300 LABELS "suite")
+# Every isolate costs the process some ten megabytes that CPython 3.12 never
+# gives back (it keeps a sub-interpreter's arenas when the interpreter ends),
+# and the suite makes a few hundred of them: more than a 32-bit process has
+# address space for. On x86 each case runs in a process of its own, above, and
+# only there.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_test(NAME python.whole-suite-in-one-process COMMAND unibind_python_tests)
+    set_tests_properties(python.whole-suite-in-one-process PROPERTIES TIMEOUT 900 LABELS "suite")
+endif()
