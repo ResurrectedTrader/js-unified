@@ -218,7 +218,11 @@ TEST_CASE("stdlib: asyncio - run, sleep and gather") {
     Fixture f;
     CHECK(EvalInt(f.context, kGatherProgram) == 20);
     CHECK(EvalText(f.context, "import _asyncio, asyncio\nasyncio.Future is _asyncio.Future") == "True");
-    CHECK(EvalText(f.context, "type(asyncio.new_event_loop()).__name__") == "ProactorEventLoop");
+    CHECK(EvalText(f.context, "loop = asyncio.new_event_loop()
+kind = type(loop).__name__
+loop.close()
+kind") ==
+          "ProactorEventLoop");
 }
 
 TEST_CASE("stdlib: asyncio - a loopback TCP echo through streams") {
