@@ -267,12 +267,6 @@ Isolate::~Isolate() {
     Impl& state = *impl_;
     assert(tCurrentIsolate == this && "an isolate is destroyed on the thread that made it");
 
-#if UNIBIND_HANDLE_CHECKS && !defined(NDEBUG)
-    // docs/status.md decision 27: a Context, Script or Global the embedder
-    // still holds is two faults at once. Diagnose it where it happens.
-    assert(state.embedderRefs == 0 && "a Context, Script or Global outlived its Isolate");
-#endif
-
     if (state.tstate != nullptr) {
         PyErr_Clear();
         // Threads a script started go first, while everything they could
@@ -306,6 +300,15 @@ Isolate::~Isolate() {
         }
         state.nativesReleased = true;
         PyErr_Clear();
+
+#if UNIBIND_HANDLE_CHECKS && !defined(NDEBUG)
+        // docs/status.md decision 27: a Context, Script or Global the embedder
+        // still holds is two faults at once. Diagnose it where it happens -
+        // which is here, once every native has been given back: a native may
+        // hold a realm and a root of its own, and giving them back is what
+        // destroying it is for (unibind/isolate.h), not a violation.
+        assert(state.embedderRefs == 0 && "a Context, Script or Global outlived its Isolate");
+#endif
 
         detail::ReleaseTypes(*this);
         // A finalizer that ran just now may have started a thread too.
