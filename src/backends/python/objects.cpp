@@ -1949,7 +1949,9 @@ std::uint32_t ArrayLength(Slot array) noexcept {
     } else if (PyTuple_Check(value)) {
         size = PyTuple_GET_SIZE(value);
     }
-    return static_cast<std::uint32_t>(std::min<Py_ssize_t>(size, 0xFFFFFFFF));
+    // Compared as unsigned 64-bit: on x86 `Py_ssize_t` is 32 bits, and a
+    // 0xFFFFFFFF there is -1, which every length is larger than.
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint64_t>(size), 0xFFFFFFFFULL));
 }
 
 NativeBox* GetNativeBox(Slot object) noexcept {
