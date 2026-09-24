@@ -941,9 +941,6 @@ same script name, and nothing it could replace.
   `Isolate::New` answers null, as decision 11 says of a platform that failed to
   bring its engine up. A fatal error inside CPython later - `Py_FatalError` - is
   not hooked: it prints and aborts without reaching `onEngineFault`.
-- **MSBuild consumption.** `unibind.props` knows `v8` and `spidermonkey` and has
-  no `python` branch yet; consume a python prefix through CMake
-  (`find_package(unibind REQUIRED COMPONENTS python)`).
 - **A published prefix.** The release workflow builds the two JavaScript
   backends; a python prefix is built from this tree.
 
@@ -1044,6 +1041,14 @@ pathcch bcrypt advapi32 user32 kernel32 ole32 oleaut32 iphlpapi rpcrt4 crypt32
 winmm msi cabinet wbemuuid propsys`. `unibind::backend_python` and the install
 tree's `unibind-backend-python.cmake` name all of them; nobody should be
 assembling that list by hand.
+
+An MSBuild project gets the same list from `msbuild\unibind.props` with
+`UnibindBackend=python`: the install tree's `unibind-engine-python.props`
+records the engine's libraries relative to `UnibindPythonDir` - vcpkg's
+installed triplet directory, defaulted to the one this prefix was built against -
+once for Release and once for Debug, and `unibind.props` picks by
+`UseDebugLibraries`. `examples/embed/embed.vcxproj` links this way against a
+python prefix in both configurations.
 
 The CRT is `/MT` (`/MTd` in Debug), as for the other two, and a `/MD` consumer
 fails at link with LNK2038. `Py_NO_LINK_LIB` keeps `pyconfig.h`'s `#pragma
