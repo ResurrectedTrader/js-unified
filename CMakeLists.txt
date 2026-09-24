@@ -372,6 +372,7 @@ install(TARGETS unibind_backend_${UNIBIND_BACKEND}
 # a default and can be overridden - `UnibindV8Dir` in MSBuild, `UNIBIND_V8_DIR` in CMake
 # - because the prefix may be copied to a machine where the engine lives
 # somewhere else.
+set(UNIBIND_ENGINE_EXTRA_LIB_NAMES "")
 if(UNIBIND_BACKEND STREQUAL "v8")
     set(UNIBIND_ENGINE_DIR "${UNIBIND_V8_DIR}")
     set(UNIBIND_ENGINE_LIB_NAME "v8_monolith.lib")
@@ -387,6 +388,9 @@ elseif(UNIBIND_BACKEND STREQUAL "python")
     set(UNIBIND_ENGINE_LIB_NAME "lib/${UNIBIND_PYTHON_LIB_NAME}")
     set(UNIBIND_MSBUILD_ENGINE_DIR_PROP "UnibindPythonDir")
     set(UNIBIND_ENGINE_SYSTEM_LIBS ${UNIBIND_PYTHON_SYSTEM_LIBS})
+    # The third-party libraries its built-in extension modules call (zlib,
+    # openssl, ...), from the same prefix - see _unibind_provide_python.
+    set(UNIBIND_ENGINE_EXTRA_LIB_NAMES ${UNIBIND_PYTHON_DEP_LIB_NAMES})
 else()
     set(UNIBIND_ENGINE_DIR "${UNIBIND_SPIDERMONKEY_DIR}")
     set(UNIBIND_ENGINE_LIB_NAME "spidermonkey.lib")

@@ -18,7 +18,9 @@ add_executable(unibind_python_tests
     functions_test.cpp
     templates_test.cpp
     interceptors_test.cpp
-    classes_test.cpp)
+    classes_test.cpp
+
+    stdlib_test.cpp)
 
 target_include_directories(unibind_python_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(unibind_python_tests PRIVATE unibind::unibind doctest::doctest)
