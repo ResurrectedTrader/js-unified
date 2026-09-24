@@ -63,6 +63,8 @@ start-up. The backend looks in these places, in order (`FindStandardLibrary` in
 Run from the build tree, the third one is always there. To ship the program
 somewhere else, copy that `Lib` directory next to it as `python-stdlib`. If none
 of them holds `os.py`, the program prints a message and exits 1.
+[`docs/python.md`](../../docs/python.md) section 10 has the rest: what an
+isolate refuses to import, and what shipping the standard library involves.
 
 ## A session
 
