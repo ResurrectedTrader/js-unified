@@ -71,11 +71,10 @@ set_tests_properties(example.python_repl.timeout-stops-a-runaway-loop PROPERTIES
 # class, an interceptor, a greeter, a command and :quit. Piped input is echoed
 # after the prompt, so the output reads as the session would on a console.
 #
-# These are the lines that must come out, in this order; anything may sit
-# between two of them, and a line ending may be CRLF.
-# (Metacharacters are written as bracket classes - `[*]` rather than `\*` -
-# because a backslash does not survive the trip through a list into the
-# generated CTest file.)
+# These are the lines that must come out, in this order, with anything
+# between them. Metacharacters are bracket classes - `[*]` rather than `\*` -
+# and the joint is `.*` rather than a newline, because neither a backslash nor
+# a control character survives the trip into the generated CTest file.
 set(session_lines
     ">>> 6 [*] 7"   "42"
     ">>> _ [+] 1"   "43"
@@ -87,7 +86,7 @@ set(session_lines
     ">>> greet[(].REPL.[)]"   "'Hi, REPL!'"
     ">>> :heap"   "used [0-9]+ B"
     ">>> :quit"   "exit code: 0")
-list(JOIN session_lines "\r?\n(.*\r?\n)?" session_pattern)
+list(JOIN session_lines ".*" session_pattern)
 
 add_test(NAME example.python_repl.session
          COMMAND "${CMAKE_COMMAND}" -DREPL=${repl} "-DINPUT=${data}/session.txt"
