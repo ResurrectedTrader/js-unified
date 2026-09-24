@@ -112,8 +112,8 @@ class Supervisor {
         reason_ = StopReason::None;
         ++generation_;
         if (timeout_) {
-            deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                                           std::chrono::duration<double>(*timeout_));
+            deadline_ =
+                Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(*timeout_));
         }
         wake_.notify_all();
     }
@@ -304,11 +304,13 @@ class LineReader {
             DWORD read = 0;
             if (!ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 512, &read, nullptr)) {
                 return {.kind = GetLastError() == ERROR_OPERATION_ABORTED ? InputEvent::Kind::Interrupt
-                                                                          : InputEvent::Kind::Eof, .text = {}};
+                                                                          : InputEvent::Kind::Eof,
+                        .text = {}};
             }
             if (read == 0) {
                 return {.kind = GetLastError() == ERROR_OPERATION_ABORTED ? InputEvent::Kind::Interrupt
-                                                                          : InputEvent::Kind::Eof, .text = {}};
+                                                                          : InputEvent::Kind::Eof,
+                        .text = {}};
             }
             line.append(buffer, read);
             if (line.ends_with(L'\n')) {
@@ -324,11 +326,15 @@ class LineReader {
         return {.kind = InputEvent::Kind::Line, .text = Narrow(line)};
     }
 
-    /// From a pipe or a file: bytes, taken as UTF-8.
-    static InputEvent ReadPipedLine() {
+    /// From a pipe or a file: bytes, taken as UTF-8. A byte order mark at the
+    /// very start - PowerShell writes one when it pipes text - is not input.
+    InputEvent ReadPipedLine() {
         std::string line;
         if (!std::getline(std::cin, line)) {
             return {.kind = InputEvent::Kind::Eof, .text = {}};
+        }
+        if (std::exchange(firstLine_, false) && line.starts_with("\xEF\xBB\xBF")) {
+            line.erase(0, 3);
         }
         if (line.ends_with('\r')) {
             line.pop_back();
@@ -355,7 +361,8 @@ class LineReader {
     std::condition_variable_any wake_;
     bool requested_ = false;
     std::optional<InputEvent> ready_;
-    std::jthread thread_;  // last: it starts in the constructor and uses the rest
+    bool firstLine_ = true;  // the reader thread's own
+    std::jthread thread_;    // last: it starts in the constructor and uses the rest
 };
 
 // =====================================================================================
@@ -490,7 +497,7 @@ class Session {
             // Top-level `await` makes the whole input a coroutine: `Evaluate`
             // answers a promise - an asyncio Task - that the pump settles.
             if (result && result->IsPromise()) {
-                result = Await(*result->To<ub::Promise>(), stopped);
+                result = Await(*result->To<ub::Promise>(), interactive, stopped);
             }
             if (!result) {
                 outcome = Report(caught, stopped);
@@ -528,8 +535,8 @@ class Session {
 
     /// Pump for `seconds`, so that timers due in that window fire.
     void PumpFor(double seconds) {
-        const auto until = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                                              std::chrono::duration<double>(seconds));
+        const auto until =
+            Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
         do {
             Pump();
             if (gSupervisor.TakeIdleInterrupt()) {
@@ -609,9 +616,10 @@ class Session {
 
     /// Settle `promise`, pumping, and answer its value - or empty with its
     /// exception pending, as if the input itself had thrown.
-    std::optional<ub::Local<ub::Value>> Await(const ub::Local<ub::Promise>& promise, StopReason& stopped) {
+    std::optional<ub::Local<ub::Value>> Await(const ub::Local<ub::Promise>& promise, bool interactive,
+                                              StopReason& stopped) {
         (void)gSupervisor.TakeIdleInterrupt();
-        bool announced = false;
+        bool announced = !interactive;  // a script says nothing while it waits
         while (true) {
             {
                 Running running;
@@ -731,7 +739,8 @@ class Session {
 // The REPL
 // =====================================================================================
 
-constexpr std::string_view HELP = R"(Enter Python; a blank line ends a block. The last expression's repr is printed and kept in _.
+constexpr std::string_view HELP =
+    R"(Enter Python; a blank line ends a block. The last expression's repr is printed and kept in _.
 Top-level await works:  await host.fetch_later(42)
 
   :help               this text
@@ -936,8 +945,8 @@ struct Options {
     enum class Mode { Repl, File, Code, Demo, Help };
     Mode mode = Mode::Repl;
     std::optional<double> timeout;
-    std::string code;                ///< -c
-    std::vector<std::string> argv;   ///< sys.argv for a file
+    std::string code;               ///< -c
+    std::vector<std::string> argv;  ///< sys.argv for a file
 };
 
 std::optional<Options> Parse(std::span<const std::string> args) {
@@ -1025,8 +1034,8 @@ int Run(const Options& options) {
             case Options::Mode::Demo: {
                 const auto path = options.mode == Options::Mode::Demo
                                       ? FindDemo()
-                                      : std::optional(std::filesystem::path(std::u8string(
-                                            options.argv.front().begin(), options.argv.front().end())));
+                                      : std::optional(std::filesystem::path(
+                                            std::u8string(options.argv.front().begin(), options.argv.front().end())));
                 const auto source = path ? ReadWholeFile(*path) : std::nullopt;
                 if (!source) {
                     Err("cannot read {}\n", path ? path->string() : std::string("demo.py"));

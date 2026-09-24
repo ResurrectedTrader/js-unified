@@ -410,8 +410,8 @@ void SettleLater(ub::Isolate& isolate, ub::CallbackData data) {
     const ub::TryCatch caught(isolate);
     const ub::Local<ub::Promise> promise = owned.mapped()->promise.Get(isolate);
     const ub::Local<ub::Value> value = owned.mapped()->value.Get(isolate);
-    const auto settled = owned.mapped()->reject ? ub::Reject(host.context, promise, value)
-                                                : ub::Resolve(host.context, promise, value);
+    const auto settled =
+        owned.mapped()->reject ? ub::Reject(host.context, promise, value) : ub::Resolve(host.context, promise, value);
     if (!settled && caught.HasCaught() && !caught.HasTerminated()) {
         ReportUncaught(host.context, caught, "settling a fetch_later promise");
     }
