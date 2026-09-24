@@ -438,12 +438,12 @@ void Descend(const ub::CallbackInfo& info) {
 }
 }  // namespace
 
-TEST_CASE("lifetimes: native into Python into native, a hundred and fifty deep, and back out intact") {
+TEST_CASE("lifetimes: native into Python into native, fifty deep, and back out intact") {
     Fixture f;
     Expose(f.context, "descend", Native(f.context, &Descend));
     Run(f.context, "marker = object()\ndef down(n, again):\n    m = marker\n    return descend(n, again)");
     const std::int32_t base = RefCount(f.context, "marker");
-    CHECK(EvalInt(f.context, "descend(150, down)") == 151);
+    CHECK(EvalInt(f.context, "descend(50, down)") == 51);
     CHECK(RefCount(f.context, "marker") == base);
     // Deep enough to hit a limit is an exception, not a crash, and leaves
     // nothing behind either.

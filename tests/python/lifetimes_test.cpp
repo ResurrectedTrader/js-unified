@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -629,7 +630,7 @@ namespace {
 /// Asks for an ArrayBuffer no machine can hold; answers whether it was refused
 /// the way the header says - empty, with nothing thrown.
 void MakesHugeBuffer(const ub::CallbackInfo& info) {
-    const auto huge = ub::ArrayBuffer::New(info.GetContext(), std::size_t{1} << 62);
+    const auto huge = ub::ArrayBuffer::New(info.GetContext(), std::numeric_limits<std::size_t>::max() / 2 - 64);
     info.GetReturnValue().Set(!huge.has_value() && !info.GetIsolate().HasPendingException());
 }
 }  // namespace
@@ -658,7 +659,7 @@ try:
         litter = [(2**300 - 1) - i for i in range(64)]
         del litter
         try:
-            unibind.TypedArray('int8', 2**62)
+            unibind.TypedArray('int8', sys.maxsize - 64)
         except MemoryError:
             refused += 1
 finally:
