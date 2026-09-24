@@ -6,6 +6,8 @@
 
 #include <psapi.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -21,6 +23,7 @@ using py_test::Eval;
 using py_test::EvalError;
 using py_test::EvalInt;
 using py_test::EvalTruth;
+using py_test::Expose;
 using py_test::Fixture;
 
 namespace {
@@ -1060,8 +1063,18 @@ int DepthReached(const ub::IsolateOptions& options) {
 
 }  // namespace
 
+/// The smallest thread stack the cases below run an isolate on. A debug
+/// CPython's evaluation loop is unoptimised and some twenty times the size, and
+/// bringing an interpreter up - before anything here is in play - overflows a
+/// 256 KB stack by itself.
+#if defined(NDEBUG)
+constexpr std::size_t SMALL_STACK = std::size_t{256} * 1024;
+#else
+constexpr std::size_t SMALL_STACK = std::size_t{1024} * 1024;
+#endif
+
 TEST_CASE("stack: runaway recursion is a RecursionError, not a crash, on threads of several sizes") {
-    for (const std::size_t stack : {std::size_t{256} * 1024, std::size_t{1024} * 1024, std::size_t{8} * 1024 * 1024}) {
+    for (const std::size_t stack : {SMALL_STACK, std::size_t{1024} * 1024, std::size_t{8} * 1024 * 1024}) {
         CAPTURE(stack);
         OnThreadWithStack(stack, [] {
             Fixture f;
@@ -1088,7 +1101,7 @@ TEST_CASE("stack: a smaller stackLimitBytes stops native recursion sooner") {
 }
 
 TEST_CASE("stack: a stackLimitBytes past the end of the thread's stack is held to the stack") {
-    OnThreadWithStack(512 * 1024, [] {
+    OnThreadWithStack(2 * SMALL_STACK, [] {
         auto isolate = ub::Isolate::New({.stackLimitBytes = std::size_t{1} << 30});
         REQUIRE(isolate != nullptr);
         const ub::HandleScope scope(*isolate);
@@ -1153,27 +1166,53 @@ TEST_CASE("concurrency: isolates on different threads run Python in parallel") {
         MESSAGE("fewer than four hardware threads; nothing to measure");
         return;
     }
-    const auto work = [] {
+    // Only the Python is timed: each thread makes its isolate first, then all
+    // of them start together. Sharing one lock, each of four would take about
+    // four times as long as one alone; with a lock each, about as long. Best
+    // of three, so that a busy machine does not fail it.
+    constexpr std::string_view SOURCE = "t = 0\nfor i in range(3_000_000):\n    t += 1\nt";
+    const auto alone = [&] {
         Fixture f;
         const auto start = std::chrono::steady_clock::now();
-        CHECK(EvalInt(f.context, "t = 0\nfor i in range(3_000_000):\n    t += 1\nt") == 3000000);
+        CHECK(EvalInt(f.context, SOURCE) == 3000000);
         return std::chrono::steady_clock::now() - start;
     };
-    // One alone, then four at once. Sharing a lock, four would take four times
-    // as long; with a lock each they take about as long as one.
-    const auto alone = work();
-    std::vector<std::thread> threads;
-    const auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < 4; ++i) {
-        threads.emplace_back([&] { (void)work(); });
+    const auto together = [&] {
+        constexpr int THREADS = 4;
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::chrono::steady_clock::duration> took(THREADS);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < THREADS; ++i) {
+            threads.emplace_back([&, i] {
+                Fixture f;
+                ready.fetch_add(1);
+                while (!go.load()) {
+                    std::this_thread::yield();
+                }
+                const auto start = std::chrono::steady_clock::now();
+                const auto total = Eval(f.context, SOURCE).To<ub::Integer>();
+                took[i] = std::chrono::steady_clock::now() - start;
+                CHECK((total && total->Int32Value() == 3000000));
+            });
+        }
+        while (ready.load() < THREADS) {
+            std::this_thread::yield();
+        }
+        go.store(true);
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        return *std::max_element(took.begin(), took.end());
+    };
+    double best = 1e9;
+    for (int attempt = 0; attempt < 3 && best >= 2.5; ++attempt) {
+        const auto one = alone();
+        const auto four = together();
+        best = (std::min)(best, std::chrono::duration<double>(four) / std::chrono::duration<double>(one));
     }
-    for (std::thread& thread : threads) {
-        thread.join();
-    }
-    const auto together = std::chrono::steady_clock::now() - start;
-    CAPTURE(std::chrono::duration_cast<std::chrono::milliseconds>(alone).count());
-    CAPTURE(std::chrono::duration_cast<std::chrono::milliseconds>(together).count());
-    CHECK(together < alone * 3);
+    CAPTURE(best);
+    CHECK(best < 2.5);
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,11 +1338,190 @@ TEST_CASE("lifetime: many isolates in sequence and on many threads leak nothing 
                                                       << " KB");
     // CPython 3.12 does not give a sub-interpreter's object arenas back when
     // it ends - it frees them from 3.13 - so every isolate costs the process
-    // five or six megabytes whatever this backend does; measured the same
+    // several megabytes whatever this backend does; measured the same
     // with the allocator hooks switched off. What is asserted is that nothing
     // here adds to that: queued jobs, interrupts, a stop and a heap limit left
     // for teardown cost no more than an isolate that had none of them.
     CHECK(busy < plain + 512 * 1024);
     CHECK(threaded < plain + 1024 * 1024);
-    CHECK(plain < std::int64_t{8} * 1024 * 1024);
+    // The absolute figure is CPython's, and grows with what an isolate imports
+    // - asyncio, for its loop, is several megabytes of it - so this bound is
+    // loose, and only catches a leak of whole interpreters.
+    CHECK(plain < std::int64_t{16} * 1024 * 1024);
+}
+
+// ---------------------------------------------------------------------------
+// Natives
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] ub::Local<ub::Function> Native(const ub::Context& context, ub::FunctionCallback callback,
+                                             ub::CallbackData data = {}) {
+    auto function = ub::Function::New(context, callback, data);
+    REQUIRE(function.has_value());
+    return *function;
+}
+
+/// Calls its argument with itself: native recursion that never enters the
+/// evaluation loop, so CPython's own count never sees it.
+void CallsItself(const ub::CallbackInfo& info) {
+    const auto function = info[0].To<ub::Function>();
+    if (!function) {
+        return;
+    }
+    const std::array<ub::Local<ub::Value>, 1> arguments{info[0]};
+    (void)function->Call(info.GetContext(), ub::Undefined(info.GetIsolate()), arguments);
+}
+
+/// Calls its argument, a Python function, with no arguments.
+void CallsBack(const ub::CallbackInfo& info) {
+    const auto function = info[0].To<ub::Function>();
+    if (!function) {
+        return;
+    }
+    (void)function->Call(info.GetContext(), ub::Undefined(info.GetIsolate()), {});
+}
+
+void StopsItsIsolate(const ub::CallbackInfo& info) {
+    info.GetIsolate().TerminateExecution();
+}
+
+struct Marks {
+    std::atomic<int> count{0};
+    std::atomic<bool> sawStop{false};
+};
+
+void Mark(const ub::CallbackInfo& info) {
+    info.Data<Marks>()->count.fetch_add(1);
+}
+
+/// Spins until it is told to stop, as a well-behaved long-running native
+/// does: `IsExecutionTerminating` is the only thing that reaches it.
+void SpinsUntilStopped(const ub::CallbackInfo& info) {
+    auto* marks = info.Data<Marks>();
+    marks->count.fetch_add(1);
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (!info.GetIsolate().IsExecutionTerminating() && std::chrono::steady_clock::now() < give_up) {
+        std::this_thread::yield();
+    }
+    marks->sawStop.store(info.GetIsolate().IsExecutionTerminating());
+}
+
+}  // namespace
+
+TEST_CASE("stack: native recursion that never enters Python is a RecursionError, not a crash") {
+    for (const std::size_t stack : {SMALL_STACK, std::size_t{2048} * 1024}) {
+        CAPTURE(stack);
+        OnThreadWithStack(stack, [] {
+            Fixture f;
+            Expose(f.context, "recurse", Native(f.context, &CallsItself));
+            CHECK(py_test::EvalText(f.context, R"(
+try:
+    recurse(recurse)
+    outcome = 'returned'
+except RecursionError:
+    outcome = 'caught'
+outcome
+)") == "caught");
+            CHECK(EvalInt(f.context, "sum(range(10))") == 45);
+        });
+    }
+}
+
+TEST_CASE("stack: recursion bouncing between a native and Python is a RecursionError, not a crash") {
+    for (const std::size_t stack : {SMALL_STACK, std::size_t{2048} * 1024}) {
+        CAPTURE(stack);
+        OnThreadWithStack(stack, [] {
+            Fixture f;
+            Expose(f.context, "bounce", Native(f.context, &CallsBack));
+            CHECK(py_test::EvalText(f.context, R"(
+def down():
+    bounce(down)
+try:
+    down()
+    outcome = 'returned'
+except RecursionError:
+    outcome = 'caught'
+outcome
+)") == "caught");
+            CHECK(EvalInt(f.context, "sum(range(10))") == 45);
+        });
+    }
+}
+
+TEST_CASE("termination: a native that stops its own isolate stops the script that called it") {
+    Fixture f;
+    Expose(f.context, "stop", Native(f.context, &StopsItsIsolate));
+    {
+        const ub::HandleScope scope(f.iso());
+        ub::TryCatch handler(f.iso());
+        CHECK_FALSE(ub::Evaluate(f.context, "before = True\nstop()\nafter = True\n").has_value());
+        CHECK(handler.HasTerminated());
+    }
+    CancelAndCheckUsable(f);
+    CHECK(EvalTruth(f.context, "before"));
+    CHECK(EvalTruth(f.context, "'after' not in globals()"));
+}
+
+TEST_CASE("termination: a native is not interrupted, sees the stop, and the script stops when it returns") {
+    Fixture f;
+    Marks marks;
+    Expose(f.context, "spin", Native(f.context, &SpinsUntilStopped, ub::CallbackData::For(marks)));
+    std::thread stopper([&] {
+        while (marks.count.load() == 0) {
+            std::this_thread::sleep_for(1ms);
+        }
+        std::this_thread::sleep_for(20ms);
+        f.iso().TerminateExecution();
+    });
+    {
+        const ub::HandleScope scope(f.iso());
+        ub::TryCatch handler(f.iso());
+        CHECK_FALSE(ub::Evaluate(f.context, "spin()\nafter = True\n").has_value());
+        CHECK(handler.HasTerminated());
+    }
+    stopper.join();
+    CHECK(marks.sawStop.load());
+    CancelAndCheckUsable(f);
+    CHECK(EvalTruth(f.context, "'after' not in globals()"));
+}
+
+TEST_CASE("termination: a native called from a finally block of a stopped script does not run") {
+    Fixture f;
+    Marks marks;
+    Expose(f.context, "mark", Native(f.context, &Mark, ub::CallbackData::For(marks)));
+    RunUntilStopped(f, R"(
+started = True
+try:
+    while True:
+        pass
+finally:
+    mark()
+)");
+    CancelAndCheckUsable(f);
+    CHECK(marks.count.load() == 0);
+}
+
+TEST_CASE("termination: a stopped isolate refuses a native's call back into Python") {
+    Fixture f;
+    Expose(f.context, "bounce", Native(f.context, &CallsBack));
+    Expose(f.context, "stop", Native(f.context, &StopsItsIsolate));
+    {
+        const ub::HandleScope scope(f.iso());
+        ub::TryCatch handler(f.iso());
+        CHECK_FALSE(ub::Evaluate(f.context, R"(
+reached = []
+def inner():
+    reached.append(1)
+def outer():
+    stop()
+bounce(outer)
+bounce(inner)
+)")
+                        .has_value());
+        CHECK(handler.HasTerminated());
+    }
+    CancelAndCheckUsable(f);
+    CHECK(EvalInt(f.context, "len(reached)") == 0);
 }

@@ -197,7 +197,7 @@ def step(n):
     order.append((n, asyncio.get_running_loop() is loop))
     if n < 5:
         loop.call_soon(step, n + 1)
-loop.call_soon(step, 0)
+_ = loop.call_soon(step, 0)
 )")
                   .IsUndefined());
         f.iso().PumpJobs();
@@ -267,8 +267,8 @@ behind = []
 def spin():
     while True:
         pass
-loop.call_soon(spin)
-loop.call_soon(lambda: behind.append('ran'))
+_ = loop.call_soon(spin)
+_ = loop.call_soon(lambda: behind.append('ran'))
 )")
                   .IsUndefined());
         std::thread stopper([&] {
@@ -282,7 +282,7 @@ loop.call_soon(lambda: behind.append('ran'))
         f.iso().PumpJobs();
         CHECK(EvalInt(f.context, "len(behind)") == 0);
         // The loop is intact: it runs the next thing it is given.
-        CHECK(Eval(f.context, "loop.call_soon(lambda: behind.append('later'))").IsUndefined());
+        CHECK(Eval(f.context, "_ = loop.call_soon(lambda: behind.append('later'))").IsUndefined());
         f.iso().PumpJobs();
         CHECK(EvalTruth(f.context, "behind == ['later']"));
     }
@@ -318,7 +318,7 @@ async def forever():
     await loop.create_future()
 started = loop.create_task(forever())
 never_started = loop.create_task(forever())
-loop.call_later(1000, print, 'never')
+_ = loop.call_later(1000, print, 'never')
 failed = loop.create_future()
 failed.set_exception(ValueError('never retrieved'))
 )")

@@ -834,7 +834,7 @@ void DropLoop(RuntimeState& runtime) noexcept {
 /// be used for exactly that reason: its `finally` is Python, and a sticky stop
 /// raises again at the first call in it.
 struct RunningLoop {
-    RunningLoop(RuntimeState& runtime) noexcept : runtime_(runtime) {
+    explicit RunningLoop(RuntimeState& runtime) noexcept : runtime_(runtime) {
         PyObject* ident = PyLong_FromUnsignedLong(PyThread_get_thread_ident());
         if (ident != nullptr) {
             (void)PyObject_SetAttrString(runtime.loop, "_thread_id", ident);
@@ -975,14 +975,28 @@ constexpr std::size_t STACK_HEADROOM = 128 * 1024;
 /// embedder made the isolate on, 1 MB by default on Windows, so the count is
 /// derived from the stack at that same density, a little more cautiously.
 ///
-/// Measured on this build: re-entering the evaluation loop through a builtin
-/// costs about 430 bytes a unit, a recursive `repr` about 260. **A builtin
-/// with a large frame costs more than any count can allow for**: `sorted`
-/// keeps a 2 KB merge buffer on the stack, 2.7 KB a unit, and a recursion
-/// through its `key` overflows the stack of a stock `python.exe` 3.12 as
-/// well. Only CPython 3.14's stack-pointer checks close that; it is a known
-/// gap.
+/// Measured, release: re-entering the evaluation loop through a builtin costs
+/// about 400 bytes a unit, a recursive `repr` about 200. A debug CPython's
+/// unoptimised evaluation loop costs some 7 KB a unit, and the figure follows
+/// the build. **A builtin with a large frame costs more than any count can
+/// allow for**: `sorted` keeps a 2 KB merge buffer on the stack, 2.7 KB a
+/// unit, and a recursion through its `key` overflows the stack of a stock
+/// `python.exe` 3.12 as well. Only CPython 3.14's stack-pointer checks close
+/// that; it is a known gap.
+///
+/// Native recursion - a callback calling back into the engine, through
+/// Python or not - is held by an address instead: every native entry asks
+/// `StackExhausted` (bindings.cpp), which no count can fool.
+#if defined(_DEBUG)
+constexpr std::size_t STACK_BYTES_PER_UNIT = 8192;
+#else
 constexpr std::size_t STACK_BYTES_PER_UNIT = 768;
+#endif
+
+/// Fewer units than this and CPython cannot import a module, which nests
+/// several evaluation loops; a stack too small for even this many is one the
+/// embedder cannot run Python on.
+constexpr std::size_t MIN_RECURSION_UNITS = 16;
 
 [[nodiscard]] std::uintptr_t StackPointer() noexcept {
     return reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
@@ -1101,7 +1115,7 @@ bool IsolateRuntimeSetup(Isolate& isolate, const IsolateOptions& options) noexce
     // CPython's own guard is a count, not an address: set the count from the
     // budget. Python-to-Python calls cost no native stack in 3.12 and are
     // held by the separate `sys.getrecursionlimit()`, which is left as it is.
-    const std::size_t units = std::clamp<std::size_t>(budget / STACK_BYTES_PER_UNIT, 50, INT_MAX / 2);
+    const std::size_t units = std::clamp<std::size_t>(budget / STACK_BYTES_PER_UNIT, MIN_RECURSION_UNITS, INT_MAX / 2);
     isolate.impl().tstate->c_recursion_remaining = static_cast<int>(units);
     return true;
 }
