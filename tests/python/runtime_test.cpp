@@ -628,7 +628,7 @@ TEST_CASE("jobs: what a job throws stops at the pump") {
     CHECK(log.Order() == std::vector<int>{1, 2});
 }
 
-TEST_CASE("jobs: a stop in a job ends the pump; the rest waits for the cancel") {
+TEST_CASE("jobs: a stop in a job ends the pump, and the rest waits for the cancel") {
     Fixture f;
     JobLog log;
     Job stopping{&log, 1};
@@ -687,7 +687,7 @@ TEST_CASE("jobs: delayed work runs in the order it fell due, after work already 
     CHECK(log.Order() == std::vector<int>{4, 2, 1, 3});
 }
 
-TEST_CASE("jobs: a delay that is zero, negative or not a number is no delay; one past the clock is never") {
+TEST_CASE("jobs: a delay that is zero, negative or not a number is no delay, and one past the clock is never") {
     Fixture f;
     JobLog log;
     Job zero{&log, 1};

@@ -21,7 +21,13 @@ add_executable(unibind_python_tests
     templates_test.cpp
     interceptors_test.cpp
     classes_test.cpp
-    stdlib_test.cpp)
+    stdlib_test.cpp
+    lifetimes_test.cpp
+    lifetimes_natives_test.cpp
+    teardown_test.cpp
+    # The global allocation operators, replaced: the lifetime cases count the
+    # backend's own C++ heap and make its allocations fail on purpose.
+    "${PROJECT_SOURCE_DIR}/tests/support/allocations.cpp")
 
 target_include_directories(unibind_python_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(unibind_python_tests PRIVATE unibind::unibind doctest::doctest)
