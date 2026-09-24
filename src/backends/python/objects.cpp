@@ -931,6 +931,27 @@ int ObjectClear(PyObject* self) {
     return 0;
 }
 
+/// Whether `name` is declared by a Python class between `type` and the first
+/// type in its MRO that a template made (or `unibind.Object` itself) - that
+/// is, by a Python subclass, whose members override the prototype chain.
+[[nodiscard]] bool DeclaredBySubclass(Isolate& isolate, PyTypeObject* type, PyObject* name) noexcept {
+    PyObject* mro = type->tp_mro;
+    if (mro == nullptr || !PyTuple_Check(mro)) {
+        return false;
+    }
+    PyTypeObject* base = isolate.impl().types.object;
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(mro); ++i) {
+        auto* entry = reinterpret_cast<PyTypeObject*>(PyTuple_GET_ITEM(mro, i));
+        if (entry == base || IsTemplateMadeType(isolate, entry)) {
+            return false;
+        }
+        if (entry->tp_dict != nullptr && PyDict_Contains(entry->tp_dict, name) == 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// `o.name`.
 ///
 /// Python's data descriptors on the type come first - `__class__`,
@@ -965,6 +986,22 @@ PyObject* ObjectGetAttr(PyObject* self, PyObject* name) {
     if (key == nullptr) {
         return nullptr;
     }
+    // A member a Python subclass declares overrides the template's prototype,
+    // as a subclass's method overrides its base's in Python: `class
+    // Loud(Counter): def increment(self)` must be what `Loud().increment()`
+    // runs. Only an own property of the instance comes before it, as an
+    // instance attribute does in Python.
+    if (DeclaredBySubclass(*isolate, Py_TYPE(self), name)) {
+        PyObject* properties = AsInstance(self)->properties;
+        const int own = properties != nullptr ? PyDict_Contains(properties, key) : 0;
+        if (own <= 0) {
+            Py_DECREF(key);
+            if (own < 0) {
+                return nullptr;
+            }
+            return PyObject_GenericGetAttr(self, name);
+        }
+    }
     bool found = false;
     PyObject* value = GetChain(*isolate, AsInstance(self), key, !IsDunder(name), &found);
     Py_DECREF(key);
@@ -980,6 +1017,12 @@ PyObject* ObjectGetAttr(PyObject* self, PyObject* name) {
         return value;
     }
     Py_DECREF(value);
+    // A mirror of a prototype method, kept on the class for `super()`, is not
+    // a member of its own: the prototype chain just said the name is absent.
+    if (MirroredOnly(*isolate, Py_TYPE(self), name)) {
+        PyErr_Format(PyExc_AttributeError, "'%.100s' object has no attribute '%U'", Py_TYPE(self)->tp_name, name);
+        return nullptr;
+    }
     return PyObject_GenericGetAttr(self, name);
 }
 

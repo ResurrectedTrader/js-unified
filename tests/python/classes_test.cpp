@@ -346,6 +346,32 @@ s = Sub(21)
     CHECK(ClassHas(f.context, cls, made));
 }
 
+TEST_CASE("classes: a Python subclass overrides a class method, and can call the base's") {
+    Counter::Reset();
+    Fixture f;
+    const auto cls = DeclareCounter(f.iso());
+    Expose(f.context, "Counter", *cls.GetConstructor(f.context));
+    REQUIRE(ub::Evaluate(f.context, R"(
+class Loud(Counter):
+    def increment(self, by=1):
+        return 1000 + super().increment(by)
+class Deeper(Loud):
+    pass
+l = Loud(1)
+)")
+                .has_value());
+
+    // The subclass's method runs, and `super()` still reaches the native one.
+    CHECK(EvalInt(f.context, "l.increment(2)") == 1003);
+    CHECK(EvalInt(f.context, "l.value") == 3);
+    CHECK(EvalInt(f.context, "Deeper(0).increment()") == 1001);
+    // The base class is untouched.
+    CHECK(EvalInt(f.context, "Counter(1).increment(2)") == 3);
+    // An own property of the instance still comes first, as an instance
+    // attribute does in Python.
+    CHECK(EvalInt(f.context, "l.increment = lambda by=1: -1\nl.increment()") == -1);
+}
+
 TEST_CASE("classes: the native is recovered as its real type or not at all") {
     Counter::Reset();
     Fixture f;

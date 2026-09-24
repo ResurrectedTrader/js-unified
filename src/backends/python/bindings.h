@@ -283,6 +283,15 @@ enum class Hook : std::uint8_t {
 /// The template a type was made from - the nearest along its bases, so that a
 /// Python subclass of a template's type finds it - or null.
 [[nodiscard]] TemplateRec* TemplateOfType(Isolate& isolate, PyTypeObject* type) noexcept;
+/// Whether `type` itself was made from a template - as opposed to a Python
+/// subclass of such a type, which `TemplateOfType` also answers for.
+[[nodiscard]] bool IsTemplateMadeType(Isolate& isolate, PyTypeObject* type) noexcept;
+/// Where a template's type records the prototype methods it mirrors for
+/// `super()`'s sake (bindings.cpp, `MirrorPrototypeMethods`).
+inline constexpr const char* MIRRORED_KEY = "__unibind_mirrored__";
+/// Whether the class attribute ordinary lookup would find for `name` is only
+/// such a mirror - which the prototype chain, not the class, answers for.
+[[nodiscard]] bool MirroredOnly(Isolate& isolate, PyTypeObject* type, PyObject* name) noexcept;
 /// `type(*args)` for a template's type: the construct path. `isConstruct` is
 /// what the callback's `IsConstructCall()` says - false only for a class that
 /// opted into `ConstructOrCall` being called plainly. New reference, or null

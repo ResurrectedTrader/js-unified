@@ -1270,6 +1270,54 @@ void Seal(TemplateRec* rec) noexcept {
     return true;
 }
 
+/// The prototype's native methods, mirrored onto the type as class attributes.
+///
+/// The prototype object is where instances find them, and stays the only
+/// place ordinary lookup finds them. But `super()` - `super().increment(by)`
+/// in a Python subclass that overrides `increment` - searches the class
+/// dictionaries along the MRO and never looks at a prototype, so without this
+/// a subclass could override a native method and never reach it again. A
+/// native function binds like a method when it is found on a class, so the
+/// mirrored entry gives `super()` exactly the bound method it expects.
+///
+/// What was mirrored is recorded under `MIRRORED_KEY`, so that the ordinary
+/// lookup can tell a mirror from a real class attribute and ignore it: an
+/// instance whose prototype was swapped away must not keep the old methods
+/// through the back door (`MirroredOnly`). A static of the same name keeps
+/// the class attribute, and dunder names are not mirrored at all - the type
+/// slot for `__iter__` would otherwise call the native directly and skip the
+/// adapter that lets Python iterate a JavaScript-style iterator.
+[[nodiscard]] bool MirrorPrototypeMethods(Isolate& isolate, ObjectInstance* prototype, PyObject* type) noexcept {
+    PyObject* dict = reinterpret_cast<PyTypeObject*>(type)->tp_dict;
+    if (prototype->properties == nullptr || dict == nullptr) {
+        return true;
+    }
+    PyObject* mirrored = PySet_New(nullptr);
+    if (mirrored == nullptr) {
+        return false;
+    }
+    Py_ssize_t position = 0;
+    PyObject* key = nullptr;
+    PyObject* value = nullptr;
+    bool ok = true;
+    while (ok && PyDict_Next(prototype->properties, &position, &key, &value) != 0) {
+        if (!PyUnicode_Check(key) || !IsNativeFunction(isolate, value) ||
+            PyUnicode_CompareWithASCIIString(key, "constructor") == 0 ||
+            (PyUnicode_GET_LENGTH(key) > 4 && PyUnicode_READ_CHAR(key, 0) == '_' &&
+             PyUnicode_READ_CHAR(key, 1) == '_')) {
+            continue;
+        }
+        const int present = PyDict_Contains(dict, key);
+        ok = present >= 0 &&
+             (present == 1 || (PyType_Type.tp_setattro(type, key, value) == 0 && PySet_Add(mirrored, key) == 0));
+    }
+    PyObject* name = ok ? PyUnicode_InternFromString(MIRRORED_KEY) : nullptr;
+    ok = ok && name != nullptr && PyType_Type.tp_setattro(type, name, mirrored) == 0;
+    Py_XDECREF(name);
+    Py_DECREF(mirrored);
+    return ok;
+}
+
 /// The `prototype` a template's type hands its instances, or null if it has
 /// been replaced with something that cannot be one.
 [[nodiscard]] PyObject* PrototypeOf(Isolate& isolate, PyObject* type) noexcept {
@@ -1360,7 +1408,8 @@ PyObject* Materialise(Isolate& isolate, ContextRec* realm, TemplateRec* tpl) noe
     ok = ok && prototypeName != nullptr && constructorName != nullptr &&
          PyType_Type.tp_setattro(type, prototypeName, reinterpret_cast<PyObject*>(prototype)) == 0 &&
          DefineRaw(prototype, constructorName, type, static_cast<long>(PropertyAttribute::DontEnum)) &&
-         ApplyEntries(isolate, realm, prototype, tpl->prototype) && ApplyStatics(isolate, realm, type, tpl);
+         ApplyEntries(isolate, realm, prototype, tpl->prototype) && ApplyStatics(isolate, realm, type, tpl) &&
+         MirrorPrototypeMethods(isolate, prototype, type);
     Py_XDECREF(prototypeName);
     Py_XDECREF(constructorName);
     Py_XDECREF(prototype);
@@ -1488,6 +1537,13 @@ TemplateRec* TemplateOfType(Isolate& isolate, PyTypeObject* type) noexcept {
         }
     }
     return nullptr;
+}
+
+bool IsTemplateMadeType(Isolate& isolate, PyTypeObject* type) noexcept {
+    BindingsState* state = StateOf(isolate);
+    PyTypeObject* meta = state != nullptr ? state->templateMeta : nullptr;
+    return meta != nullptr && PyObject_TypeCheck(reinterpret_cast<PyObject*>(type), meta) &&
+           reinterpret_cast<TemplateTypeObject*>(type)->tpl != nullptr;
 }
 
 /// `new Type(...)`, for a template's type or a Python subclass of one.
@@ -1950,6 +2006,26 @@ void IsolateBindingsTeardown(Isolate& isolate) noexcept {
     // template for any type, and makes plain objects.
     Py_CLEAR(state->templateMeta);
     Py_CLEAR(state->iteratorAdapter);
+}
+
+bool MirroredOnly(Isolate& isolate, PyTypeObject* type, PyObject* name) noexcept {
+    PyObject* mro = type->tp_mro;
+    if (mro == nullptr || !PyTuple_Check(mro)) {
+        return false;
+    }
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(mro); ++i) {
+        auto* entry = reinterpret_cast<PyTypeObject*>(PyTuple_GET_ITEM(mro, i));
+        if (entry->tp_dict == nullptr || PyDict_Contains(entry->tp_dict, name) != 1) {
+            continue;
+        }
+        // The first class that has the name decides.
+        if (!IsTemplateMadeType(isolate, entry)) {
+            return false;
+        }
+        PyObject* mirrored = PyDict_GetItemString(entry->tp_dict, MIRRORED_KEY);  // borrowed
+        return mirrored != nullptr && PySet_Check(mirrored) && PySet_Contains(mirrored, name) == 1;
+    }
+    return false;
 }
 
 }  // namespace ub::detail
