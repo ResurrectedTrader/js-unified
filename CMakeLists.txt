@@ -373,6 +373,9 @@ install(TARGETS unibind_backend_${UNIBIND_BACKEND}
 # - because the prefix may be copied to a machine where the engine lives
 # somewhere else.
 set(UNIBIND_ENGINE_EXTRA_LIB_NAMES "")
+# Extra properties for this backend's MSBuild engine fragment. Only CPython has
+# any: its link inputs are more than one library, and differ by configuration.
+set(UNIBIND_MSBUILD_ENGINE_EXTRA "")
 if(UNIBIND_BACKEND STREQUAL "v8")
     set(UNIBIND_ENGINE_DIR "${UNIBIND_V8_DIR}")
     set(UNIBIND_ENGINE_LIB_NAME "v8_monolith.lib")
@@ -391,6 +394,19 @@ elseif(UNIBIND_BACKEND STREQUAL "python")
     # The third-party libraries its built-in extension modules call (zlib,
     # openssl, ...), from the same prefix - see _unibind_provide_python.
     set(UNIBIND_ENGINE_EXTRA_LIB_NAMES ${UNIBIND_PYTHON_DEP_LIB_NAMES})
+    # For MSBuild: the engine's libraries relative to UnibindPythonDir, one list
+    # per CRT flavour - a Debug (/MTd) project links python3X_d.lib and the
+    # debug builds of its dependencies from debug/lib.
+    string(REPLACE ".lib" "_d.lib" unibindPythonDebugLib "debug/lib/${UNIBIND_PYTHON_LIB_NAME}")
+    set(unibindPythonRelease "lib/${UNIBIND_PYTHON_LIB_NAME}" ${UNIBIND_PYTHON_DEP_LIB_NAMES})
+    set(unibindPythonDebug "${unibindPythonDebugLib}" ${UNIBIND_PYTHON_DEP_DEBUG_LIB_NAMES})
+    list(JOIN unibindPythonRelease ";" unibindPythonRelease)
+    list(JOIN unibindPythonDebug ";" unibindPythonDebug)
+    string(REPLACE "/" "\\" unibindPythonRelease "${unibindPythonRelease}")
+    string(REPLACE "/" "\\" unibindPythonDebug "${unibindPythonDebug}")
+    string(CONCAT UNIBIND_MSBUILD_ENGINE_EXTRA
+        "    <UnibindPythonLibs Condition=\"'$(UnibindPythonLibs)' == ''\">${unibindPythonRelease}</UnibindPythonLibs>\n"
+        "    <UnibindPythonDebugLibs Condition=\"'$(UnibindPythonDebugLibs)' == ''\">${unibindPythonDebug}</UnibindPythonDebugLibs>")
 else()
     set(UNIBIND_ENGINE_DIR "${UNIBIND_SPIDERMONKEY_DIR}")
     set(UNIBIND_ENGINE_LIB_NAME "spidermonkey.lib")
