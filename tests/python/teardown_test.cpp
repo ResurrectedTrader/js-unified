@@ -354,9 +354,10 @@ TEST_CASE("teardown: one isolate churning realms, scripts, templates, roots and 
 
 TEST_CASE("teardown: a threading.Thread still running Python when the isolate goes is stopped, quietly") {
     std::string printed;
-    const auto start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration teardown{};
     {
         CaptureStderr capture;
+        std::chrono::steady_clock::time_point stopping;
         {
             Fixture f;
             Run(f.context, R"(
@@ -374,10 +375,19 @@ t.start()
 while state['n'] == 0:
     pass
 )");
+            stopping = std::chrono::steady_clock::now();
         }
+        teardown = std::chrono::steady_clock::now() - stopping;
         printed = capture.Stop();
     }
-    CHECK(std::chrono::steady_clock::now() - start < 1500ms);
+    // Timed from the script's return, so that only the stop and the teardown
+    // are in it: bringing the isolate up is not, and a debug CPython takes
+    // well over a second for that alone. The stop and the teardown take tens
+    // of milliseconds, Debug or not. Under `~Isolate`'s two-second grace
+    // (runtime.cpp, `THREAD_GRACE`) also means the interpreter was ended,
+    // not left behind: `~Isolate` abandons it only once the whole grace has
+    // passed with the thread still in it.
+    CHECK(teardown < 1500ms);
     CHECK(printed.empty());
 }
 
