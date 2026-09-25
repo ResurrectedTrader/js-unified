@@ -232,20 +232,10 @@ constexpr int SEQUENTIAL = 15;  // a debug CPython starts an interpreter many ti
 #endif
 constexpr int ROUNDS_PER_THREAD = sizeof(void*) == 8 ? 4 : 1;
 
-/// Threads running isolates at once. Fewer against a debug CPython: with more
-/// than a couple of sub-interpreters running concurrently, its debug heap
-/// reports a block freed by an interpreter whose allocator did not make it
-/// (`_CrtIsValidHeapPointer`, and then an access violation) - inside CPython,
-/// with the backend's allocator hooks switched off too, with isolate creation
-/// and teardown serialised, and with next to nothing evaluated. A release
-/// CPython has not shown it in any run. It is a known issue of the backend
-/// under a debug CPython; the concurrency is what this case is about, so a
-/// debug build keeps two threads rather than none.
-#if defined(NDEBUG)
+/// Threads running isolates at once - as many against a debug CPython, whose
+/// debug heap once caught CPython switching its process-wide allocator under
+/// running sub-interpreters (cmake/vcpkg-ports/README.md, patch 0103).
 constexpr int CONCURRENT_THREADS = 8;
-#else
-constexpr int CONCURRENT_THREADS = 2;
-#endif
 
 /// What `UseEverything(seed)` answers when every part of it worked.
 std::int64_t ExpectedSum(int seed) {

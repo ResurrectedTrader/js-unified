@@ -1347,15 +1347,8 @@ TEST_CASE("lifetime: many isolates in sequence and on many threads leak nothing 
     (void)CostPerIsolate(4, 1, true);  // warm up whatever the process keeps once
     const Cost plain = CostPerIsolate(20 / SCALE, 1, false);
     const Cost busy = CostPerIsolate(20 / SCALE, 1, true);
-    // Six threads at once - two against a debug CPython, whose debug heap
-    // reports cross-interpreter frees with more than a couple of
-    // sub-interpreters running concurrently (teardown_test.cpp,
-    // `CONCURRENT_THREADS`).
-#if defined(NDEBUG)
+    // Six threads at once.
     constexpr int THREADS = 6;
-#else
-    constexpr int THREADS = 2;
-#endif
     const Cost threaded = CostPerIsolate(24 / SCALE, THREADS, true);
     CAPTURE(plain.processBytes);
     CAPTURE(busy.processBytes);
