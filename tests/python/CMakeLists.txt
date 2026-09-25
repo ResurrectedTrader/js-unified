@@ -26,6 +26,7 @@ add_executable(unibind_python_tests
     lifetimes_test.cpp
     lifetimes_natives_test.cpp
     teardown_test.cpp
+    concurrency_test.cpp
     # The global allocation operators, replaced: the lifetime cases count the
     # backend's own C++ heap and make its allocations fail on purpose.
     "${PROJECT_SOURCE_DIR}/tests/support/allocations.cpp")
