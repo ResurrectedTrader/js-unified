@@ -114,6 +114,15 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(unibind_bench bench/bench_main.cpp)
 target_link_libraries(unibind_bench PRIVATE unibind::unibind)
+# On V8, the benchmark also times each operation against V8 directly, for the
+# ratio between the two.
+if(UNIBIND_BACKEND STREQUAL "v8")
+    target_include_directories(unibind_bench SYSTEM PRIVATE "${UNIBIND_V8_DIR}/include")
+    target_compile_definitions(unibind_bench PRIVATE UNIBIND_BENCH_V8_BASELINE V8_GN_HEADER NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(unibindEngineOwnsOperators)
+        target_link_options(unibind_bench PRIVATE "/FORCE:MULTIPLE")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # unibind/interop/v8.h - defined by one backend, so tested outside the suite
