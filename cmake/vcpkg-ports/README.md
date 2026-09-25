@@ -80,6 +80,31 @@ main thread, and `set_wakeup_fd` raises outside the main interpreter - so
 `asyncio.run` failed in every isolate. The loop now does that only in the main
 interpreter, the only one signals are delivered to.
 
+**`0103-no-allocator-swap-in-subinterpreter-init.patch`.** Every new
+interpreter's `init_sys_streams` ends with `_Py_ClearStandardStreamEncoding()`,
+which frees what `Py_SetStandardStreamEncoding` kept - and to do so switches the
+process-wide `PYMEM_DOMAIN_RAW` allocator to the "default" one with
+`_PyMem_SetDefaultAllocator` and back, whether or not there is anything to free.
+The switch holds the allocators' mutex, but `PyMem_RawMalloc`/`PyMem_RawFree`
+read the allocator without it, and with an own-GIL sub-interpreter other
+interpreters are running on other threads while one starts. Under `Py_DEBUG` the
+default is `malloc` wrapped in the debug hooks, installed in two steps, so for a
+moment the RAW allocator is plain `malloc`: a block another thread allocates or
+frees in that moment (pymalloc sends every request over 512 bytes to RAW, so the
+compiler's arrays are the usual victims) goes through the wrong allocator. That
+is the "debug heap reports a block freed by an interpreter that did not allocate
+it" crash - `_CrtIsValidHeapPointer`, `RtlValidateHeap`, or a debug block whose
+pad bytes are not `FORBIDDENBYTE` - that concurrent isolates hit in Debug.
+Release has the same race, but its default RAW allocator is the one already
+installed, so the switch writes identical values and nothing can go wrong -
+unless anything has replaced or wrapped the RAW allocator (debug hooks via
+`PyMem_SetupDebugHooks`/`PYTHONMALLOC=debug`, tracemalloc, an embedder's own),
+and then Release corrupts its heap the same way. The patch returns before the
+switch when there is nothing to free, which is always after the main
+interpreter's first start: `Py_SetStandardStreamEncoding` refuses once Python is
+initialised. 3.12 has no upstream fix; 3.13 removed `Py_SetStandardStreamEncoding`
+and this clean-up with it.
+
 **`portfile.cmake` and `python_vcpkg.props.in`.** For a static Windows build the
 portfile lists the modules to build in (`PYTHON_BUILTIN_EXTENSIONS`), rewrites
 each one's `.vcxproj` from `DynamicLibrary` to `StaticLibrary`, and generates

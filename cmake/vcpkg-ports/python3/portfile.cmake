@@ -82,6 +82,12 @@ list(APPEND PATCHES 0101-builtin-extension-modules.patch)
 # "main thread" - which the first thread of a sub-interpreter is, to threading - and
 # signal.set_wakeup_fd refuses outside the main interpreter. Skip it there.
 list(APPEND PATCHES 0102-asyncio-proactor-in-subinterpreters.patch)
+# unibind: every new interpreter calls _Py_ClearStandardStreamEncoding(), which swapped the
+# process-wide RAW allocator for the "default" one and back, even with nothing to free. Other
+# interpreters (own GIL) allocate through it meanwhile, unlocked; under Py_DEBUG or debug hooks
+# the swap briefly installs an allocator without the hooks - heap corruption. Skip it when
+# there is nothing to free, which is always, after the main interpreter's start.
+list(APPEND PATCHES 0103-no-allocator-swap-in-subinterpreter-init.patch)
 
 # unibind: on Windows a static core cannot load a .pyd (every one links python3X.dll), so the
 # extension modules are compiled into the static library instead, as built-in modules. Each one
